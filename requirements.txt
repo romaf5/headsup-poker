@@ -1,0 +1,6 @@
+treys
+gym
+numpy
+pygame
+cairosvg
+torch
