@@ -219,19 +219,27 @@ class SimpleModel:
             return np.random.choice(range(len(values_per_action)), p=values_per_action)
 
 
-def self_play_train():
+def train(enable_self_play=False):
     epochs = 100
     epochs_per_self_play_model = 10
 
-    env = None
     workers = Workers()
     model = SimpleModel()
     obs_processor = ObsProcessor()
+    env = (
+        HeadsUpPoker(obs_processor, AlwaysCallPlayer())
+        if not enable_self_play
+        else None
+    )
 
     avg_reward = float("inf")
     for epoch in range(epochs):
         # update self play model every 10 epochs and only if our current model is winning
-        if epoch % epochs_per_self_play_model == 0 and avg_reward > 0:
+        if (
+            enable_self_play
+            and epoch % epochs_per_self_play_model == 0
+            and avg_reward > 0
+        ):
             print("=" * 80)
             model.save("simple_model.pth")
             self_play_model = SimpleModel()
@@ -253,23 +261,6 @@ def self_play_train():
     print("Eval mean reward:", info["mean_reward"])
 
 
-def train_v0():
-    epochs = 100
-    workers = Workers()
-    model = SimpleModel()
-    obs_processor = ObsProcessor()
-    env = HeadsUpPoker(obs_processor, AlwaysCallPlayer())
-
-    for epoch in range(epochs):
-        avg_reward = model.train_epoch(env, workers)
-        print("Epoch:", epoch + 1, "Avg reward:", avg_reward)
-    model.save("simple_model.pth")
-    # evaluate
-    model.load("simple_model.pth")
-    _, _, _, info = model._generate_samples(env, hands_to_play=10000)
-    print("Eval mean reward:", info["mean_reward"])
-
-
 if __name__ == "__main__":
     mp.set_start_method("spawn")
-    self_play_train()
+    train(enable_self_play=True)
