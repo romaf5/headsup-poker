@@ -4,8 +4,8 @@ import torch
 from treys import Card
 from poker_env import ObsProcessor
 from poker_env import HeadsUpPoker, Action
-from poker_env import RandomPlayer, AlwaysCallPlayer
-
+from poker_env import AlwaysCallPlayer
+import torch.multiprocessing as mp
 
 RANKS = 13
 SUITS = 4
@@ -86,6 +86,18 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
+class Workers:
+    def __init__(self, num_processes):
+        self.num_processes = num_processes
+        self.mp_pool = mp.Pool(num_processes)
+
+    def __del__(self):
+        self.mp_pool.close()
+
+    def map(self, func, args):
+        return self.mp_pool.map(func, args)
+
+
 class SimpleModel:
     def __init__(self):
         self.nn_model = SimpleNetwork()
@@ -101,7 +113,10 @@ class SimpleModel:
         self.nn_model.load_state_dict(torch.load(path))
         self.nn_model.cuda()
 
-    def _generate_samples(self, env, hands_to_play=128):
+    def set_eval(self):
+        self.nn_model.eval()
+
+    def _generate_samples(self, env, hands_to_play=512):
         obses = []
         actions = []
         rewards = []
@@ -121,6 +136,31 @@ class SimpleModel:
             "mean_reward": np.mean(rewards_per_hand),
             "hands_played": hands_to_play,
         }
+        return obses, actions, rewards, samples_info
+
+    def _multiprocess_generate_samples(self, env, workers):
+        samples = workers.map(
+            self._generate_samples,
+            [env for _ in range(workers.num_processes)],
+        )
+
+        obses = []
+        actions = []
+        rewards = []
+        samples_info = {
+            "mean_reward": 0,
+            "hands_played": 0,
+        }
+        for sample in samples:
+            obses.extend(sample[0])
+            actions.extend(sample[1])
+            rewards.extend(sample[2])
+            samples_info["mean_reward"] = (
+                samples_info["mean_reward"] * samples_info["hands_played"]
+                + sample[3]["mean_reward"] * sample[3]["hands_played"]
+            ) / (samples_info["hands_played"] + sample[3]["hands_played"])
+            samples_info["hands_played"] += sample[3]["hands_played"]
+
         return obses, actions, rewards, samples_info
 
     def _batch_obses(self, obses):
@@ -146,13 +186,12 @@ class SimpleModel:
         loss.backward()
         self.optimizer.step()
 
-    def train_epoch(self, env):
-        average_meter = AverageMeter()
-        for _ in range(10):
-            obses, actions, rewards, info = self._generate_samples(env)
-            self._train_batch(obses, actions, rewards)
-            average_meter.update(info["mean_reward"], info["hands_played"])
-        return average_meter.avg
+    def train_epoch(self, env, workers):
+        obses, actions, rewards, info = self._multiprocess_generate_samples(
+            env, workers
+        )
+        self._train_batch(obses, actions, rewards)
+        return info["mean_reward"]
 
     def __call__(self, obs):
         assert type(obs) == dict
@@ -168,16 +207,53 @@ class SimpleModel:
         else:
             values_per_action = value_per_action.squeeze().cpu().detach().numpy()
             values_per_action[values_per_action < 0] = 0
+
+            eps = 1e-6
+            values_per_action = values_per_action + eps
+
             values_per_action = values_per_action / values_per_action.sum()
             return np.random.choice(range(len(values_per_action)), p=values_per_action)
 
 
-def main():
+def self_play_train():
+    epochs = 100
+    epochs_per_self_play_model = 10
+
+    env = None
+    workers = Workers(32)
+    model = SimpleModel()
+    obs_processor = ObsProcessor()
+
+    avg_reward = float("inf")
+    for epoch in range(epochs):
+        # update self play model every 10 epochs and only if our current model is winning
+        if epoch % epochs_per_self_play_model == 0 and avg_reward > 0:
+            print("=" * 80)
+            model.save("simple_model.pth")
+            self_play_model = SimpleModel()
+            self_play_model.load("simple_model.pth")
+            self_play_model.set_eval()
+            env = HeadsUpPoker(obs_processor, self_play_model)
+
+        avg_reward = model.train_epoch(env, workers)
+        print("Epoch:", epoch + 1, "Avg reward:", avg_reward)
+
+    model.save("simple_model.pth")
+    # evaluate
+    model.load("simple_model.pth")
+    _, _, _, info = model._generate_samples(env, hands_to_play=10000)
+    print("Eval mean reward:", info["mean_reward"])
+
+
+def train_v0():
+    epochs = 100
+    workers = Workers(32)
     model = SimpleModel()
     obs_processor = ObsProcessor()
     env = HeadsUpPoker(obs_processor, AlwaysCallPlayer())
-    for epoch in range(100):
-        avg_reward = model.train_epoch(env)
+
+    for epoch in range(epochs):
+        avg_reward = model.train_epoch(env, workers)
         print("Epoch:", epoch + 1, "Avg reward:", avg_reward)
     model.save("simple_model.pth")
     # evaluate
@@ -187,4 +263,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    mp.set_start_method("spawn")
+    self_play_train()
