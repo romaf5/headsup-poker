@@ -19,6 +19,18 @@ NUM_EPOCHS = 1000
 NUM_EPOCHS_PER_SELF_PLAY_MODEL = 10
 
 
+class Workers:
+    def __init__(self, num_processes=NUM_WORKERS):
+        self.num_processes = num_processes
+        self.mp_pool = mp.Pool(num_processes)
+
+    def __del__(self):
+        self.mp_pool.close()
+
+    def map(self, func, args):
+        return self.mp_pool.map(func, args)
+
+
 class SimpleNetwork(torch.nn.Module):
     def __init__(self):
         super(SimpleNetwork, self).__init__()
@@ -74,35 +86,6 @@ class SimpleNetwork(torch.nn.Module):
         x = self.act(x)
         x = self.fc3(x)
         return x
-
-
-class AverageMeter:
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-
-class Workers:
-    def __init__(self, num_processes=NUM_WORKERS):
-        self.num_processes = num_processes
-        self.mp_pool = mp.Pool(num_processes)
-
-    def __del__(self):
-        self.mp_pool.close()
-
-    def map(self, func, args):
-        return self.mp_pool.map(func, args)
 
 
 class SimpleModel:
