@@ -121,21 +121,23 @@ class SimpleModel:
         self.nn_model.eval()
 
     def _generate_samples(self, env, hands_to_play=HANDS_PER_WORKER):
-        obses = []
-        actions = []
-        rewards = []
-        rewards_per_hand = []
-        for _ in range(hands_to_play):
-            obs = env.reset()
-            done = False
-            while not done:
-                obses.append(obs.copy())
-                action = self(obs)
-                actions.append(action)
-                obs, reward, done, _ = env.step(action)
-                if done:
-                    rewards_per_hand.append(reward)
-                    rewards.extend([reward] * (len(obses) - len(rewards)))
+        self.set_eval()
+        with torch.no_grad():
+            obses = []
+            actions = []
+            rewards = []
+            rewards_per_hand = []
+            for _ in range(hands_to_play):
+                obs = env.reset()
+                done = False
+                while not done:
+                    obses.append(obs.copy())
+                    action = self(obs)
+                    actions.append(action)
+                    obs, reward, done, _ = env.step(action)
+                    if done:
+                        rewards_per_hand.append(reward)
+                        rewards.extend([reward] * (len(obses) - len(rewards)))
         samples_info = {
             "mean_reward": np.mean(rewards_per_hand),
             "hands_played": hands_to_play,
@@ -179,6 +181,7 @@ class SimpleModel:
         return batch_obses
 
     def _train_batch(self, obses, actions, rewards):
+        self.nn_model.train()
         obses = self._batch_obses(obses)
         actions = torch.tensor(actions).cuda().long()
         rewards = torch.tensor(rewards).cuda().float()
