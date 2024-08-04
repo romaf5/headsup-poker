@@ -1,3 +1,4 @@
+import time
 import numpy as np
 
 import torch
@@ -10,6 +11,9 @@ import torch.multiprocessing as mp
 RANKS = 13
 SUITS = 4
 EMBEDDING_DIM = 128
+
+NUM_WORKERS = 32
+HANDS_PER_WORKER = 512
 
 
 class SimpleNetwork(torch.nn.Module):
@@ -87,7 +91,7 @@ class AverageMeter:
 
 
 class Workers:
-    def __init__(self, num_processes):
+    def __init__(self, num_processes=NUM_WORKERS):
         self.num_processes = num_processes
         self.mp_pool = mp.Pool(num_processes)
 
@@ -116,7 +120,7 @@ class SimpleModel:
     def set_eval(self):
         self.nn_model.eval()
 
-    def _generate_samples(self, env, hands_to_play=512):
+    def _generate_samples(self, env, hands_to_play=HANDS_PER_WORKER):
         obses = []
         actions = []
         rewards = []
@@ -220,7 +224,7 @@ def self_play_train():
     epochs_per_self_play_model = 10
 
     env = None
-    workers = Workers(32)
+    workers = Workers()
     model = SimpleModel()
     obs_processor = ObsProcessor()
 
@@ -235,8 +239,12 @@ def self_play_train():
             self_play_model.set_eval()
             env = HeadsUpPoker(obs_processor, self_play_model)
 
+        start_time = time.time()
         avg_reward = model.train_epoch(env, workers)
-        print("Epoch:", epoch + 1, "Avg reward:", avg_reward)
+        duration = time.time() - start_time
+        print(
+            f"Epoch: {epoch + 1}, Avg reward: {avg_reward:.3f}, hands/s: {HANDS_PER_WORKER * NUM_WORKERS / duration:.2f}"
+        )
 
     model.save("simple_model.pth")
     # evaluate
@@ -247,7 +255,7 @@ def self_play_train():
 
 def train_v0():
     epochs = 100
-    workers = Workers(32)
+    workers = Workers()
     model = SimpleModel()
     obs_processor = ObsProcessor()
     env = HeadsUpPoker(obs_processor, AlwaysCallPlayer())
