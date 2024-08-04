@@ -12,8 +12,11 @@ RANKS = 13
 SUITS = 4
 EMBEDDING_DIM = 128
 
-NUM_WORKERS = 32
-HANDS_PER_WORKER = 512
+NUM_WORKERS = 16
+HANDS_PER_WORKER = 2048
+
+NUM_EPOCHS = 1000
+NUM_EPOCHS_PER_SELF_PLAY_MODEL = 10
 
 
 class SimpleNetwork(torch.nn.Module):
@@ -223,8 +226,8 @@ class SimpleModel:
 
 
 def train(enable_self_play=False):
-    epochs = 100
-    epochs_per_self_play_model = 10
+    epochs = NUM_EPOCHS
+    epochs_per_self_play_model = NUM_EPOCHS_PER_SELF_PLAY_MODEL
 
     workers = Workers()
     model = SimpleModel()
