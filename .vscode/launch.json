@@ -25,7 +25,10 @@
             "request": "launch",
             "program": "train_deepcrf.py",
             "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}/deepcrf"
+            "cwd": "${workspaceFolder}/deepcrf",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1"
+            }
         },
         {
             "name": "TrainV0",
