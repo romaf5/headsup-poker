@@ -1,11 +1,124 @@
-import torch
 from copy import deepcopy
+
+import torch
+import numpy as np
 from tqdm import tqdm
+import torch.multiprocessing as mp
 from pokerenv_crf import Action, HeadsUpPoker, ObsProcessor
 
-RANKS = 13
 SUITS = 4
+RANKS = 13
+NUM_WORKERS = 16
 EMBEDDING_DIM = 128
+
+
+class AlwaysCallPlayer:
+    def __call__(self, _):
+        return Action.CHECK_CALL
+
+
+class AlwaysAllInPlayer:
+    def __call__(self, _):
+        return Action.ALL_IN
+
+
+class RandomPlayer:
+    def __call__(self, _):
+        return np.random.choice(
+            [Action.FOLD, Action.CHECK_CALL, Action.RAISE, Action.ALL_IN]
+        )
+
+
+class ValuePlayerWrapper:
+    def __init__(self, player):
+        self.player = player
+
+    def __call__(self, obs):
+        with torch.no_grad():
+            obs = _batch_obses([obs])
+            values = self.player(obs)
+            action = torch.multinomial(regret_matching(values), 1).item()
+            return action
+
+
+class PolicyPlayerWrapper:
+    def __init__(self, player):
+        self.player = player
+
+    def __call__(self, obs):
+        with torch.no_grad():
+            obs = _batch_obses([obs])
+            action_distribution = self.player(obs)
+            action_distribution = torch.clamp(action_distribution, min=0)
+            total_action_distribution = torch.sum(action_distribution)
+            if total_action_distribution <= 0:
+                return np.random.choice(range(len(action_distribution)))
+            action_distribution /= total_action_distribution
+            action = torch.multinomial(action_distribution, 1).item()
+            return action
+
+
+class EvalValuePlayers:
+    def __init__(self, env):
+        self.env = env
+        self.opponent_players = {
+            "random": RandomPlayer(),
+            "call": AlwaysCallPlayer(),
+            "allin": AlwaysAllInPlayer(),
+        }
+
+    def eval(self, players, games_to_play=1000):
+        for opponent_name, opponent_player in self.opponent_players.items():
+            for i, player in enumerate(players):
+                wrapped_player = ValuePlayerWrapper(player)
+                rewards = []
+                for _ in range(games_to_play):
+                    obs = self.env.reset()
+                    done = False
+                    while not done:
+                        if obs["player_idx"] == i:
+                            action = wrapped_player(obs)
+                        else:
+                            action = opponent_player(obs)
+                        obs, reward, done, _ = self.env.step(action)
+                        if done:
+                            rewards.append(reward[i])
+                print(
+                    "Player:",
+                    i,
+                    "Opponent:",
+                    opponent_name,
+                    "Mean reward:",
+                    np.mean(rewards),
+                )
+
+
+class EvalPolicyPlayer:
+    def __init__(self, env):
+        self.env = env
+        self.opponent_players = {
+            "random": RandomPlayer(),
+            "call": AlwaysCallPlayer(),
+            "allin": AlwaysAllInPlayer(),
+        }
+
+    def eval(self, player, games_to_play=1000):
+        for opponent_name, opponent_player in self.opponent_players.items():
+            wrapped_player = PolicyPlayerWrapper(player)
+            rewards = []
+            for play_as_idx in [0, 1]:
+                for _ in range(games_to_play):
+                    obs = self.env.reset()
+                    done = False
+                    while not done:
+                        if obs["player_idx"] == play_as_idx:
+                            action = wrapped_player(obs)
+                        else:
+                            action = opponent_player(obs)
+                        obs, reward, done, _ = self.env.step(action)
+                        if done:
+                            rewards.append(reward[play_as_idx])
+            print("Opponent:", opponent_name, "Mean reward:", np.mean(rewards))
 
 
 class BaseModel(torch.nn.Module):
@@ -147,6 +260,18 @@ def regret_matching(values, eps=1e-6):
     return values
 
 
+class Workers:
+    def __init__(self, num_processes=NUM_WORKERS):
+        self.num_processes = num_processes
+        self.mp_pool = mp.Pool(num_processes)
+
+    def __del__(self):
+        self.mp_pool.close()
+
+    def map(self, func, args):
+        return self.mp_pool.map(func, args)
+
+
 def traverse_crf(env, player_idx, players, samples_storage, policy_storage, crf_iter):
     if env.done:
         return env.reward[player_idx]
@@ -199,6 +324,30 @@ def train_policy(policy, policy_storage):
             optimizer.step()
 
 
+class TraversalWorker:
+    def __init__(self, env, player_idx, players, crf_iter):
+        self.player_idx = player_idx
+        self.players = players
+        self.value_storage = [[], []]
+        self.policy_storage = []
+        self.crf_iter = crf_iter
+        self.env = CRFEnvWrapper(deepcopy(env))
+
+    def __call__(self, traverses):
+        with torch.no_grad():
+            for _ in range(traverses):
+                self.env.reset()
+                traverse_crf(
+                    self.env,
+                    self.player_idx,
+                    self.players,
+                    self.value_storage,
+                    self.policy_storage,
+                    self.crf_iter,
+                )
+        return self.value_storage[self.player_idx], self.policy_storage
+
+
 def deepcrf(env, crf_iterations, traverses_per_iteration):
     num_players = 2
     assert num_players == 2
@@ -208,31 +357,51 @@ def deepcrf(env, crf_iterations, traverses_per_iteration):
     samples_storage = [[] for _ in range(num_players)]
     policy_storage = []
 
+    eval_value_player_helper = EvalValuePlayers(env)
+    workers = Workers()
+
     for crf_iter in tqdm(range(crf_iterations)):
         for player_idx in range(num_players):
             with torch.no_grad():
-                for _ in range(traverses_per_iteration):
-                    crf_env = CRFEnvWrapper(env)
-                    traverse_crf(
-                        crf_env,
-                        player_idx,
-                        players,
-                        samples_storage,
-                        policy_storage,
-                        crf_iter,
-                    )
+                traversal_worker = TraversalWorker(
+                    env,
+                    player_idx,
+                    players,
+                    crf_iter,
+                )
+                per_worker_traverses = (
+                    traverses_per_iteration + workers.num_processes - 1
+                ) // workers.num_processes
+
+                results = workers.map(
+                    traversal_worker, [per_worker_traverses] * workers.num_processes
+                )
+
+                for value_storage, policy_storage in results:
+                    samples_storage[player_idx].extend(value_storage)
+                    policy_storage.extend(policy_storage)
 
             players[player_idx] = BaseModel().cuda()
             train_values(players[player_idx], samples_storage[player_idx])
             # clean up storage
             samples_storage[player_idx] = []
+        # evaluate against random, call, allin players
+        print("CFR iteration value evaluation:")
+        eval_value_player_helper.eval(players)
+
     train_policy(policy, policy_storage)
+    eval_policy_player_helper = EvalPolicyPlayer(env)
+    print("Final policy evaluation:")
+    eval_policy_player_helper.eval(policy)
     print("Deep CRF training complete")
+    torch.save(policy.state_dict(), "policy.pth")
+    print("Policy model saved!")
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn")
     env = HeadsUpPoker(ObsProcessor())
 
-    crf_iterations = 1
-    traverses_per_iteration = 1
+    crf_iterations = 1000
+    traverses_per_iteration = 1000
     deepcrf(env, crf_iterations, traverses_per_iteration)
