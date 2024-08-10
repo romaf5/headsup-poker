@@ -4,3 +4,4 @@ numpy
 pygame
 cairosvg
 torch
+tqdm

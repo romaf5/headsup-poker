@@ -12,6 +12,22 @@
             "console": "integratedTerminal"
         },
         {
+            "name": "DeepCRFPokerEnv",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "pokerenv_crf.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/deepcrf"
+        },
+        {
+            "name": "DeepCRFTraining",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "train_deepcrf.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/deepcrf"
+        },
+        {
             "name": "TrainV0",
             "type": "debugpy",
             "request": "launch",
