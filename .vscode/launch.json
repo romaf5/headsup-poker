@@ -12,6 +12,25 @@
             "console": "integratedTerminal"
         },
         {
+            "name": "DeepCRFPokerEnv",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "pokerenv_crf.py",
+            "cwd": "${workspaceFolder}/deepcrf",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "DeepCRFTraining",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "train_deepcrf.py",
+            "cwd": "${workspaceFolder}/deepcrf",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1"
+            }
+        },
+        {
             "name": "TrainV0",
             "type": "debugpy",
             "request": "launch",

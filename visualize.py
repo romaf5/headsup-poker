@@ -1,8 +1,10 @@
 import os
 import time
 
+import torch
 import pygame
 import cairosvg
+import numpy as np
 from treys import Card
 from poker_env import Action, ObsProcessor
 from poker_env import HeadsUpPoker, AlwaysCallPlayer, RandomPlayer
@@ -276,10 +278,22 @@ def draw_table(screen):
     )
 
 
+class CRFPlayer:
+    def __init__(self):
+        from deepcrf.model import BaseModel
+        from deepcrf.player_wrapper import PolicyPlayerWrapper
+
+        model = BaseModel().cuda()
+        model.load_state_dict(torch.load("deepcrf/policy.pth"))
+        self.player = PolicyPlayerWrapper(model)
+
+    def __call__(self, obs):
+        return self.player(obs)
+
+
 def main():
     obs_processor = ObsProcessor()
-    player = SimpleModel()
-    player.load("simple_model.pth")
+    player = CRFPlayer()
     env = HeadsUpPoker(obs_processor, player)
     game = Game(env)
     game.reset()
