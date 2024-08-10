@@ -46,6 +46,7 @@ class HeadsUpPoker(gym.Env):
         self.bets_this_stage = None
         self.current_idx = None
         self.stage = None
+        self.previous_actions = None
         self.game_counter = 0
 
     def _initialize_stack_sizes(self):
@@ -81,6 +82,7 @@ class HeadsUpPoker(gym.Env):
         self.deck.shuffle()
 
         self.board = []
+        self.previous_actions = []
         self.player_hand = [self.deck.draw(2), self.deck.draw(2)]
         self.dealer_idx = 0
         self.stage = Stage.PREFLOP
@@ -165,6 +167,15 @@ class HeadsUpPoker(gym.Env):
 
     def step(self, action):
         action = Action(action)
+
+        # if there are 5 raises in a row, the last raise is an all-in
+        self.previous_actions.append(action)
+        if (
+            len(self.previous_actions) >= 5
+            and self.previous_actions[-5:] == [Action.RAISE] * 5
+        ):
+            action = Action.ALL_IN
+
         self._player_acts(action)
 
         # player folded

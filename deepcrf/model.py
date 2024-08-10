@@ -63,5 +63,8 @@ class BaseModel(torch.nn.Module):
         x = self.act(x)
         x = self.fc2(x)
         x = self.act(x)
-        x = self.fc3(x)
-        return x
+
+        # Normalize the output
+        x = (x - x.mean(dim=1, keepdim=True)) / (x.std(dim=1, keepdim=True) + 1e-8)
+
+        return self.fc3(x)

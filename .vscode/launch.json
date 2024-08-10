@@ -31,6 +31,17 @@
             }
         },
         {
+            "name": "DeepCRFPolicyEval",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "eval_policy.py",
+            "cwd": "${workspaceFolder}/deepcrf",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1"
+            }
+        },
+        {
             "name": "TrainV0",
             "type": "debugpy",
             "request": "launch",
