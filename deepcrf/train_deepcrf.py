@@ -4,6 +4,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 import torch.multiprocessing as mp
+from torch.utils.tensorboard import SummaryWriter
 from pokerenv_crf import Action, HeadsUpPoker, ObsProcessor
 
 SUITS = 4
@@ -59,15 +60,16 @@ class PolicyPlayerWrapper:
 
 
 class EvalValuePlayers:
-    def __init__(self, env):
+    def __init__(self, env, logger):
         self.env = env
+        self.logger = logger
         self.opponent_players = {
             "random": RandomPlayer(),
             "call": AlwaysCallPlayer(),
             "allin": AlwaysAllInPlayer(),
         }
 
-    def eval(self, players, games_to_play=1000):
+    def eval(self, players, crf_iter, games_to_play=1000):
         for opponent_name, opponent_player in self.opponent_players.items():
             for i, player in enumerate(players):
                 wrapped_player = ValuePlayerWrapper(player)
@@ -83,19 +85,17 @@ class EvalValuePlayers:
                         obs, reward, done, _ = self.env.step(action)
                         if done:
                             rewards.append(reward[i])
-                print(
-                    "Player:",
-                    i,
-                    "Opponent:",
-                    opponent_name,
-                    "Mean reward:",
+                self.logger.add_scalar(
+                    f"value_network/{opponent_name}/player_{i}/mean_reward",
                     np.mean(rewards),
+                    crf_iter,
                 )
 
 
 class EvalPolicyPlayer:
-    def __init__(self, env):
+    def __init__(self, env, logger):
         self.env = env
+        self.logger = logger
         self.opponent_players = {
             "random": RandomPlayer(),
             "call": AlwaysCallPlayer(),
@@ -118,7 +118,9 @@ class EvalPolicyPlayer:
                         obs, reward, done, _ = self.env.step(action)
                         if done:
                             rewards.append(reward[play_as_idx])
-            print("Opponent:", opponent_name, "Mean reward:", np.mean(rewards))
+            self.logger.add_scalar(
+                f"policy/{opponent_name}/mean_reward", np.mean(rewards), 0
+            )
 
 
 class BaseModel(torch.nn.Module):
@@ -357,41 +359,40 @@ def deepcrf(env, crf_iterations, traverses_per_iteration):
     samples_storage = [[] for _ in range(num_players)]
     policy_storage = []
 
-    eval_value_player_helper = EvalValuePlayers(env)
+    logger = SummaryWriter()
+    eval_value_player_helper = EvalValuePlayers(env, logger)
     workers = Workers()
 
     for crf_iter in tqdm(range(crf_iterations)):
         for player_idx in range(num_players):
-            with torch.no_grad():
-                traversal_worker = TraversalWorker(
-                    env,
-                    player_idx,
-                    players,
-                    crf_iter,
-                )
-                per_worker_traverses = (
-                    traverses_per_iteration + workers.num_processes - 1
-                ) // workers.num_processes
+            traversal_worker = TraversalWorker(
+                env,
+                player_idx,
+                players,
+                crf_iter,
+            )
+            per_worker_traverses = (
+                traverses_per_iteration + workers.num_processes - 1
+            ) // workers.num_processes
 
-                results = workers.map(
-                    traversal_worker, [per_worker_traverses] * workers.num_processes
-                )
+            results = workers.map(
+                traversal_worker, [per_worker_traverses] * workers.num_processes
+            )
 
-                for value_storage, policy_storage in results:
-                    samples_storage[player_idx].extend(value_storage)
-                    policy_storage.extend(policy_storage)
+            for value_storage, policy_storage in results:
+                samples_storage[player_idx].extend(value_storage)
+                policy_storage.extend(policy_storage)
 
             players[player_idx] = BaseModel().cuda()
             train_values(players[player_idx], samples_storage[player_idx])
             # clean up storage
             samples_storage[player_idx] = []
         # evaluate against random, call, allin players
-        print("CFR iteration value evaluation:")
-        eval_value_player_helper.eval(players)
+        eval_value_player_helper.eval(players, crf_iter)
 
     train_policy(policy, policy_storage)
-    eval_policy_player_helper = EvalPolicyPlayer(env)
-    print("Final policy evaluation:")
+    eval_policy_player_helper = EvalPolicyPlayer(env, logger)
+    print("\nFinal policy evaluation:")
     eval_policy_player_helper.eval(policy)
     print("Deep CRF training complete")
     torch.save(policy.state_dict(), "policy.pth")
@@ -402,6 +403,6 @@ if __name__ == "__main__":
     mp.set_start_method("spawn")
     env = HeadsUpPoker(ObsProcessor())
 
-    crf_iterations = 1000
+    crf_iterations = 100
     traverses_per_iteration = 1000
     deepcrf(env, crf_iterations, traverses_per_iteration)
