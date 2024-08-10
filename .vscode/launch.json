@@ -16,16 +16,16 @@
             "type": "debugpy",
             "request": "launch",
             "program": "pokerenv_crf.py",
-            "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}/deepcrf"
+            "cwd": "${workspaceFolder}/deepcrf",
+            "console": "integratedTerminal"
         },
         {
             "name": "DeepCRFTraining",
             "type": "debugpy",
             "request": "launch",
             "program": "train_deepcrf.py",
-            "console": "integratedTerminal",
             "cwd": "${workspaceFolder}/deepcrf",
+            "console": "integratedTerminal",
             "env": {
                 "CUDA_VISIBLE_DEVICES": "1"
             }
