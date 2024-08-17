@@ -13,6 +13,7 @@ from player_wrapper import PolicyPlayerWrapper
 from pokerenv_cfr import Action, HeadsUpPoker, ObsProcessor
 from simple_players import RandomPlayer, AlwaysCallPlayer, AlwaysAllInPlayer
 from cfr_env_wrapper import CFREnvWrapper
+from eval_policy import EvalPolicyPlayer, EvalExploitabilityScore
 
 NUM_WORKERS = 16
 BOUNDED_STORAGE_MAX_SIZE = 40_000_000
@@ -63,35 +64,28 @@ class EvalValuePlayers:
                 )
 
 
-class EvalPolicyPlayer:
-    def __init__(self, env, logger):
+class EvalPolicy:
+    def __init__(self, env, policy, logger):
         self.env = env
+        self.player = PolicyPlayerWrapper(policy)
         self.logger = logger
-        self.opponent_players = {
-            "random": RandomPlayer(),
-            "call": AlwaysCallPlayer(),
-            "allin": AlwaysAllInPlayer(),
-        }
 
-    def eval(self, player, games_to_play=1000):
-        for opponent_name, opponent_player in self.opponent_players.items():
-            wrapped_player = PolicyPlayerWrapper(player)
-            rewards = []
-            for play_as_idx in [0, 1]:
-                for _ in range(games_to_play):
-                    obs = self.env.reset()
-                    done = False
-                    while not done:
-                        if obs["player_idx"] == play_as_idx:
-                            action = wrapped_player(obs)
-                        else:
-                            action = opponent_player(obs)
-                        obs, reward, done, _ = self.env.step(action)
-                        if done:
-                            rewards.append(reward[play_as_idx])
+    def eval(self, games_to_play=50000):
+        eval_policy_player = EvalPolicyPlayer(self.env)
+        simple_player_scores = eval_policy_player.eval(self.player, games_to_play)
+
+        eval_exploitability_score = EvalExploitabilityScore(self.env, self.player)
+        exploitability_score_mbb_g = (
+            eval_exploitability_score.eval(games_to_play) * 1000 / 2
+        )
+
+        for opponent_name, score in simple_player_scores.items():
             self.logger.add_scalar(
-                f"policy/{opponent_name}/mean_reward", np.mean(rewards), 0
+                f"policy_evaluation/{opponent_name}/mean_reward", score
             )
+        self.logger.add_scalar(
+            "policy_evaluation/exploitability_score_mbb_g", exploitability_score_mbb_g
+        )
 
 
 def _batch_obses(obses):
@@ -308,15 +302,15 @@ def deepcfr(env, cfr_iterations, traverses_per_iteration):
 
     print("Policy storage size:", len(policy_storage))
     train_policy(policy, policy_storage)
-    eval_policy_player_helper = EvalPolicyPlayer(env, logger)
+    torch.save(policy.state_dict(), "policy.pth")
+
+    eval_policy_player_helper = EvalPolicy(env, policy, logger)
     print("\nFinal policy evaluation:")
     eval_games_to_play = 50000
     timers.start("eval policy")
-    eval_policy_player_helper.eval(policy, games_to_play=eval_games_to_play)
+    eval_policy_player_helper.eval(games_to_play=eval_games_to_play)
     print("Eval policy time:", timers.stop("eval policy"))
     print("Deep CFR training complete")
-    torch.save(policy.state_dict(), "policy.pth")
-    print("Policy model saved!")
 
 
 if __name__ == "__main__":
@@ -324,6 +318,6 @@ if __name__ == "__main__":
     mp.set_sharing_strategy("file_system")
     env = HeadsUpPoker(ObsProcessor())
 
-    cfr_iterations = 128
+    cfr_iterations = 256
     traverses_per_iteration = 10000
     deepcfr(env, cfr_iterations, traverses_per_iteration)

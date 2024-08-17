@@ -4,7 +4,7 @@ import numpy as np
 from model import BaseModel
 from enums import Action
 from player_wrapper import PolicyPlayerWrapper
-from deepcfr.pokerenv_cfr import HeadsUpPoker, ObsProcessor
+from pokerenv_cfr import HeadsUpPoker, ObsProcessor
 from simple_players import RandomPlayer, AlwaysCallPlayer, AlwaysAllInPlayer
 from cfr_env_wrapper import CFREnvWrapper
 from copy import deepcopy
@@ -84,4 +84,7 @@ if __name__ == "__main__":
 
     exploitability_evaluator = EvalExploitabilityScore(env, player)
     exploitability_score = exploitability_evaluator.eval()
-    print("Exploitability score", exploitability_score)
+
+    big_blind_size = 2
+    milli_scale = 1000
+    print(f"Exploitability {exploitability_score * milli_scale / big_blind_size} mbb/g")

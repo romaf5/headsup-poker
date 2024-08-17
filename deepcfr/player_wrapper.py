@@ -3,8 +3,8 @@ import numpy as np
 
 
 class PolicyPlayerWrapper:
-    def __init__(self, player):
-        self.player = player
+    def __init__(self, policy):
+        self.policy = policy
 
     def _batch_obses(self, obses):
         return {
@@ -14,7 +14,7 @@ class PolicyPlayerWrapper:
     def __call__(self, obs):
         with torch.no_grad():
             obs = self._batch_obses([obs])
-            action_distribution = self.player(obs)[0]
+            action_distribution = self.policy(obs)[0]
             action_distribution = torch.nn.functional.softmax(
                 action_distribution, dim=-1
             )
