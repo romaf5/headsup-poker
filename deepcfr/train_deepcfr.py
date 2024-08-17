@@ -12,6 +12,7 @@ from bounded_storage import BoundedStorage
 from player_wrapper import PolicyPlayerWrapper
 from pokerenv_cfr import Action, HeadsUpPoker, ObsProcessor
 from simple_players import RandomPlayer, AlwaysCallPlayer, AlwaysAllInPlayer
+from cfr_env_wrapper import CFREnvWrapper
 
 NUM_WORKERS = 16
 BOUNDED_STORAGE_MAX_SIZE = 40_000_000
@@ -153,23 +154,6 @@ def train_policy(policy, policy_storage):
         loss = (ts * (action_distribution - distributions).pow(2)).mean()
         loss.backward()
         optimizer.step()
-
-
-class CFREnvWrapper:
-    def __init__(self, env):
-        self.env = deepcopy(env)
-        self.reset()
-
-    def reset(self):
-        self.obs = self.env.reset()
-        self.reward = None
-        self.done = False
-        self.info = None
-        return self.obs
-
-    def step(self, action):
-        self.obs, self.reward, self.done, self.info = self.env.step(action)
-        return self.obs, self.reward, self.done, self.info
 
 
 def regret_matching(values, eps=1e-6):
@@ -341,5 +325,5 @@ if __name__ == "__main__":
     env = HeadsUpPoker(ObsProcessor())
 
     cfr_iterations = 128
-    traverses_per_iteration = 2048
+    traverses_per_iteration = 10000
     deepcfr(env, cfr_iterations, traverses_per_iteration)

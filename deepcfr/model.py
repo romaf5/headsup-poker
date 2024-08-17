@@ -110,9 +110,7 @@ class BaseModel(torch.nn.Module):
         board_and_hand = x["board_and_hand"]
         first_to_act_next_stage = x["first_to_act_next_stage"].long()
 
-        # B, 21
-        batch_size = board_and_hand.size(0)
-        board_and_hand = board_and_hand.view(batch_size, 7, 3)
+        board_and_hand = board_and_hand.view(-1, 7, 3)
         board_and_hand_emb = self.card_model(board_and_hand)
 
         stage_and_order_emb = self.stage_and_order_model(stage, first_to_act_next_stage)
