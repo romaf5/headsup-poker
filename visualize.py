@@ -278,13 +278,13 @@ def draw_table(screen):
     )
 
 
-class CRFPlayer:
+class CFRPlayer:
     def __init__(self):
-        from deepcrf.model import BaseModel
-        from deepcrf.player_wrapper import PolicyPlayerWrapper
+        from deepcfr.model import BaseModel
+        from deepcfr.player_wrapper import PolicyPlayerWrapper
 
         model = BaseModel().cuda()
-        model.load_state_dict(torch.load("deepcrf/policy.pth"))
+        model.load_state_dict(torch.load("deepcfr/policy.pth"))
         self.player = PolicyPlayerWrapper(model)
 
     def __call__(self, obs):
@@ -293,7 +293,7 @@ class CRFPlayer:
 
 def main():
     obs_processor = ObsProcessor()
-    player = CRFPlayer()
+    player = CFRPlayer()
     env = HeadsUpPoker(obs_processor, player)
     game = Game(env)
     game.reset()

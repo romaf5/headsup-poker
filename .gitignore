@@ -1,5 +1,5 @@
 # ignore tensoboard logs
-deepcrf/runs/
+deepcfr/runs/
 runs/
 
 # Byte-compiled / optimized / DLL files

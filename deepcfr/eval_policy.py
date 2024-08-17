@@ -3,7 +3,7 @@ import numpy as np
 
 from model import BaseModel
 from player_wrapper import PolicyPlayerWrapper
-from pokerenv_crf import HeadsUpPoker, ObsProcessor
+from deepcfr.pokerenv_cfr import HeadsUpPoker, ObsProcessor
 from simple_players import RandomPlayer, AlwaysCallPlayer, AlwaysAllInPlayer
 
 

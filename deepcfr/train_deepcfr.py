@@ -10,7 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 from model import BaseModel
 from bounded_storage import BoundedStorage
 from player_wrapper import PolicyPlayerWrapper
-from pokerenv_crf import Action, HeadsUpPoker, ObsProcessor
+from pokerenv_cfr import Action, HeadsUpPoker, ObsProcessor
 from simple_players import RandomPlayer, AlwaysCallPlayer, AlwaysAllInPlayer
 
 NUM_WORKERS = 16
@@ -39,7 +39,7 @@ class EvalValuePlayers:
             "allin": AlwaysAllInPlayer(),
         }
 
-    def eval(self, players, crf_iter, games_to_play=1000):
+    def eval(self, players, cfr_iter, games_to_play=1000):
         for opponent_name, opponent_player in self.opponent_players.items():
             for i, player in enumerate(players):
                 wrapped_player = ValuePlayerWrapper(player)
@@ -58,7 +58,7 @@ class EvalValuePlayers:
                 self.logger.add_scalar(
                     f"value_network/{opponent_name}/player_{i}/mean_reward",
                     np.mean(rewards),
-                    crf_iter,
+                    cfr_iter,
                 )
 
 
@@ -155,7 +155,7 @@ def train_policy(policy, policy_storage):
         optimizer.step()
 
 
-class CRFEnvWrapper:
+class CFREnvWrapper:
     def __init__(self, env):
         self.env = deepcopy(env)
         self.reset()
@@ -190,11 +190,14 @@ class Workers:
     def __del__(self):
         self.mp_pool.close()
 
-    def map(self, func, args):
+    def sync_map(self, func, args):
+        return [func(arg) for arg in args]
+
+    def async_map(self, func, args):
         return self.mp_pool.map(func, args)
 
 
-def traverse_crf(env, player_idx, players, samples_storage, policy_storage, crf_iter):
+def traverse_cfr(env, player_idx, players, samples_storage, policy_storage, cfr_iter):
     if env.done:
         return env.reward[player_idx]
 
@@ -206,48 +209,57 @@ def traverse_crf(env, player_idx, players, samples_storage, policy_storage, crf_
         va = torch.zeros(len(Action))
         mean_value_action = 0
         for action_idx, (probability, action) in enumerate(zip(distribution, Action)):
-            crf_env = deepcopy(env)
-            crf_env.step(action)
+            cfr_env = deepcopy(env)
+            cfr_env.step(action)
 
-            value_per_action = traverse_crf(
-                crf_env, player_idx, players, samples_storage, policy_storage, crf_iter
+            value_per_action = traverse_cfr(
+                cfr_env, player_idx, players, samples_storage, policy_storage, cfr_iter
             )
             va[action_idx] = value_per_action
             mean_value_action += probability * value_per_action
         va -= mean_value_action
-        samples_storage[player_idx].append((obs, crf_iter, va.numpy()))
+        samples_storage[player_idx].append((obs, cfr_iter, va.numpy()))
         return mean_value_action
     else:
         values = players[1 - player_idx](batched_obs)[0]
         distribution = regret_matching(values).cpu()
-        policy_storage.append((obs, crf_iter, distribution.numpy()))
+        policy_storage.append((obs, cfr_iter, distribution.numpy()))
         sampled_action = torch.multinomial(distribution, 1).item()
         env.step(sampled_action)
-        return traverse_crf(
-            env, player_idx, players, samples_storage, policy_storage, crf_iter
+        return traverse_cfr(
+            env, player_idx, players, samples_storage, policy_storage, cfr_iter
         )
 
 
 class TraversalWorker:
-    def __init__(self, env, player_idx, players, crf_iter):
+    def __init__(self, env, player_idx, players, cfr_iter):
         self.player_idx = player_idx
-        self.players = players
-        self.crf_iter = crf_iter
-        self.env = CRFEnvWrapper(env)
+        self.cfr_iter = cfr_iter
+        self.env = CFREnvWrapper(env)
+        for idx in range(2):
+            torch.save(players[idx].state_dict(), f"/tmp/player_{idx}.pth")
 
     def __call__(self, traverses):
         value_storage = [[], []]
         policy_storage = []
+
+        players = [BaseModel().cuda() for _ in range(2)]
+        for idx in range(2):
+            players[idx].load_state_dict(
+                torch.load(f"/tmp/player_{idx}.pth", weights_only=True)
+            )
+            players[idx].eval()
+
         with torch.no_grad():
             for _ in range(traverses):
                 self.env.reset()
-                traverse_crf(
+                traverse_cfr(
                     self.env,
                     self.player_idx,
-                    self.players,
+                    players,
                     value_storage,
                     policy_storage,
-                    self.crf_iter,
+                    self.cfr_iter,
                 )
         return value_storage[self.player_idx], policy_storage
 
@@ -264,7 +276,7 @@ class Timers:
         return self.timers[name]
 
 
-def deepcrf(env, crf_iterations, traverses_per_iteration):
+def deepcfr(env, cfr_iterations, traverses_per_iteration):
     num_players = 2
     assert num_players == 2
     players = [BaseModel().cuda() for _ in range(num_players)]
@@ -279,21 +291,21 @@ def deepcrf(env, crf_iterations, traverses_per_iteration):
     eval_value_player_helper = EvalValuePlayers(env, logger)
     workers = Workers(NUM_WORKERS)
     timers = Timers()
-    for crf_iter in tqdm(range(crf_iterations)):
+    for cfr_iter in tqdm(range(cfr_iterations)):
         for player_idx in range(num_players):
             timers.start("traversal")
             traversal_worker = TraversalWorker(
                 env,
                 player_idx,
                 players,
-                crf_iter + 1,
+                cfr_iter + 1,
             )
 
             per_worker_traverses = (
                 traverses_per_iteration + workers.num_processes - 1
             ) // workers.num_processes
 
-            results = workers.map(
+            results = workers.async_map(
                 traversal_worker,
                 [per_worker_traverses] * workers.num_processes,
             )
@@ -301,14 +313,14 @@ def deepcrf(env, crf_iterations, traverses_per_iteration):
                 samples_storage[player_idx].add_all(value)
                 policy_storage.extend(pol)
             print(
-                f"Cfr iteration {crf_iter} Player {player_idx} traversed {timers.stop('traversal'):.2f} seconds"
+                f"Cfr iteration {cfr_iter} Player {player_idx} traversed {timers.stop('traversal'):.2f} seconds"
             )
             players[player_idx] = BaseModel().cuda()
             timers.start("train values")
             train_values(players[player_idx], samples_storage[player_idx].get_storage())
             print("Train values time:", timers.stop("train values"))
         # evaluate against random, call, allin players
-        eval_value_player_helper.eval(players, crf_iter)
+        eval_value_player_helper.eval(players, cfr_iter)
 
     print("Policy storage size:", len(policy_storage))
     train_policy(policy, policy_storage)
@@ -318,7 +330,7 @@ def deepcrf(env, crf_iterations, traverses_per_iteration):
     timers.start("eval policy")
     eval_policy_player_helper.eval(policy, games_to_play=eval_games_to_play)
     print("Eval policy time:", timers.stop("eval policy"))
-    print("Deep CRF training complete")
+    print("Deep CFR training complete")
     torch.save(policy.state_dict(), "policy.pth")
     print("Policy model saved!")
 
@@ -328,6 +340,6 @@ if __name__ == "__main__":
     mp.set_sharing_strategy("file_system")
     env = HeadsUpPoker(ObsProcessor())
 
-    crf_iterations = 1024
-    traverses_per_iteration = 16384
-    deepcrf(env, crf_iterations, traverses_per_iteration)
+    cfr_iterations = 128
+    traverses_per_iteration = 2048
+    deepcfr(env, cfr_iterations, traverses_per_iteration)

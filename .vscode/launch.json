@@ -12,30 +12,30 @@
             "console": "integratedTerminal"
         },
         {
-            "name": "DeepCRFPokerEnv",
+            "name": "DeepCFRPokerEnv",
             "type": "debugpy",
             "request": "launch",
-            "program": "pokerenv_crf.py",
-            "cwd": "${workspaceFolder}/deepcrf",
+            "program": "pokerenv_cfr.py",
+            "cwd": "${workspaceFolder}/deepcfr",
             "console": "integratedTerminal"
         },
         {
-            "name": "DeepCRFTraining",
+            "name": "DeepCFRTraining",
             "type": "debugpy",
             "request": "launch",
-            "program": "train_deepcrf.py",
-            "cwd": "${workspaceFolder}/deepcrf",
+            "program": "train_deepcfr.py",
+            "cwd": "${workspaceFolder}/deepcfr",
             "console": "integratedTerminal",
             "env": {
                 "CUDA_VISIBLE_DEVICES": "1"
             }
         },
         {
-            "name": "DeepCRFPolicyEval",
+            "name": "DeepCFRPolicyEval",
             "type": "debugpy",
             "request": "launch",
             "program": "eval_policy.py",
-            "cwd": "${workspaceFolder}/deepcrf",
+            "cwd": "${workspaceFolder}/deepcfr",
             "console": "integratedTerminal",
             "env": {
                 "CUDA_VISIBLE_DEVICES": "1"
