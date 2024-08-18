@@ -172,6 +172,21 @@ def draw_opponent_cards(screen, cards, show_opponent_cards):
         draw_card(screen, WIDTH // 2, 0)
 
 
+def draw_opponent_distribution(screen, distribution, show_opponent_distribution):
+    if show_opponent_distribution and distribution is not None:
+        font = pygame.font.Font(None, FONT_SIZE)
+        action_short_name = ["FOLD  ", "CALL   ", "RAISE ", "ALL IN"]
+        for i, prob in enumerate(distribution):
+            text = font.render(f"{action_short_name[i]}: {prob:.2f}", True, WHITE)
+            screen.blit(
+                text,
+                (
+                    WIDTH // 2 + CARD_WIDTH,
+                    i * FONT_SIZE + CARD_HEIGHT // 2 - 2 * FONT_SIZE,
+                ),
+            )
+
+
 def draw_player_cards(screen, cards):
     draw_card(screen, WIDTH // 2 - CARD_WIDTH, HEIGHT - CARD_HEIGHT, cards[0])
     draw_card(screen, WIDTH // 2, HEIGHT - CARD_HEIGHT, cards[1])
@@ -284,8 +299,12 @@ class CFRPlayer:
         from deepcfr.player_wrapper import PolicyPlayerWrapper
 
         model = BaseModel().cuda()
-        model.load_state_dict(torch.load("deepcfr/policy.pth"))
+        model.load_state_dict(torch.load("deepcfr/policy.pth", weights_only=True))
         self.player = PolicyPlayerWrapper(model)
+
+    @property
+    def previous_action_distribution(self):
+        return self.player.previous_action_distribution
 
     def __call__(self, obs):
         return self.player(obs)
@@ -300,6 +319,7 @@ def main():
 
     running = True
     show_opponent_cards = False
+    show_opponent_distribution = False
     buttons = [
         Button(
             WIDTH - 4 * (BUTTON_WIDTH + 10),
@@ -348,6 +368,16 @@ def main():
         None,
     )
 
+    show_opponent_distribution_button = Button(
+        0,
+        HEIGHT // 2 + BUTTON_HEIGHT,
+        BUTTON_WIDTH * 2,
+        BUTTON_HEIGHT,
+        "Show distribution",
+        RED,
+        None,
+    )
+
     player_stats = PlayerStatistics()
     while running:
         screen.fill(BLUE)
@@ -359,6 +389,9 @@ def main():
                 if show_opponent_cards_button.is_clicked(x, y):
                     show_opponent_cards = not show_opponent_cards
 
+                if show_opponent_distribution_button.is_clicked(x, y):
+                    show_opponent_distribution = not show_opponent_distribution
+
                 for button in buttons:
                     if button.is_clicked(x, y):
                         reward, done = game.step(button.action)
@@ -369,10 +402,16 @@ def main():
 
         draw_table(screen)
         draw_opponent_cards(screen, game.get_opponent_cards(), show_opponent_cards)
+        draw_opponent_distribution(
+            screen,
+            env.env_player.previous_action_distribution,
+            show_opponent_distribution,
+        )
         draw_player_cards(screen, game.get_player_cards())
         draw_community_cards(screen, game.get_community_cards())
         draw_buttons(screen, buttons)
         show_opponent_cards_button.draw(screen)
+        show_opponent_distribution_button.draw(screen)
         if game.opponent_folded():
             show_opponent_folded()
 

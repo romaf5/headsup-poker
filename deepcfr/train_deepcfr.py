@@ -318,6 +318,6 @@ if __name__ == "__main__":
     mp.set_sharing_strategy("file_system")
     env = HeadsUpPoker(ObsProcessor())
 
-    cfr_iterations = 256
-    traverses_per_iteration = 10000
+    cfr_iterations = 64
+    traverses_per_iteration = 3000
     deepcfr(env, cfr_iterations, traverses_per_iteration)

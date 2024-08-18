@@ -5,6 +5,7 @@ import numpy as np
 class PolicyPlayerWrapper:
     def __init__(self, policy):
         self.policy = policy
+        self.previous_action_distribution = None
 
     def _batch_obses(self, obses):
         return {
@@ -18,5 +19,6 @@ class PolicyPlayerWrapper:
             action_distribution = torch.nn.functional.softmax(
                 action_distribution, dim=-1
             )
+            self.previous_action_distribution = action_distribution.cpu().numpy()
             action = torch.multinomial(action_distribution, 1).item()
             return action
