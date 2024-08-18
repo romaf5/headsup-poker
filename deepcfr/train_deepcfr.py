@@ -86,7 +86,7 @@ def train_policy(policy, policy_storage, logger):
     batch_size = 8192
     mini_batches = epochs * len(policy_storage) // batch_size
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
-    for iter in range(mini_batches):
+    for iter in tqdm(range(mini_batches)):
         obses, ts, distributions = batch_sampler(batch_size)
         optimizer.zero_grad()
         action_distribution = policy(obses)
