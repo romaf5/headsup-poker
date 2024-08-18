@@ -91,7 +91,7 @@ def train_policy(policy, policy_storage, logger):
         optimizer.zero_grad()
         action_distribution = policy(obses)
         action_distribution = torch.nn.functional.softmax(action_distribution, dim=-1)
-        loss = (ts * (action_distribution - distributions).pow(2)).sum(1).mean()
+        loss = (ts * (action_distribution - distributions).pow(2)).mean()
         logger.add_scalar("policy_training/loss", loss.item(), iter)
         loss.backward()
         optimizer.step()
