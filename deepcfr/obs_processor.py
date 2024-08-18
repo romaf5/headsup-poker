@@ -58,7 +58,11 @@ class ObsProcessor:
             opponent_this_stage_bet / pot_size,
             stack_size / pot_size,
             pot_size / 1000,
-            stack_size / pot_size,
+            (
+                (opponent_this_stage_bet - player_this_stage_bet) / stack_size
+                if stack_size > 0
+                else 0
+            ),
         ]
 
     def __call__(self, obs):
@@ -69,10 +73,14 @@ class ObsProcessor:
             obs["first_to_act_next_stage"]
         )
         bets_and_stacks = self._process_bets_and_stacks(obs)
-        return {
-            "board_and_hand": board + player_hand,  # 15 + 6
+        processed_obs = {
+            "board_and_hand": player_hand + board,  # 6 + 15
             "stage": stage,  # 1
             "first_to_act_next_stage": first_to_act_next_stage,  # 1
             "bets_and_stacks": bets_and_stacks,  # 8
-            "player_idx": obs["player_idx"],
         }
+
+        if "player_idx" in obs:
+            processed_obs["player_idx"] = obs["player_idx"]
+
+        return processed_obs
