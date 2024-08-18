@@ -370,7 +370,7 @@ def main():
 
     show_opponent_distribution_button = Button(
         0,
-        HEIGHT // 2 + BUTTON_HEIGHT,
+        HEIGHT // 2 + BUTTON_HEIGHT // 2 + 1,
         BUTTON_WIDTH * 2,
         BUTTON_HEIGHT,
         "Show distribution",
