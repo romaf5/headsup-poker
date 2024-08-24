@@ -1,6 +1,7 @@
 # ignore tensoboard logs
 deepcfr/runs/
 runs/
+nn/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
