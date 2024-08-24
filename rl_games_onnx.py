@@ -8,15 +8,13 @@ import torch.nn.functional as F
 from rl_games.torch_runner import Runner
 
 
-class ModelWrapper(torch.nn.Module):
+class ModelWrapper(nn.Module):
     def __init__(self, model):
         super(ModelWrapper, self).__init__()
         self._model = model
 
     def forward(self, x):
-        input_dict = {}
-        input_dict["obs"] = self._model.norm_obs(x)
-        logits = self._model.a2c_network(input_dict)["logits"]
+        logits = self._model.a2c_network({"obs": self._model.norm_obs(x)})[0]
         probs = F.softmax(logits, dim=-1)
         return probs
 
@@ -39,11 +37,16 @@ def main():
     agent.restore(args["model"])
 
     inputs = np.random.rand(1, 31).astype(np.float32)
+    inputs = torch.tensor(inputs).cuda()
     torch.onnx.export(
         ModelWrapper(agent.model),
-        torch.tensor(inputs),
+        inputs,
         "rl_games_model.onnx",
         input_names=["obs"],
         output_names=["logits"],
         opset_version=11,
     )
+
+
+if __name__ == "__main__":
+    main()

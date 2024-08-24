@@ -319,24 +319,20 @@ class ONNXRLGamesPlayer:
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
         self.previous_action_distribution = None
-
         self.obs_processor = RLGamesObsProcessor()
-
-    @property
-    def previous_action_distribution(self):
-        return self.previous_action_distribution
 
     def __call__(self, obs):
         obs = obs.astype(np.float32)
         obs = obs[np.newaxis, :]
         action_distribution = self.session.run(
             [self.output_name], {self.input_name: obs}
-        )[0]
+        )
+        action_distribution = action_distribution[0][0]
         self.previous_action_distribution = action_distribution
         action = np.random.choice(
             range(len(action_distribution)), p=action_distribution
         )
-        return action[0]
+        return action
 
 
 def main():
