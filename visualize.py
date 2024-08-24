@@ -4,12 +4,10 @@ import time
 import torch
 import pygame
 import cairosvg
-import numpy as np
 from treys import Card
 from poker_env import Action, ObsProcessor
-from poker_env import HeadsUpPoker, AlwaysCallPlayer, RandomPlayer
+from poker_env import HeadsUpPoker
 
-from train_v0 import SimpleModel
 
 pygame.init()
 
