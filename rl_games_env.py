@@ -41,7 +41,7 @@ class PolicyPlayerWrapper:
                 "board_and_hand": [int(x) for x in obs[:21]],
                 "stage": int(obs[21]),
                 "first_to_act_next_stage": int(obs[22]),
-                "bets_and_stacks": obs[23:],
+                "bets_and_stacks": list(obs[23:]),
             }
 
             obs = self._batch_obses([obs_dict])
@@ -70,7 +70,7 @@ class HeadsUpPokerRLGames(HeadsUpPoker):
         # model = RandomPlayer()
 
         self.observation_space = spaces.Box(
-            low=-1e9, high=1e9, shape=(31,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(31,), dtype=np.float32
         )
 
         super(HeadsUpPokerRLGames, self).__init__(obs_processor, model)

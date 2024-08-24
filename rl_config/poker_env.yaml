@@ -48,8 +48,9 @@ params:
 
       player:
         games_num: 50000
-        deterministic: False
+        deterministic: True
         print_stats: False
+        use_vecenv: True
 
       env_config:
         name: HeadsUpPokerRLGames-v0
