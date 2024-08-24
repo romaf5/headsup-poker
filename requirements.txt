@@ -6,3 +6,6 @@ cairosvg
 torch
 tqdm
 tensorboard
+# exploitability rl-games
+ray
+rl-games
