@@ -4,6 +4,7 @@ import time
 import torch
 import pygame
 import cairosvg
+import numpy as np
 from treys import Card
 from poker_env import Action, ObsProcessor
 from poker_env import HeadsUpPoker
@@ -299,6 +300,7 @@ class CFRPlayer:
         model = BaseModel().cuda()
         model.load_state_dict(torch.load("deepcfr/policy.pth", weights_only=True))
         self.player = PolicyPlayerWrapper(model)
+        self.obs_processor = ObsProcessor()
 
     @property
     def previous_action_distribution(self):
@@ -308,10 +310,35 @@ class CFRPlayer:
         return self.player(obs)
 
 
+class ONNXRLGamesPlayer:
+    def __init__(self):
+        import onnxruntime as ort
+        from rl_games_env import RLGamesObsProcessor
+
+        self.session = ort.InferenceSession("rl_games_model.onnx")
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+        self.previous_action_distribution = None
+        self.obs_processor = RLGamesObsProcessor()
+
+    def __call__(self, obs):
+        obs = obs.astype(np.float32)
+        obs = obs[np.newaxis, :]
+        action_distribution = self.session.run(
+            [self.output_name], {self.input_name: obs}
+        )
+        action_distribution = action_distribution[0][0]
+        self.previous_action_distribution = action_distribution
+        action = np.random.choice(
+            range(len(action_distribution)), p=action_distribution
+        )
+        return action
+
+
 def main():
-    obs_processor = ObsProcessor()
     player = CFRPlayer()
-    env = HeadsUpPoker(obs_processor, player)
+    # player = ONNXRLGamesPlayer()
+    env = HeadsUpPoker(player.obs_processor, player)
     game = Game(env)
     game.reset()
 

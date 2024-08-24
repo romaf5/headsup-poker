@@ -9,3 +9,5 @@ tensorboard
 # exploitability rl-games
 ray
 rl-games
+onnx
+onnxruntime

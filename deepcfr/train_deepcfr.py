@@ -240,6 +240,6 @@ if __name__ == "__main__":
     mp.set_start_method("spawn")
     env = HeadsUpPoker(ObsProcessor())
 
-    cfr_iterations = 64
+    cfr_iterations = 128
     traverses_per_iteration = 3000
     deepcfr(env, cfr_iterations, traverses_per_iteration)
