@@ -1,14 +1,14 @@
-import psutil
 from copy import deepcopy
 
 import torch
 import numpy as np
 from tqdm import tqdm
+
 import torch.multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 
 from model import BaseModel
-from bounded_storage import BoundedStorage, GPUBoundedStorage
+from bounded_storage import GPUBoundedStorage, convert_storage
 from player_wrapper import PolicyPlayerWrapper
 from pokerenv_cfr import Action, HeadsUpPoker, ObsProcessor
 from cfr_env_wrapper import CFREnvWrapper
@@ -16,58 +16,23 @@ from eval_policy import EvalPolicyPlayer
 
 from time_tools import Timers
 
-NUM_WORKERS = 16
+NUM_WORKERS = 64
+BATCH_SIZE = 16384
+
 BOUNDED_STORAGE_MAX_SIZE = 40_000_000
 
 
-class EvalPolicy:
-    def __init__(self, env, policy, logger):
-        self.env = env
-        self.player = PolicyPlayerWrapper(policy)
-        self.logger = logger
+def eval_policy(env, policy, logger, games_to_play=50000):
+    player = PolicyPlayerWrapper(policy)
 
-    def eval(self, games_to_play=50000):
-        eval_policy_player = EvalPolicyPlayer(self.env)
-        simple_player_scores = eval_policy_player.eval(self.player, games_to_play)
+    eval_policy_player = EvalPolicyPlayer(env)
+    simple_player_scores = eval_policy_player.eval(player, games_to_play)
 
-        for opponent_name, score in simple_player_scores.items():
-            self.logger.add_scalar(
-                f"policy_evaluation/{opponent_name}/mean_reward", score
-            )
-
-
-def _batch_obses(obses):
-    return {k: torch.tensor([obs[k] for obs in obses]) for k in obses[0].keys()}
+    for opponent_name, score in simple_player_scores.items():
+        logger.add_scalar(f"policy_evaluation/{opponent_name}/mean_reward", score)
 
 
 class BatchSampler:
-    def __init__(self, samples):
-        self.dicts = [sample[0] for sample in samples]
-        self.ts = [sample[1] for sample in samples]
-        self.values = [sample[2] for sample in samples]
-
-        # reshape dicts
-        keys = self.dicts[0].keys()
-        self.dicts = {
-            k: torch.tensor([dct[k] for dct in self.dicts], device="cuda") for k in keys
-        }
-        self.ts = torch.tensor(self.ts, device="cuda")[..., None]
-        self.values = torch.tensor(np.array(self.values), device="cuda")
-
-    def __len__(self):
-        return len(self.ts)
-
-    def __call__(self, batch_size):
-        indices = np.random.choice(len(self), batch_size)
-
-        obs = {k: v[indices] for k, v in self.dicts.items()}
-        ts = self.ts[indices]
-        values = self.values[indices]
-
-        return obs, ts, values
-
-
-class BatchSamplerGPUStorage:
     def __init__(self, bounded_storage):
         self.dicts, self.ts, self.values = bounded_storage.get_storage()
 
@@ -75,7 +40,7 @@ class BatchSamplerGPUStorage:
         return len(self.ts)
 
     def __call__(self, batch_size):
-        indices = np.random.choice(len(self), batch_size)
+        indices = torch.randint(0, len(self), (batch_size,), device="cuda")
 
         obs = {k: v[indices] for k, v in self.dicts.items()}
         ts = self.ts[indices]
@@ -87,9 +52,9 @@ class BatchSamplerGPUStorage:
 def train_values(player, samples):
     mini_batches = 4000
     optimizer = torch.optim.Adam(player.parameters(), lr=1e-3)
-    batch_sampler = BatchSamplerGPUStorage(samples)
+    batch_sampler = BatchSampler(samples)
     for _ in range(mini_batches):
-        obses, ts, values = batch_sampler(8192)
+        obses, ts, values = batch_sampler(BATCH_SIZE)
         optimizer.zero_grad()
         value_per_action = player(obses)
         loss = (ts * (value_per_action - values).pow(2)).mean()
@@ -99,14 +64,13 @@ def train_values(player, samples):
 
 
 def train_policy(policy, policy_storage, logger):
-    batch_sampler = BatchSamplerGPUStorage(policy_storage)
+    batch_sampler = BatchSampler(policy_storage)
 
-    epochs = 500
-    batch_size = 8192
-    mini_batches = epochs * len(policy_storage) // batch_size
-    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+    epochs = 1000
+    mini_batches = epochs * len(policy_storage) // BATCH_SIZE
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
     for iter in tqdm(range(mini_batches)):
-        obses, ts, distributions = batch_sampler(batch_size)
+        obses, ts, distributions = batch_sampler(BATCH_SIZE)
         optimizer.zero_grad()
         action_distribution = policy(obses)
         action_distribution = torch.nn.functional.softmax(action_distribution, dim=-1)
@@ -116,14 +80,12 @@ def train_policy(policy, policy_storage, logger):
         optimizer.step()
 
 
-def regret_matching(values, eps=1e-6):
+def regret_matching(values, eps: float = 1e-6):
     values = torch.clamp(values, min=0)
     total = torch.sum(values)
     if total <= eps:
         return torch.ones_like(values) / values.shape[-1]
-
-    values /= torch.sum(values) + eps
-    return values
+    return values / total
 
 
 class Workers:
@@ -132,6 +94,8 @@ class Workers:
         self.mp_pool = mp.Pool(num_processes)
 
     def __del__(self):
+        self.mp_pool.terminate()
+        self.mp_pool.join()
         self.mp_pool.close()
 
     def sync_map(self, func, args):
@@ -141,16 +105,27 @@ class Workers:
         return self.mp_pool.map(func, args)
 
 
+def _batch_obs(obs):
+    batched_obs = {
+        k: torch.tensor(obs[k], dtype=torch.int8).unsqueeze(0)
+        for k in ["board_and_hand", "stage", "first_to_act_next_stage"]
+    }
+    batched_obs["bets_and_stacks"] = torch.tensor(
+        obs["bets_and_stacks"], dtype=torch.float32
+    ).unsqueeze(0)
+    return batched_obs
+
+
 def traverse_cfr(env, player_idx, players, samples_storage, policy_storage, cfr_iter):
     if env.done:
         return env.reward[player_idx]
 
     obs = env.obs
-    batched_obs = _batch_obses([obs])
+    batched_obs = _batch_obs(obs)
     if player_idx == obs["player_idx"]:
         values = players[player_idx](batched_obs)[0]
-        distribution = regret_matching(values).cpu()
-        va = torch.zeros(len(Action))
+        distribution = regret_matching(values).numpy()
+        va = np.zeros(len(Action), dtype=np.float32)
         mean_value_action = 0
         for action_idx, (probability, action) in enumerate(zip(distribution, Action)):
             cfr_env = deepcopy(env)
@@ -162,13 +137,13 @@ def traverse_cfr(env, player_idx, players, samples_storage, policy_storage, cfr_
             va[action_idx] = value_per_action
             mean_value_action += probability * value_per_action
         va -= mean_value_action
-        samples_storage[player_idx].append((obs, cfr_iter, va.numpy()))
+        samples_storage[player_idx].append((obs, cfr_iter, va))
         return mean_value_action
     else:
         values = players[1 - player_idx](batched_obs)[0]
-        distribution = regret_matching(values).cpu()
-        policy_storage.append((obs, cfr_iter, distribution.numpy()))
+        distribution = regret_matching(values)
         sampled_action = torch.multinomial(distribution, 1).item()
+        policy_storage.append((obs, cfr_iter, distribution.numpy()))
         env.step(sampled_action)
         return traverse_cfr(
             env, player_idx, players, samples_storage, policy_storage, cfr_iter
@@ -207,14 +182,78 @@ class TraversalWorker:
                     policy_storage,
                     self.cfr_iter,
                 )
-        return value_storage[self.player_idx], policy_storage
+        return convert_storage(value_storage[self.player_idx]), convert_storage(
+            policy_storage
+        )
 
 
-def deepcfr(env, cfr_iterations, traverses_per_iteration):
+def perform_cfr_iteration(
+    cfr_iter,
+    num_players,
+    traverses_per_iteration,
+    timers,
+    players,
+    workers,
+    env,
+    samples_storage,
+    policy_storage,
+    logger,
+):
+    for player_idx in range(num_players):
+        iteration = cfr_iter * num_players + player_idx
+
+        timers.start("traverse")
+        traversal_worker = TraversalWorker(
+            env,
+            player_idx,
+            players,
+            cfr_iter + 1,
+        )
+
+        per_worker_traverses = (
+            traverses_per_iteration + workers.num_processes - 1
+        ) // workers.num_processes
+
+        results = workers.async_map(
+            traversal_worker,
+            [per_worker_traverses] * workers.num_processes,
+        )
+        traverse_time = timers.stop("traverse")
+        logger.add_scalar("traverse_time", traverse_time, iteration)
+
+        for value, pol in results:
+            samples_storage[player_idx].add_all(value)
+            policy_storage.add_all(pol)
+
+        players[player_idx] = BaseModel().cuda()
+        timers.start("train values model")
+        train_values(players[player_idx], samples_storage[player_idx])
+        train_values_model_time = timers.stop("train values model")
+        logger.add_scalar("train_values_model_time", train_values_model_time, iteration)
+
+        logger.add_scalar(
+            f"samples_storage_size/player_{player_idx}",
+            len(samples_storage[player_idx]),
+            iteration,
+        )
+
+
+def train_and_eval_policy(env, policy_storage, logger, timers):
+    policy = BaseModel().cuda()
+    timers.start("train policy")
+    train_policy(policy, policy_storage, logger)
+    train_policy_time = timers.stop("train policy")
+    logger.add_scalar("train_policy_time", train_policy_time, 0)
+    torch.save(policy.state_dict(), "policy.pth")
+
+    eval_games = 50000
+    eval_policy(env, policy, logger, eval_games)
+
+
+def deepcfr(cfr_iterations, traverses_per_iteration):
     num_players = 2
     assert num_players == 2
-    players = [BaseModel().cuda() for _ in range(num_players)]
-    policy = BaseModel().cuda()
+    env = HeadsUpPoker(ObsProcessor())
 
     samples_storage = [
         GPUBoundedStorage(BOUNDED_STORAGE_MAX_SIZE) for _ in range(num_players)
@@ -222,84 +261,30 @@ def deepcfr(env, cfr_iterations, traverses_per_iteration):
     policy_storage = GPUBoundedStorage(BOUNDED_STORAGE_MAX_SIZE)
 
     timers = Timers()
-    global_iter = 0
-
     logger = SummaryWriter()
     workers = Workers(NUM_WORKERS)
+    players = [BaseModel() for _ in range(num_players)]
     for cfr_iter in tqdm(range(cfr_iterations)):
-        for player_idx in range(num_players):
-            timers.start("traverse")
-            traversal_worker = TraversalWorker(
-                env,
-                player_idx,
-                players,
-                cfr_iter + 1,
-            )
+        perform_cfr_iteration(
+            cfr_iter,
+            num_players,
+            traverses_per_iteration,
+            timers,
+            players,
+            workers,
+            env,
+            samples_storage,
+            policy_storage,
+            logger,
+        )
+        logger.add_scalar("policy_storage_size", len(policy_storage), cfr_iter)
 
-            per_worker_traverses = (
-                traverses_per_iteration + workers.num_processes - 1
-            ) // workers.num_processes
-
-            results = workers.async_map(
-                traversal_worker,
-                [per_worker_traverses] * workers.num_processes,
-            )
-            traverse_time = timers.stop("traverse")
-            logger.add_scalar("traverse_time", traverse_time, global_iter)
-
-            timers.start("store traverse results")
-            for value, pol in results:
-                samples_storage[player_idx].add_all(value)
-                policy_storage.add_all(pol)
-            store_traverse_results_time = timers.stop("store traverse results")
-            logger.add_scalar(
-                "store_traverse_results_time", store_traverse_results_time, global_iter
-            )
-
-            total_values_to_add = sum(len(value) for value, _ in results)
-            total_policy_to_add = sum(len(pol) for _, pol in results)
-            logger.add_scalar("total_values_to_add", total_values_to_add, global_iter)
-            logger.add_scalar("total_policy_to_add", total_policy_to_add, global_iter)
-
-            players[player_idx] = BaseModel().cuda()
-            timers.start("train values model")
-            train_values(players[player_idx], samples_storage[player_idx])
-            train_values_model_time = timers.stop("train values model")
-            logger.add_scalar(
-                "train_values_model_time", train_values_model_time, global_iter
-            )
-            global_iter += 1
-
-            logger.add_scalar(
-                "memory_usage", psutil.virtual_memory().percent, global_iter
-            )
-            logger.add_scalar(
-                f"{player_idx}_samples_storage_size",
-                samples_storage[player_idx].current_len,
-                global_iter,
-            )
-
-    print("Policy storage size:", len(policy_storage))
-    timers.start("train policy")
-    train_policy(policy, policy_storage, logger)
-    train_policy_time = timers.stop("train policy")
-    logger.add_scalar("train_policy_time", train_policy_time, 0)
-    torch.save(policy.state_dict(), "policy.pth")
-
-    eval_policy_player_helper = EvalPolicy(env, policy, logger)
-    print("Final policy evaluation:")
-    eval_games_to_play = 50000
-    timers.start("eval")
-    eval_policy_player_helper.eval(games_to_play=eval_games_to_play)
-    eval_time = timers.stop("eval")
-    logger.add_scalar("eval_time", eval_time, 0)
-    print("Deep CFR training complete")
+    train_and_eval_policy(env, policy_storage, logger, timers)
 
 
 if __name__ == "__main__":
     mp.set_start_method("spawn")
-    env = HeadsUpPoker(ObsProcessor())
 
-    cfr_iterations = 200
-    traverses_per_iteration = 3000
-    deepcfr(env, cfr_iterations, traverses_per_iteration)
+    cfr_iterations = 100
+    traverses_per_iteration = 10000
+    deepcfr(cfr_iterations, traverses_per_iteration)

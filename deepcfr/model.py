@@ -106,7 +106,7 @@ class BaseModel(torch.nn.Module):
         return (z - z.mean(dim=1, keepdim=True)) / (z.std(dim=1, keepdim=True) + 1e-6)
 
     def forward(self, x):
-        stage = x["stage"]
+        stage = x["stage"].long()
         board_and_hand = x["board_and_hand"]
         first_to_act_next_stage = x["first_to_act_next_stage"].long()
 

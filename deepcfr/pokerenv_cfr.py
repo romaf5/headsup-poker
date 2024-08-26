@@ -168,11 +168,11 @@ class HeadsUpPoker(gym.Env):
     def step(self, action):
         action = Action(action)
 
-        # if there are 5 raises in a row, the last raise is an all-in
+        # if there are 3 raises in a row, the last raise is an all-in
         self.previous_actions.append(action)
         if (
-            len(self.previous_actions) >= 5
-            and self.previous_actions[-5:] == [Action.RAISE] * 5
+            len(self.previous_actions) >= 3
+            and self.previous_actions[-3:] == [Action.RAISE] * 3
         ):
             action = Action.ALL_IN
 

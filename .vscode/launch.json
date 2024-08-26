@@ -42,16 +42,6 @@
             }
         },
         {
-            "name": "TrainV0",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "train_v0.py",
-            "console": "integratedTerminal",
-            "env": {
-                "CUDA_VISIBLE_DEVICES": "1"
-            }
-        },
-        {
             "name": "Visualize",
             "type": "debugpy",
             "request": "launch",
