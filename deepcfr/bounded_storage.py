@@ -1,3 +1,6 @@
+import torch
+
+
 class BoundedStorage:
     def __init__(self, max_size):
         self.max_size = max_size
@@ -33,6 +36,51 @@ class BoundedStorage:
             self.storage[self.current_idx :] = items[:first_part]
             self.storage[: len(items) - first_part] = items[first_part:]
             self.current_idx = len(items) - first_part
+
+
+class GPUBoundedStorage:
+    def __init__(self, max_size, target_size=4):
+        self.max_size = max_size
+        self.current_len = 0
+
+        self.obs = {
+            "board_and_hand": torch.zeros(
+                (max_size, 21), device="cuda", dtype=torch.long
+            ),
+            "stage": torch.zeros((max_size, 1), device="cuda", dtype=torch.long),
+            "first_to_act_next_stage": torch.zeros(
+                (max_size, 1), device="cuda", dtype=torch.long
+            ),
+            "bets_and_stacks": torch.zeros((max_size, 8), device="cuda"),
+        }
+
+        self.ts = torch.zeros((max_size, 1), device="cuda")
+        self.values = torch.zeros((max_size, target_size), device="cuda")
+
+    def get_storage(self):
+        ret_obs = {k: v[: self.current_len] for k, v in self.obs.items()}
+        return ret_obs, self.ts[: self.current_len], self.values[: self.current_len]
+
+    def add_all(self, items):
+        for obs, ts, values in items:
+            idx = None
+            if self.current_len < self.max_size:
+                idx = self.current_len
+                self.current_len += 1
+            else:
+                idx = torch.randint(0, self.max_size, (1,)).item()
+            self.obs["board_and_hand"][idx] = torch.tensor(
+                obs["board_and_hand"], device="cuda", dtype=torch.int32
+            )
+            self.obs["stage"][idx] = torch.tensor(obs["stage"], device="cuda")
+            self.obs["first_to_act_next_stage"][idx] = torch.tensor(
+                obs["first_to_act_next_stage"], device="cuda"
+            )
+            self.obs["bets_and_stacks"][idx] = torch.tensor(
+                obs["bets_and_stacks"], device="cuda"
+            )
+            self.ts[idx] = torch.tensor(ts, device="cuda")
+            self.values[idx] = torch.tensor(values, device="cuda")
 
 
 if __name__ == "__main__":
