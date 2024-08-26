@@ -67,12 +67,21 @@ class BatchSampler:
         return obs, ts, values
 
 
-class BatchSamplerGPUStorage(BatchSampler):
+class BatchSamplerGPUStorage:
     def __init__(self, bounded_storage):
         self.dicts, self.ts, self.values = bounded_storage.get_storage()
 
     def __len__(self):
         return len(self.ts)
+
+    def __call__(self, batch_size):
+        indices = np.random.choice(len(self), batch_size)
+
+        obs = {k: v[indices] for k, v in self.dicts.items()}
+        ts = self.ts[indices]
+        values = self.values[indices]
+
+        return obs, ts, values
 
 
 def train_values(player, samples):
