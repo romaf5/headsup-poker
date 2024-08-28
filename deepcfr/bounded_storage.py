@@ -76,7 +76,6 @@ class GPUBoundedStorage:
                 self.obs[k][start_idx:end_idx] = v
             self.ts[start_idx:end_idx] = ts[..., None]
             self.values[start_idx:end_idx] = values
-            torch.cuda.synchronize()
             return
 
         if self.current_len < self.max_size:
@@ -92,7 +91,6 @@ class GPUBoundedStorage:
             self.ts[: num_items - first_part] = ts[first_part:][..., None]
             self.values[: num_items - first_part] = values[first_part:]
             self.current_idx = num_items - first_part
-            torch.cuda.synchronize()
             return
 
         if self.current_idx + num_items <= self.max_size:
@@ -101,7 +99,6 @@ class GPUBoundedStorage:
             self.ts[self.current_idx : self.current_idx + num_items] = ts[..., None]
             self.values[self.current_idx : self.current_idx + num_items] = values
             self.current_idx = (self.current_idx + num_items) % self.max_size
-            torch.cuda.synchronize()
             return
 
         first_part = self.max_size - self.current_idx
@@ -116,5 +113,3 @@ class GPUBoundedStorage:
         self.ts[: num_items - first_part] = ts[first_part:][..., None]
         self.values[: num_items - first_part] = values[first_part:]
         self.current_idx = num_items - first_part
-
-        torch.cuda.synchronize()

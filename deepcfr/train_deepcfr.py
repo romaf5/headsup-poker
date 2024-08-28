@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 
-import torch.multiprocessing as mp
+import ray
 from torch.utils.tensorboard import SummaryWriter
 
 from model import BaseModel
@@ -88,23 +88,6 @@ def regret_matching(values, eps: float = 1e-6):
     return values / total
 
 
-class Workers:
-    def __init__(self, num_processes):
-        self.num_processes = num_processes
-        self.mp_pool = mp.Pool(num_processes)
-
-    def __del__(self):
-        self.mp_pool.terminate()
-        self.mp_pool.join()
-        self.mp_pool.close()
-
-    def sync_map(self, func, args):
-        return [func(arg) for arg in args]
-
-    def async_map(self, func, args):
-        return self.mp_pool.map(func, args)
-
-
 def _batch_obs(obs):
     batched_obs = {
         k: torch.tensor(obs[k], dtype=torch.int8).unsqueeze(0)
@@ -150,41 +133,37 @@ def traverse_cfr(env, player_idx, players, samples_storage, policy_storage, cfr_
         )
 
 
-class TraversalWorker:
-    def __init__(self, env, player_idx, players, cfr_iter):
-        self.player_idx = player_idx
-        self.cfr_iter = cfr_iter
-        self.env = CFREnvWrapper(env)
-        for idx in range(2):
-            torch.save(players[idx].state_dict(), f"/tmp/player_{idx}.pth")
+@ray.remote
+def traverses_run(cfr_iter, player_idx, traverses):
+    torch.set_num_threads(1)
+    value_storage = [[], []]
+    policy_storage = []
 
-    def __call__(self, traverses):
-        value_storage = [[], []]
-        policy_storage = []
-
-        players = [BaseModel() for _ in range(2)]
-        for idx in range(2):
-            players[idx].load_state_dict(
-                torch.load(
-                    f"/tmp/player_{idx}.pth", weights_only=True, map_location="cpu"
-                )
-            )
-            players[idx].eval()
-
-        with torch.no_grad():
-            for _ in range(traverses):
-                self.env.reset()
-                traverse_cfr(
-                    self.env,
-                    self.player_idx,
-                    players,
-                    value_storage,
-                    policy_storage,
-                    self.cfr_iter,
-                )
-        return convert_storage(value_storage[self.player_idx]), convert_storage(
-            policy_storage
+    players = [BaseModel() for _ in range(2)]
+    for idx in range(2):
+        players[idx].load_state_dict(
+            torch.load(f"/tmp/player_{idx}.pth", weights_only=True, map_location="cpu")
         )
+        players[idx].eval()
+
+    env = CFREnvWrapper(HeadsUpPoker(ObsProcessor()))
+    with torch.no_grad():
+        for _ in range(traverses):
+            env.reset()
+            traverse_cfr(
+                env,
+                player_idx,
+                players,
+                value_storage,
+                policy_storage,
+                cfr_iter,
+            )
+    return convert_storage(value_storage[player_idx]), convert_storage(policy_storage)
+
+
+def save_players(players):
+    for idx in range(2):
+        torch.save(players[idx].state_dict(), f"/tmp/player_{idx}.pth")
 
 
 def perform_cfr_iteration(
@@ -193,31 +172,21 @@ def perform_cfr_iteration(
     traverses_per_iteration,
     timers,
     players,
-    workers,
-    env,
     samples_storage,
     policy_storage,
     logger,
 ):
     for player_idx in range(num_players):
         iteration = cfr_iter * num_players + player_idx
+        save_players(players)
 
         timers.start("traverse")
-        traversal_worker = TraversalWorker(
-            env,
-            player_idx,
-            players,
-            cfr_iter + 1,
-        )
-
-        per_worker_traverses = (
-            traverses_per_iteration + workers.num_processes - 1
-        ) // workers.num_processes
-
-        results = workers.async_map(
-            traversal_worker,
-            [per_worker_traverses] * workers.num_processes,
-        )
+        traverses_per_run = (traverses_per_iteration + NUM_WORKERS - 1) // NUM_WORKERS
+        future_results = [
+            traverses_run.remote(cfr_iter + 1, player_idx, traverses_per_run)
+            for _ in range(NUM_WORKERS)
+        ]
+        results = ray.get(future_results)
         traverse_time = timers.stop("traverse")
         logger.add_scalar("traverse_time", traverse_time, iteration)
 
@@ -253,7 +222,6 @@ def train_and_eval_policy(env, policy_storage, logger, timers):
 def deepcfr(cfr_iterations, traverses_per_iteration):
     num_players = 2
     assert num_players == 2
-    env = HeadsUpPoker(ObsProcessor())
 
     samples_storage = [
         GPUBoundedStorage(BOUNDED_STORAGE_MAX_SIZE) for _ in range(num_players)
@@ -262,7 +230,6 @@ def deepcfr(cfr_iterations, traverses_per_iteration):
 
     timers = Timers()
     logger = SummaryWriter()
-    workers = Workers(NUM_WORKERS)
     players = [BaseModel() for _ in range(num_players)]
     for cfr_iter in tqdm(range(cfr_iterations)):
         perform_cfr_iteration(
@@ -271,20 +238,21 @@ def deepcfr(cfr_iterations, traverses_per_iteration):
             traverses_per_iteration,
             timers,
             players,
-            workers,
-            env,
             samples_storage,
             policy_storage,
             logger,
         )
         logger.add_scalar("policy_storage_size", len(policy_storage), cfr_iter)
 
+    env = HeadsUpPoker(ObsProcessor())
     train_and_eval_policy(env, policy_storage, logger, timers)
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn")
+    ray.init()
 
     cfr_iterations = 100
     traverses_per_iteration = 10000
     deepcfr(cfr_iterations, traverses_per_iteration)
+
+    ray.shutdown()

@@ -3,7 +3,7 @@ from copy import deepcopy
 
 class CFREnvWrapper:
     def __init__(self, env):
-        self.env = deepcopy(env)
+        self.env = env
         self.reset()
 
     def reset(self):

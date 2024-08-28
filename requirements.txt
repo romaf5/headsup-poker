@@ -6,8 +6,8 @@ cairosvg
 torch
 tqdm
 tensorboard
-# exploitability rl-games
 ray
+# exploitability rl-games
 rl-games
 onnx
 onnxruntime
