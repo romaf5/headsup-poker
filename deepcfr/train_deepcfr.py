@@ -245,6 +245,16 @@ def deepcfr(cfr_iterations, traverses_per_iteration):
         logger.add_scalar("policy_storage_size", len(policy_storage), cfr_iter)
 
     env = HeadsUpPoker(ObsProcessor())
+    policy_storage.save("policy_storage.pt")
+    train_and_eval_policy(env, policy_storage, logger, timers)
+
+
+def policy_training_only():
+    timers = Timers()
+    logger = SummaryWriter()
+    env = HeadsUpPoker(ObsProcessor())
+    policy_storage = GPUBoundedStorage(BOUNDED_STORAGE_MAX_SIZE)
+    policy_storage.load("policy_storage.pt")
     train_and_eval_policy(env, policy_storage, logger, timers)
 
 

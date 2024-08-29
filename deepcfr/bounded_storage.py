@@ -1,3 +1,4 @@
+import gc
 import torch
 import numpy as np
 
@@ -55,6 +56,34 @@ class GPUBoundedStorage:
 
     def __len__(self):
         return self.current_len
+
+    def save(self, filename):
+        torch.save(
+            {
+                "obs": {k: v.cpu() for k, v in self.obs.items()},
+                "ts": self.ts.cpu(),
+                "values": self.values.cpu(),
+                "current_len": self.current_len,
+                "current_idx": self.current_idx,
+            },
+            filename,
+        )
+
+    def load(self, filename):
+        data = torch.load(filename, weights_only=True)
+
+        del self.obs
+        del self.ts
+        del self.values
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        self.obs = {k: v.cuda() for k, v in data["obs"].items()}
+        self.ts = data["ts"].cuda()
+        self.values = data["values"].cuda()
+        self.current_len = data["current_len"]
+        self.current_idx = data["current_idx"]
 
     def add_all(self, items):
         obses, ts, values = items
