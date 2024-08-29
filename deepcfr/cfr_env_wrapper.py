@@ -1,6 +1,3 @@
-from copy import deepcopy
-
-
 class CFREnvWrapper:
     def __init__(self, env):
         self.env = env

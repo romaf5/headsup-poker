@@ -66,7 +66,7 @@ def train_values(player, samples):
 def train_policy(policy, policy_storage, logger):
     batch_sampler = BatchSampler(policy_storage)
 
-    epochs = 1000
+    epochs = 200
     mini_batches = epochs * len(policy_storage) // BATCH_SIZE
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
     for iter in tqdm(range(mini_batches)):
@@ -251,7 +251,7 @@ def deepcfr(cfr_iterations, traverses_per_iteration):
 if __name__ == "__main__":
     ray.init()
 
-    cfr_iterations = 100
+    cfr_iterations = 200
     traverses_per_iteration = 10000
     deepcfr(cfr_iterations, traverses_per_iteration)
 

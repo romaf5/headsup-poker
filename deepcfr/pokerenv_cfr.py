@@ -199,10 +199,6 @@ class HeadsUpPoker(gym.Env):
         if self.stage == Stage.END or self._everyone_all_in():
             return None, self._evaluate(), True, {}
 
-        # if evaluation phase
-        if self.stage == Stage.END or self._everyone_all_in():
-            return None, self._evaluate(), True, {}
-
         return self._get_obs(), None, False, {}
 
     def _get_obs(self):
@@ -273,7 +269,7 @@ def debug_env():
 
     class AlwaysCallPlayer:
         def __call__(self, _):
-            return np.random.choice([Action.CHECK_CALL, Action.RAISE, Action.FOLD])
+            return Action.CHECK_CALL
 
     players = [AlwaysCallPlayer(), AlwaysCallPlayer()]
 

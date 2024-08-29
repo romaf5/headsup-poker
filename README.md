@@ -23,7 +23,7 @@ gym.register(id="HeadsUpPokerRLGames-v0", entry_point="rl_games_env:HeadsUpPoker
 ### Training
 `python exploitability.py -f rl_config/poker_env.yaml`
 
-### Evaluation
+### Evaluation (current model: 350mbb/g)
 `python exploitability.py -f rl_config/poker_env.yaml -p -c runs/<exp_folder>/<checkpoint name>.pth`
 
 ### Model conversion to onnx
