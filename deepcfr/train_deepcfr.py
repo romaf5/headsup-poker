@@ -66,9 +66,13 @@ def train_values(player, samples):
 def train_policy(policy, policy_storage, logger):
     batch_sampler = BatchSampler(policy_storage)
 
-    epochs = 200
+    epochs = 50
     mini_batches = epochs * len(policy_storage) // BATCH_SIZE
-    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
+    learning_rate = 1e-3
+    optimizer = torch.optim.Adam(policy.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=mini_batches // epochs, gamma=0.9
+    )
     for iter in tqdm(range(mini_batches)):
         obses, ts, distributions = batch_sampler(BATCH_SIZE)
         optimizer.zero_grad()
@@ -78,6 +82,7 @@ def train_policy(policy, policy_storage, logger):
         logger.add_scalar("policy_training/loss", loss.item(), iter)
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
 
 def regret_matching(values, eps: float = 1e-6):
@@ -261,7 +266,7 @@ def policy_training_only():
 if __name__ == "__main__":
     ray.init()
 
-    cfr_iterations = 200
+    cfr_iterations = 300
     traverses_per_iteration = 10000
     deepcfr(cfr_iterations, traverses_per_iteration)
 

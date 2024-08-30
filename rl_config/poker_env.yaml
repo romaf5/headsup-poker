@@ -47,7 +47,7 @@ params:
       max_epochs: 200
 
       player:
-        games_num: 50000
+        games_num: 200000
         deterministic: True
         print_stats: False
         use_vecenv: True
