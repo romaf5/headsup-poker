@@ -49,12 +49,29 @@ class BatchSampler:
         return obs, ts, values
 
 
+class MultiBatchSampler(BatchSampler):
+    def __call__(self, mini_batches, batch_size):
+        indices = torch.randint(
+            0,
+            len(self),
+            (
+                mini_batches,
+                batch_size,
+            ),
+            device="cuda",
+        )
+        obs = {k: v[indices] for k, v in self.dicts.items()}
+        ts = self.ts[indices]
+        values = self.values[indices]
+
+        for i in range(mini_batches):
+            yield {k: v[i] for k, v in obs.items()}, ts[i], values[i]
+
+
 def train_values(player, samples):
     mini_batches = 4000
     optimizer = torch.optim.Adam(player.parameters(), lr=1e-3)
-    batch_sampler = BatchSampler(samples)
-    for _ in range(mini_batches):
-        obses, ts, values = batch_sampler(BATCH_SIZE)
+    for obses, ts, values in MultiBatchSampler(samples)(mini_batches, BATCH_SIZE):
         optimizer.zero_grad()
         value_per_action = player(obses)
         loss = (ts * (value_per_action - values).pow(2)).mean()
@@ -64,8 +81,6 @@ def train_values(player, samples):
 
 
 def train_policy(policy, policy_storage, logger):
-    batch_sampler = BatchSampler(policy_storage)
-
     epochs = 50
     learning_rate = 1e-3
     mini_batches = epochs * len(policy_storage) // BATCH_SIZE
@@ -73,8 +88,8 @@ def train_policy(policy, policy_storage, logger):
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=mini_batches // epochs, gamma=0.9
     )
-    for iter in tqdm(range(mini_batches)):
-        obses, ts, distributions = batch_sampler(BATCH_SIZE)
+    multi_batch_sampler = MultiBatchSampler(policy_storage)
+    for obses, ts, distributions in multi_batch_sampler(mini_batches, BATCH_SIZE):
         optimizer.zero_grad()
         action_distribution = policy(obses)
         action_distribution = torch.nn.functional.softmax(action_distribution, dim=-1)
