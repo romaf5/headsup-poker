@@ -67,8 +67,8 @@ def train_policy(policy, policy_storage, logger):
     batch_sampler = BatchSampler(policy_storage)
 
     epochs = 50
-    mini_batches = epochs * len(policy_storage) // BATCH_SIZE
     learning_rate = 1e-3
+    mini_batches = epochs * len(policy_storage) // BATCH_SIZE
     optimizer = torch.optim.Adam(policy.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=mini_batches // epochs, gamma=0.9
@@ -114,16 +114,14 @@ def traverse_cfr(env, player_idx, players, samples_storage, policy_storage, cfr_
         values = players[player_idx](batched_obs)[0]
         distribution = regret_matching(values).numpy()
         va = np.zeros(len(Action), dtype=np.float32)
-        mean_value_action = 0
-        for action_idx, (probability, action) in enumerate(zip(distribution, Action)):
-            cfr_env = deepcopy(env)
+        for action_idx, action in enumerate(Action):
+            # avoid a copy of env for the last action
+            cfr_env = deepcopy(env) if action_idx + 1 < len(Action) else env
             cfr_env.step(action)
-
-            value_per_action = traverse_cfr(
+            va[action_idx] = traverse_cfr(
                 cfr_env, player_idx, players, samples_storage, policy_storage, cfr_iter
             )
-            va[action_idx] = value_per_action
-            mean_value_action += probability * value_per_action
+        mean_value_action = np.dot(distribution, va)
         va -= mean_value_action
         samples_storage[player_idx].append((obs, cfr_iter, va))
         return mean_value_action

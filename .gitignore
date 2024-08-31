@@ -4,6 +4,8 @@ runs/
 nn/
 *.pt
 deepcfr/*.pt
+# virtualenv
+.venv311
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

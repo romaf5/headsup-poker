@@ -11,6 +11,9 @@ def _convert_list_of_cards_to_str(cards):
     return [Card.int_to_str(card) for card in cards]
 
 
+_evaluator = Evaluator()
+
+
 class HeadsUpPoker(gym.Env):
     def __init__(self, obs_processor):
         super(HeadsUpPoker, self).__init__()
@@ -20,9 +23,6 @@ class HeadsUpPoker(gym.Env):
 
         # define action space
         self.action_space = spaces.Discrete(len(Action))
-
-        # poker hand evaluator
-        self.evaluator = Evaluator()
 
         # config
         self.big_blind = 2
@@ -46,8 +46,8 @@ class HeadsUpPoker(gym.Env):
         self.bets_this_stage = None
         self.current_idx = None
         self.stage = None
-        self.previous_actions = None
         self.game_counter = 0
+        self.raises_on_this_stage = 0
 
     def _initialize_stack_sizes(self):
         return [self.stack_size, self.stack_size]
@@ -59,7 +59,10 @@ class HeadsUpPoker(gym.Env):
         return idx
 
     def _stage_over(self):
-        everyone_acted = set(self.active_players) == set(self.players_acted_this_stage)
+        everyone_acted = all(
+            player_idx in self.players_acted_this_stage
+            for player_idx in self.active_players
+        )
         if not everyone_acted:
             return False
         max_bet_this_stage = max(self.bets_this_stage)
@@ -79,15 +82,14 @@ class HeadsUpPoker(gym.Env):
         self.game_counter += 1
 
         self.deck = Deck()
-        self.deck.shuffle()
 
         self.board = []
-        self.previous_actions = []
+        self.raises_on_this_stage = 0
         self.player_hand = [self.deck.draw(2), self.deck.draw(2)]
         self.dealer_idx = 0
         self.stage = Stage.PREFLOP
         self.active_players = [0, 1]
-        self.players_acted_this_stage = set()
+        self.players_acted_this_stage = []
         self.pot_size = 0
         self.bets = [0, 0]
         self.bets_this_stage = [0, 0]
@@ -118,8 +120,8 @@ class HeadsUpPoker(gym.Env):
         if len(self.board) < 5:
             self.board += self.deck.draw(5 - len(self.board))
 
-        player_0 = self.evaluator.evaluate(self.board, self.player_hand[0])
-        player_1 = self.evaluator.evaluate(self.board, self.player_hand[1])
+        player_0 = _evaluator.evaluate(self.board, self.player_hand[0])
+        player_1 = _evaluator.evaluate(self.board, self.player_hand[1])
         if player_0 == player_1:
             return [0, 0]
 
@@ -163,19 +165,18 @@ class HeadsUpPoker(gym.Env):
         else:
             raise ValueError("Invalid action")
 
-        self.players_acted_this_stage.add(self.current_idx)
+        self.players_acted_this_stage.append(self.current_idx)
 
     def step(self, action):
         action = Action(action)
 
         # if there are 3 raises in a row, the last raise is an all-in
-        self.previous_actions.append(action)
-        if (
-            len(self.previous_actions) >= 3
-            and self.previous_actions[-3:] == [Action.RAISE] * 3
-        ):
-            action = Action.ALL_IN
-
+        if action == Action.RAISE:
+            self.raises_on_this_stage += 1
+            if self.raises_on_this_stage == 3:
+                action = Action.ALL_IN
+        else:
+            self.raises_on_this_stage = 0
         self._player_acts(action)
 
         # player folded
@@ -251,7 +252,7 @@ class HeadsUpPoker(gym.Env):
             self.board += self.deck.draw(1)
 
     def _next_stage(self):
-        self.players_acted_this_stage = set()
+        self.players_acted_this_stage = []
         self.bets_this_stage = [0, 0]
         assert self.stage != Stage.END
         self.stage = Stage(self.stage.value + 1)

@@ -1,7 +1,6 @@
 class CFREnvWrapper:
     def __init__(self, env):
         self.env = env
-        self.reset()
 
     def reset(self):
         self.obs = self.env.reset()
