@@ -4,7 +4,7 @@ from deepcfr.obs_processor import ObsProcessor
 import torch
 import numpy as np
 from gym import spaces
-
+import os
 
 class RandomPlayer:
     def __call__(self, _):
@@ -53,6 +53,18 @@ class PolicyPlayerWrapper:
             return action
 
 
+
+class RLGAgentWrapper:
+    def __init__(self, player, is_deterministic=False):
+        self.player = player
+        self.is_deterministic = is_deterministic
+        self.obs_processor = RLGamesObsProcessor()
+    def __call__(self, obs):
+        obs = self.obs_processor(obs)
+        obs = self.agent.obs_to_torch(obs)
+        action = self.agent.get_action(obs, self.is_deterministic).item()
+        return action
+
 class HeadsUpPokerRLGames(HeadsUpPoker):
     def __init__(self):
         from deepcfr.model import BaseModel
@@ -66,7 +78,7 @@ class HeadsUpPokerRLGames(HeadsUpPoker):
                 map_location="cpu",
             )
         )
-        model = PolicyPlayerWrapper(policy)
+        model = RLGAgentWrapper(policy)
         # model = RandomPlayer()
 
         self.observation_space = spaces.Box(
@@ -74,6 +86,39 @@ class HeadsUpPokerRLGames(HeadsUpPoker):
         )
 
         super(HeadsUpPokerRLGames, self).__init__(obs_processor, model)
+
+
+        op_obs = self.agent.obs_to_torch(self.opponent_obs)
+        
+        opponent_action = self.agent.get_action(op_obs, self.is_deterministic).item()
+        obs, reward, done, info = self.env.step(action, opponent_action)
+
+class HeadsUpPokerRLGamesSelfplay(HeadsUpPoker):
+    def __init__(self):
+        
+        obs_processor = RLGamesObsProcessor()
+
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(31,), dtype=np.float32
+        )
+        model = self._create_agent()
+        super(HeadsUpPokerRLGamesSelfplay, self).__init__(obs_processor, model)
+
+    def _create_agent(self, config='rl_config/poker_sp_env.yaml'):
+        import yaml
+        from rl_games.torch_runner import Runner
+        with open(config, 'r') as stream:
+            config = yaml.safe_load(stream)
+            runner = Runner()
+            from rl_games.common.env_configurations import get_env_info
+            config['params']['config']['env_info'] = get_env_info(self)
+            runner.load(config)
+        config = runner.get_prebuilt_config()
+
+        # 'RAYLIB has bug here, CUDA_VISIBLE_DEVICES become unset'
+        os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
+        self.agent = runner.create_player()
 
 
 if __name__ == "__main__":
