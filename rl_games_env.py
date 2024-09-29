@@ -78,7 +78,7 @@ class HeadsUpPokerRLGames(HeadsUpPoker):
                 map_location="cpu",
             )
         )
-        model = RLGAgentWrapper(policy)
+        model = PolicyPlayerWrapper(policy)
         # model = RandomPlayer()
 
         self.observation_space = spaces.Box(
@@ -101,7 +101,8 @@ class HeadsUpPokerRLGamesSelfplay(HeadsUpPoker):
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(31,), dtype=np.float32
         )
-        model = self._create_agent()
+        self.agent = self._create_agent()
+        model = RLGAgentWrapper(self.agent)
         super(HeadsUpPokerRLGamesSelfplay, self).__init__(obs_processor, model)
 
     def _create_agent(self, config='rl_config/poker_sp_env.yaml'):
