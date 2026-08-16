@@ -17,7 +17,7 @@ hand's result in the reward stream instead of silently re-dealing.
 import numpy as np
 
 from headsup.engine import OBS_DIM, HeadsUpPoker
-from headsup.enums import NUM_ACTIONS
+from headsup.game import DEFAULT_GAME, GameConfig
 
 try:  # spaces are only needed for RL libraries
     from gymnasium import spaces as _spaces
@@ -32,13 +32,24 @@ def _call_player(player, obs, ids):
     return player(obs)
 
 
-def _make_spaces():
+def _make_spaces(game=DEFAULT_GAME):
     if _spaces is None:
         return None, None
     return (
         _spaces.Box(low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32),
-        _spaces.Discrete(NUM_ACTIONS),
+        _spaces.Discrete(game.num_actions),
     )
+
+
+def resolve_game(game=None, *players, **engine_kwargs):
+    """The :class:`GameConfig` for an env: ``game`` if given, else the first player's ``game``
+    (network players carry the tree they were trained for), else the default; ``engine_kwargs``
+    (stack_size, small_blind, ...) override individual fields."""
+    if game is None:
+        game = next((getattr(p, "game", None) for p in players if getattr(p, "game", None) is not None), DEFAULT_GAME)
+    if isinstance(game, dict):
+        game = GameConfig.from_dict(game)
+    return game.with_(**engine_kwargs)
 
 
 class PokerVecEnv:
@@ -48,20 +59,22 @@ class PokerVecEnv:
         opponent,
         seat_mode="alternate",
         seed=None,
+        game=None,
         **engine_kwargs,
     ):
         assert seat_mode in ("alternate", "random")
         self.num_envs = num_envs
         self.opponent = opponent
         self.seat_mode = seat_mode
+        self.game = resolve_game(game, opponent, **engine_kwargs)
         self.rng = np.random.default_rng(seed)
         self.engines = [
-            HeadsUpPoker(rng=np.random.default_rng(self.rng.integers(2**63)), **engine_kwargs)
+            HeadsUpPoker(rng=np.random.default_rng(self.rng.integers(2**63)), game=self.game)
             for _ in range(num_envs)
         ]
         # balanced initial seats (flipped on the first reset, so env 0 starts as dealer)
         self.agent_seat = (np.arange(num_envs) % 2) ^ 1
-        self.observation_space, self.action_space = _make_spaces()
+        self.observation_space, self.action_space = _make_spaces(self.game)
         self.hands_completed = 0
 
     # ---------------------------------------------------------------- helpers
@@ -159,8 +172,8 @@ class PokerVecEnv:
 class SingleAgentEnv:
     """One table, gym-style API, agent vs. a fixed opponent."""
 
-    def __init__(self, opponent, seat_mode="alternate", seed=None, **engine_kwargs):
-        self.vec = PokerVecEnv(1, opponent, seat_mode=seat_mode, seed=seed, **engine_kwargs)
+    def __init__(self, opponent, seat_mode="alternate", seed=None, game=None, **engine_kwargs):
+        self.vec = PokerVecEnv(1, opponent, seat_mode=seat_mode, seed=seed, game=game, **engine_kwargs)
         self.observation_space = self.vec.observation_space
         self.action_space = self.vec.action_space
 
@@ -197,6 +210,9 @@ class SingleAgentEnv:
 def play_hands(vec_env, agent, num_hands, progress=False):
     """Run ``num_hands`` complete hands of ``agent`` in ``vec_env``; returns per-hand rewards."""
     rewards = []
+    agent_game, env_game = getattr(agent, "game", None), getattr(vec_env, "game", None)
+    if agent_game is not None and env_game is not None and agent_game.num_actions != env_game.num_actions:
+        raise ValueError(f"the agent plays a {agent_game.num_actions}-action game, the env a {env_game.num_actions}-action one")
     obs = vec_env.reset()
     bar = None
     if progress:
@@ -222,15 +238,16 @@ class NativeVecEnv:
     "raise") or a :class:`headsup.model.BaseModel` given by its numpy weights.
     """
 
-    def __init__(self, num_envs, opponent="call", seat_mode="alternate", seed=None, deterministic=False, **engine_kwargs):
+    def __init__(self, num_envs, opponent="call", seat_mode="alternate", seed=None, deterministic=False, game=None, **engine_kwargs):
         from headsup import native
 
         self._cpp = native.module()
         seed = int(np.random.default_rng(seed).integers(2**63)) if seed is None else int(seed)
         self.num_envs = num_envs
-        self.env = self._cpp.VecEnv(num_envs, seed, native.engine_config(**engine_kwargs), seat_mode == "alternate")
+        self.game = resolve_game(game, opponent, **engine_kwargs)
+        self.env = self._cpp.VecEnv(num_envs, seed, native.engine_config(game=self.game), seat_mode == "alternate")
         self.set_opponent(opponent, deterministic)
-        self.observation_space, self.action_space = _make_spaces()
+        self.observation_space, self.action_space = _make_spaces(self.game)
 
     def set_opponent(self, opponent, deterministic=False):
         from headsup import native
@@ -298,13 +315,15 @@ class NativeVecEnv:
         pass
 
 
-def make_vec_env(num_envs, opponent, seat_mode="alternate", seed=None, backend="auto", deterministic=False, **engine_kwargs):
+def make_vec_env(num_envs, opponent, seat_mode="alternate", seed=None, backend="auto", deterministic=False, game=None, **engine_kwargs):
     """Create a vectorised env.
 
     ``opponent`` may be a player spec string understood by :func:`headsup.players.make_player`
     ("random", "call", "allin", "raise", "cfr[:path]", "onnx[:path]"), a batched player
     callable, a :class:`BaseModel` or its numpy weights.  ``backend`` "cpp" uses the
     extension when the opponent can run natively (simple bots and BaseModel weights).
+    ``game`` fixes the action tree (default: the opponent's, if it is a network player, else the
+    default game); pass it when the *agent* is a network player and the opponent a simple bot.
     """
     from headsup import native
 
@@ -313,15 +332,17 @@ def make_vec_env(num_envs, opponent, seat_mode="alternate", seed=None, backend="
     if not native_opponent and hasattr(opponent, "numpy_weights"):
         native_opponent = True
     if native_ok and native_opponent:
-        return NativeVecEnv(num_envs, opponent, seat_mode=seat_mode, seed=seed, deterministic=deterministic, **engine_kwargs)
+        if hasattr(opponent, "game"):
+            game = resolve_game(game, opponent, **engine_kwargs)
+        return NativeVecEnv(num_envs, opponent, seat_mode=seat_mode, seed=seed, deterministic=deterministic, game=game, **engine_kwargs)
     if backend == "cpp":
         raise ValueError("cpp backend requested but the opponent cannot run natively (or extension missing)")
     if isinstance(opponent, str):
         from headsup.players import make_player
 
-        opponent = make_player(opponent, deterministic=deterministic, seed=seed)
+        opponent = make_player(opponent, deterministic=deterministic, seed=seed, game=resolve_game(game, **engine_kwargs))
     elif hasattr(opponent, "numpy_weights"):
         from headsup.players import TorchPolicyPlayer
 
         opponent = TorchPolicyPlayer(opponent, deterministic=deterministic, seed=seed)
-    return PokerVecEnv(num_envs, opponent, seat_mode=seat_mode, seed=seed, **engine_kwargs)
+    return PokerVecEnv(num_envs, opponent, seat_mode=seat_mode, seed=seed, game=game, **engine_kwargs)

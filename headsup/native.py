@@ -44,15 +44,26 @@ def module():
     return _cpp
 
 
-def engine_config(stack_size=100, small_blind=1, big_blind=2, raise_cap=3):
+def engine_config(stack_size=100, small_blind=1, big_blind=2, raise_cap=3, bet_sizes=("min",), mask_redundant=False, game=None):
+    """C++ EngineConfig from engine kwargs or a :class:`headsup.game.GameConfig`."""
+    from headsup.game import GameConfig, parse_bet_sizes
+
+    if game is None:
+        game = GameConfig(stack_size, small_blind, big_blind, raise_cap, parse_bet_sizes(bet_sizes), mask_redundant)
     cfg = module().EngineConfig()
-    cfg.stack_size = stack_size
-    cfg.small_blind = small_blind
-    cfg.big_blind = big_blind
-    cfg.raise_cap = raise_cap
+    cfg.stack_size = game.stack_size
+    cfg.small_blind = game.small_blind
+    cfg.big_blind = game.big_blind
+    cfg.raise_cap = game.raise_cap
+    cfg.bet_sizes = [-1.0 if s == "min" else float(s) for s in game.bet_sizes]
+    cfg.mask_redundant = bool(game.mask_redundant)
     return cfg
 
 
 def make_model(weights: dict):
-    """Wrap numpy weights (``BaseModel.numpy_weights()``) into a C++ model."""
-    return module().Model({k: np.ascontiguousarray(v, dtype=np.float32) for k, v in weights.items()})
+    """Wrap numpy weights (``BaseModel.numpy_weights()``: arrays + ``"config"``) into a C++ model."""
+    weights = dict(weights)
+    config = weights.pop("config")
+    arrays = {k: np.ascontiguousarray(v, dtype=np.float32) for k, v in weights.items()}
+    arrays["config"] = {k: (int(v) if k == "dim" else dict(v) if k == "game" else str(v)) for k, v in config.items()}
+    return module().Model(arrays)

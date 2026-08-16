@@ -23,8 +23,8 @@ from headsup.players import make_player
 def head_to_head(spec_a, spec_b, hands, num_envs=1024, seed=0, device=None):
     """Mean and standard error of A's chips/hand against B (both seats, alternating)."""
     a = make_player(spec_a, device=device, seed=seed)
-    b = make_player(spec_b, device=device, seed=seed + 1)
-    env = make_vec_env(num_envs, b, seed=seed)
+    b = make_player(spec_b, device=device, seed=seed + 1, game=getattr(a, "game", None))
+    env = make_vec_env(num_envs, b, seed=seed, game=getattr(a, "game", None))  # the row player's action tree
     r = play_hands(env, a, hands)
     return float(r.mean()), float(r.std() / np.sqrt(len(r)))
 

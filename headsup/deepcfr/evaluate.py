@@ -14,10 +14,12 @@ DEFAULT_OPPONENTS = ("random", "call", "allin")
 
 
 def evaluate(player, hands, opponents=DEFAULT_OPPONENTS, num_envs=1024, seed=0, backend="auto", progress=False):
-    """``player`` is a batched player; returns {opponent: mean chips per hand}."""
+    """``player`` is a batched player; returns {opponent: mean chips per hand}.  Envs use the
+    player's action tree (``player.game``) when it has one."""
     scores = {}
+    game = getattr(player, "game", None)
     for i, opp in enumerate(opponents):
-        env = make_vec_env(num_envs, opp, seed=seed + i, backend=backend)
+        env = make_vec_env(num_envs, opp, seed=seed + i, backend=backend, game=game)
         rewards = play_hands(env, player, hands, progress=progress)
         scores[opp] = float(rewards.mean())
     return scores
@@ -44,7 +46,7 @@ def main():
 
     player = make_player(args.policy, device=args.device, deterministic=args.deterministic, seed=args.seed)
     for opp in args.opponents.split(","):
-        env = make_vec_env(args.num_envs, opp.strip(), seed=args.seed)
+        env = make_vec_env(args.num_envs, opp.strip(), seed=args.seed, game=getattr(player, "game", None))
         t0 = time.perf_counter()
         r = play_hands(env, player, args.hands, progress=True)
         dt = time.perf_counter() - t0

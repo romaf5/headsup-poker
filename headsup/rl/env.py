@@ -30,12 +30,12 @@ def _split_config(kwargs):
 
 
 class HeadsUpPokerRLGames(SingleAgentEnv):
-    """One table with the classic gym API (obs float32[31], Discrete(4))."""
+    """One table with the classic gym API (obs float32[OBS_DIM], Discrete(num_actions of the opponent's game))."""
 
     def __init__(self, **kwargs):
         opponent, deterministic, seed, seat_mode, device, engine_kwargs = _split_config(kwargs)
         player = make_player(opponent, device=device or "cpu", deterministic=deterministic, seed=seed)
-        super().__init__(player, seat_mode=seat_mode, seed=seed, **engine_kwargs)
+        super().__init__(player, seat_mode=seat_mode, seed=seed, **engine_kwargs)  # action tree: the opponent's
 
 
 def create_vec_env(config_name, num_actors, **kwargs):

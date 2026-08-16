@@ -20,21 +20,27 @@ from dataclasses import dataclass
 import numpy as np
 
 from headsup.engine import OBS_DIM, HeadsUpPoker
-from headsup.enums import NUM_ACTIONS
+from headsup.game import DEFAULT_GAME
 from headsup.numpy_model import NumpyModel
 
 
-def regret_matching(adv, eps=1e-6, fold_allowed=True):
-    pos = np.clip(adv, 0.0, None)
-    if not fold_allowed:
-        pos = pos.copy()
-        pos[0] = 0.0
+def regret_matching(adv, eps=1e-6, fold_allowed=True, fallback="uniform", legal=None):
+    """Regret matching over the legal actions (``legal`` bool mask; default: all but FOLD unless
+    ``fold_allowed``); ``fallback`` when no legal advantage is positive: ``uniform`` over the
+    legal actions, or ``argmax`` = the highest legal advantage (DeepCFR paper)."""
+    adv = np.asarray(adv, dtype=np.float32)
+    if legal is None:
+        legal = np.ones(len(adv), dtype=bool)
+        legal[0] = fold_allowed
+    legal = np.asarray(legal, dtype=bool)
+    pos = np.where(legal, np.clip(adv, 0.0, None), 0.0)
     total = pos.sum()
     if total <= eps:
-        sigma = np.full(NUM_ACTIONS, 1.0 / NUM_ACTIONS, dtype=np.float32)
-        if not fold_allowed:
-            sigma[0] = 0.0
-            sigma /= sigma.sum()
+        sigma = np.zeros(len(adv), dtype=np.float32)
+        if fallback == "argmax":
+            sigma[int(np.argmax(np.where(legal, adv, -np.inf)))] = 1.0
+        else:
+            sigma[legal] = 1.0 / legal.sum()
         return sigma
     return (pos / total).astype(np.float32)
 
@@ -49,9 +55,9 @@ class Samples:
         return len(self.t)
 
     @staticmethod
-    def empty():
+    def empty(obs_dim=OBS_DIM, num_actions=DEFAULT_GAME.num_actions):
         return Samples(
-            np.zeros((0, OBS_DIM), np.float32), np.zeros((0,), np.float32), np.zeros((0, NUM_ACTIONS), np.float32)
+            np.zeros((0, obs_dim), np.float32), np.zeros((0,), np.float32), np.zeros((0, num_actions), np.float32)
         )
 
     @staticmethod
@@ -67,17 +73,18 @@ class Samples:
 
 
 class _Memory:
-    def __init__(self):
+    def __init__(self, obs_dim=OBS_DIM, num_actions=DEFAULT_GAME.num_actions):
+        self.obs_dim, self.num_actions = obs_dim, num_actions
         self.obs, self.t, self.target = [], [], []
 
     def add(self, obs, t, target):
-        self.obs.append(obs)
+        self.obs.append(obs[: self.obs_dim])
         self.t.append(t)
         self.target.append(target)
 
     def to_samples(self):
         if not self.t:
-            return Samples.empty()
+            return Samples.empty(self.obs_dim, self.num_actions)
         return Samples(
             np.stack(self.obs).astype(np.float32),
             np.asarray(self.t, dtype=np.float32),
@@ -90,36 +97,42 @@ def traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats=None):
     if engine.done:
         return float(engine.rewards[traverser])
     p = engine.current
+    n = engine.num_actions
     obs = engine.observation()
-    fold_ok = engine.fold_allowed
-    sigma = regret_matching(nets[p](obs), fold_allowed=fold_ok)
+    legal, twin = engine.legal_mask_and_twins()
+    sigma = regret_matching(nets[p](obs), legal=legal, fallback=nets[p].rm_fallback)
     if stats is not None:
         stats["nodes"] += 1
     if p == traverser:
-        values = np.empty(NUM_ACTIONS, dtype=np.float32)
-        for a in range(NUM_ACTIONS):
-            if a == 0 and not fold_ok:
-                continue  # fold == check here; filled in below
-            child = engine.clone() if a + 1 < NUM_ACTIONS else engine
+        values = np.empty(n, dtype=np.float32)
+        for a in range(n):
+            if not legal[a]:
+                continue  # duplicates another action; filled in below
+            child = engine.clone() if a + 1 < n else engine
             child.step(a)
             values[a] = traverse(child, traverser, nets, t, rng, adv_mem, strat_mem, stats)
-        if not fold_ok:
-            values[0] = values[1]
+        for a in range(n):
+            if not legal[a]:
+                values[a] = values[twin[a]]
         mean = float(np.dot(sigma, values))
         adv_mem.add(obs, t, values - mean)
         return mean
     strat_mem.add(obs, t, sigma)
     a = int(np.searchsorted(np.cumsum(sigma), rng.random(), side="right"))
-    engine.step(min(a, NUM_ACTIONS - 1))
+    engine.step(min(a, n - 1))
     return traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats)
 
 
 def run_traversals_python(weights, traverser, n_traversals, t, seed, engine_kwargs=None, decks=None):
     """Worker entry point (picklable): returns (adv Samples, strat Samples, nodes)."""
     rng = np.random.default_rng(seed)
-    engine = HeadsUpPoker(rng=rng, **(engine_kwargs or {}))
     nets = [NumpyModel(weights[0]), NumpyModel(weights[1])]
-    adv, strat, stats = _Memory(), _Memory(), {"nodes": 0}
+    if nets[0].obs_dim != nets[1].obs_dim:
+        raise ValueError("both networks must read the same observation width")
+    engine = HeadsUpPoker(rng=rng, game=nets[0].game.with_(**(engine_kwargs or {})))
+    if engine.num_actions != nets[0].num_actions or engine.num_actions != nets[1].num_actions:
+        raise ValueError("the networks' action heads do not match the game's number of actions")
+    adv, strat, stats = _Memory(nets[0].obs_dim, engine.num_actions), _Memory(nets[0].obs_dim, engine.num_actions), {"nodes": 0}
     for i in range(n_traversals):
         engine.reset(None if decks is None else decks[i])
         traverse(engine, traverser, nets, t, rng, adv, strat, stats)
@@ -129,9 +142,10 @@ def run_traversals_python(weights, traverser, n_traversals, t, seed, engine_kwar
 class TraversalRunner:
     """Collects samples for one CFR iteration using all CPU cores."""
 
-    def __init__(self, num_workers=None, backend="auto", engine_kwargs=None):
+    def __init__(self, num_workers=None, backend="auto", engine_kwargs=None, game=None):
         self.num_workers = num_workers or max(1, (os.cpu_count() or 2) - 1)
-        self.engine_kwargs = engine_kwargs or {}
+        self.game = (game or DEFAULT_GAME).with_(**(engine_kwargs or {}))
+        self.engine_kwargs = self.game.to_dict()
         if backend == "auto":
             from headsup import native
 
@@ -142,7 +156,7 @@ class TraversalRunner:
             from headsup import native
 
             self._cpp = native.module()
-            self._cfg = native.engine_config(**self.engine_kwargs)
+            self._cfg = native.engine_config(game=self.game)
             self._pool = ThreadPoolExecutor(self.num_workers)
         elif backend == "python":
             import multiprocessing as mp

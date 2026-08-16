@@ -1,3 +1,7 @@
+"""Action / stage enums.  ``Action`` names the indices of the default 4-action game
+(fold, check/call, min-raise, all-in); games with several bet sizes have more raise indices and
+their all-in is ``GameConfig.all_in`` (see headsup/game.py)."""
+
 from enum import IntEnum
 
 
@@ -16,4 +20,4 @@ class Stage(IntEnum):
     END = 4
 
 
-NUM_ACTIONS = len(Action)
+NUM_ACTIONS = len(Action)  # of the default game

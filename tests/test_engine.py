@@ -28,11 +28,41 @@ def test_reset_blinds_and_first_to_act():
 def test_observation_layout():
     e = HeadsUpPoker(rng=np.random.default_rng(0))
     obs = e.reset(AA_vs_72)
+    assert OBS_DIM == 80
     # As: rank 12 suit 0 -> (13, 1, 13); Ad: rank 12 suit 2 -> (13, 3, 39)
     assert obs[0:6].tolist() == [13, 1, 13, 13, 3, 39]
     assert obs[6:21].tolist() == [0] * 15  # no board pre-flop
     assert obs[21] == 0 and obs[22] == 0  # stage, first_to_act_next_stage (seat 0 = dealer)
     np.testing.assert_allclose(obs[23:31], [1 / 3, 1 / 3, 2 / 3, 1 / 3, 2 / 3, 33, 0.003, 1 / 99], rtol=1e-6)
+    assert obs[31:79].tolist() == [0] * 48  # no action yet
+    assert obs[79] == 0  # consecutive raises
+    e.step(Action.RAISE)
+    e.step(Action.RAISE)
+    assert e.observation()[79] == 2
+
+
+def test_bet_history_features():
+    from headsup.engine import HISTORY_SLOTS, history_slot
+
+    e = HeadsUpPoker(rng=np.random.default_rng(0))
+    e.reset(AA_vs_72)
+    e.step(Action.CHECK_CALL)  # SB calls 1 into a pot of 3
+    e.step(Action.RAISE)  # BB raises 2 into a pot of 4
+    obs = e.step(Action.CHECK_CALL)[0]  # SB calls 2 into 6 -> flop, BB to act
+    pre = obs[history_slot(0, 0) : history_slot(0, 3)]
+    np.testing.assert_allclose(pre, [1 / 3, 1, 2 / 4, 1, 2 / 6, 1], rtol=1e-6)
+    assert obs[history_slot(0, 3) : history_slot(1, 0)].tolist() == [0] * (2 * (HISTORY_SLOTS - 3))
+    assert obs[history_slot(1, 0) : 79].tolist() == [0] * (2 * 3 * HISTORY_SLOTS)  # flop: nothing yet
+    e.step(Action.CHECK_CALL)  # BB checks (size 0, occurred 1)
+    obs = e.step(Action.ALL_IN)[0]  # SB shoves 96 into a pot of 8
+    np.testing.assert_allclose(obs[history_slot(1, 0) : history_slot(1, 2)], [0, 1, 96 / 8, 1], rtol=1e-6)
+    np.testing.assert_allclose(obs[history_slot(0, 0) : history_slot(0, 3)], pre)  # earlier streets are kept
+    # both seats see the same history (it is public information)
+    np.testing.assert_array_equal(e.observation(0)[31:], e.observation(1)[31:])
+    # a clone's history is independent
+    c = e.clone()
+    c.step(Action.CHECK_CALL)
+    assert c.history_n[1] == 3 and e.history_n[1] == 2
 
 
 def test_fold_rewards_are_zero_sum():

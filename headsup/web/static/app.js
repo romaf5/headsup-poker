@@ -190,8 +190,16 @@ function bars(container, rows, opts = {}) {
   });
 }
 
-const ACTION_LABELS = { fold: "Fold", call: "Check/Call", raise: "Raise", allin: "All-in" };
-const ORDER = ["fold", "call", "raise", "allin"];
+// action names / labels in index order come from the server (they depend on the bot's bet sizes)
+let ORDER = ["fold", "call", "raise", "allin"];
+let ACTION_LABELS = { fold: "Fold", call: "Check/Call", raise: "Raise", allin: "All-in" };
+function syncActions(s) {
+  if (s.action_names) {
+    ORDER = s.action_names;
+    ACTION_LABELS = {};
+    s.action_names.forEach((n, i) => { ACTION_LABELS[n] = s.action_labels ? s.action_labels[i] : n; });
+  }
+}
 
 function miniCards(cards) {
   return cards.map((c) => `<span class="mini${c.red ? " red" : ""}">${c.rank}${c.suit}</span>`).join("");
@@ -261,19 +269,20 @@ function render() {
   }
 
   // actions
+  syncActions(s);
   const acts = $("#actions");
   acts.innerHTML = "";
   const best = advice && advice.probs ? advice.probs.reduce((b, r) => (r.p > b.p ? r : b), advice.probs[0]).action : null;
   s.actions.forEach((a) => {
     const b = document.createElement("button");
-    b.className = "act " + a.action + (showAdvice && best === a.action ? " suggested" : "");
+    b.className = "act " + (a.action.startsWith("raise") ? "raise" : a.action) + (showAdvice && best === a.action ? " suggested" : "");
     b.innerHTML = `${a.label}<kbd>${a.key}</kbd>`;
     b.disabled = !s.your_turn;
     b.onclick = (ev) => { ev.currentTarget.blur(); userAct(a.action).catch((e) => toast(e.message)); };
     acts.appendChild(b);
   });
   if (!s.actions.length && !s.hand_over) {
-    ORDER.forEach((a) => { const b = document.createElement("button"); b.className = "act " + a; b.disabled = true; b.textContent = ACTION_LABELS[a]; acts.appendChild(b); });
+    ORDER.forEach((a) => { const b = document.createElement("button"); b.className = "act " + (a.startsWith("raise") ? "raise" : a); b.disabled = true; b.textContent = ACTION_LABELS[a]; acts.appendChild(b); });
   }
   acts.classList.toggle("hidden", s.hand_over);
   $("#turn-hint").textContent = s.hand_over ? "" : s.your_turn ? (s.to_call ? `Your turn — ${s.to_call} to call` : "Your turn — check or bet") : "Bot is thinking…";
@@ -441,7 +450,8 @@ document.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
   if (!$("#modal").classList.contains("hidden")) { if (e.key === "Escape") $("#modal").classList.add("hidden"); return; }
   const k = e.key.toLowerCase();
-  const map = { f: "fold", c: "call", r: "raise", a: "allin" };
+  const map = {};  // keys are assigned by the server per legal action (F, C, R or 1..5 for bet sizes, A)
+  if (state && state.actions) state.actions.forEach((a) => { map[String(a.key).toLowerCase()] = a.action; });
   if (k === "enter" || k === " ") e.preventDefault();  // never let a focused button double-fire
   if (map[k] && state && state.your_turn) { e.preventDefault(); userAct(map[k]).catch((err) => toast(err.message)); }
   else if ((k === "enter" || k === " " || k === "n") && state && state.hand_over) { nextHand().catch((err) => toast(err.message)); }

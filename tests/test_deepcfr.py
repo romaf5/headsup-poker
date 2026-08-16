@@ -11,10 +11,16 @@ from headsup.model import BaseModel
 def test_regret_matching():
     np.testing.assert_allclose(regret_matching(np.array([1.0, 3.0, -2.0, 0.0])), [0.25, 0.75, 0, 0])
     np.testing.assert_allclose(regret_matching(np.array([-1.0, -3.0, -2.0, 0.0])), [0.25] * 4)
+    np.testing.assert_allclose(regret_matching(np.array([-1.0, -3.0, -2.0, 0.0]), fold_allowed=False), [0, 1 / 3, 1 / 3, 1 / 3])
+    # DeepCFR paper fallback: the highest advantage (among the allowed actions) with probability 1
+    np.testing.assert_allclose(regret_matching(np.array([-1.0, -3.0, -2.0, -0.5]), fallback="argmax"), [0, 0, 0, 1])
+    np.testing.assert_allclose(regret_matching(np.array([-0.5, -3.0, -2.0, -1.0]), fallback="argmax"), [1, 0, 0, 0])
+    np.testing.assert_allclose(regret_matching(np.array([-0.5, -3.0, -2.0, -1.0]), fold_allowed=False, fallback="argmax"), [0, 0, 0, 1])
+    np.testing.assert_allclose(regret_matching(np.array([1.0, 3.0, -2.0, 0.0]), fallback="argmax"), [0.25, 0.75, 0, 0])
 
 
 def test_reservoir_is_uniform_and_round_trips(tmp_path):
-    buf = ReservoirBuffer(500, "cpu", seed=0)
+    buf = ReservoirBuffer(500, "cpu", obs_dim=31, seed=0)
     for chunk in range(40):
         t = np.arange(chunk * 500, (chunk + 1) * 500, dtype=np.float32)
         buf.add(np.zeros((500, 31), np.float32), t, np.zeros((500, 4), np.float32))
@@ -22,14 +28,75 @@ def test_reservoir_is_uniform_and_round_trips(tmp_path):
     ts = buf.t.numpy()
     assert 8000 < ts.mean() < 12000  # uniform over [0, 20000)
     buf.save(tmp_path / "buf.pt")
-    other = ReservoirBuffer(500, "cpu").load(tmp_path / "buf.pt")
+    other = ReservoirBuffer(500, "cpu", obs_dim=31).load(tmp_path / "buf.pt")
     assert other.seen == buf.seen and torch.equal(other.t, buf.t)
     obs, t, target = other.sample(16)
     assert obs.shape == (16, 31) and t.shape == (16,) and target.shape == (16, 4)
 
 
-def _peaked(bias):
-    m = BaseModel()
+def test_reservoir_host_storage_samples_to_device():
+    """Memories on the CPU sampled to another device (here also cpu -> exercises the staging path)."""
+    from headsup.engine import OBS_DIM, HeadsUpPoker
+
+    rng = np.random.default_rng(1)
+    e = HeadsUpPoker(rng=rng)
+    rows = []
+    while len(rows) < 200:
+        e.reset()
+        while not e.done:
+            rows.append(e.observation())
+            e.step(rng.integers(4))
+    obs = np.stack(rows[:200])
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    buf = ReservoirBuffer(1000, "cpu", obs_dim=OBS_DIM, seed=0, sample_device=dev)
+    buf.add(obs, np.arange(200, dtype=np.float32), rng.random((200, 4), dtype=np.float32))
+    seen = 0
+    for got, t, target in buf.prefetch(64, 7):
+        assert str(got.device).startswith(dev) and got.shape == (64, OBS_DIM)
+        rows_idx = t.long().cpu().numpy()
+        np.testing.assert_array_equal(got.cpu().numpy(), obs[rows_idx])
+        np.testing.assert_array_equal(target.cpu().numpy(), buf.target[rows_idx].numpy())
+        seen += 1
+    assert seen == 7
+
+
+def test_reservoir_stores_observations_exactly(tmp_path):
+    from headsup.engine import OBS_DIM, HeadsUpPoker
+
+    rng = np.random.default_rng(0)
+    e = HeadsUpPoker(rng=rng)
+    rows = []
+    while len(rows) < 300:
+        e.reset()
+        while not e.done:
+            rows.append(e.observation())
+            e.step(rng.integers(4))
+    obs = np.stack(rows[:300])
+    for obs_dim in (31, OBS_DIM):
+        buf = ReservoirBuffer(1000, "cpu", obs_dim=obs_dim, seed=0)
+        buf.add(obs, np.arange(300, dtype=np.float32), rng.random((300, 4), dtype=np.float32))
+        np.testing.assert_array_equal(buf.obs.numpy(), obs[:, :obs_dim])  # uint8 / float32 split is lossless
+        got, t, _ = buf.sample(50)
+        np.testing.assert_array_equal(got.numpy(), obs[t.long().numpy(), :obs_dim])
+        buf.save(tmp_path / "buf.pt")
+        with pytest.raises(ValueError):  # a buffer of another width refuses the file
+            ReservoirBuffer(1000, "cpu", obs_dim=OBS_DIM if obs_dim == 31 else 31).load(tmp_path / "buf.pt")
+
+
+VARIANTS = [
+    dict(),
+    dict(features="history"),
+    dict(features="both", arch="paper", cards="onehot", dim=32),
+    dict(features="history", arch="paper", rm_fallback="argmax"),
+    dict(cards="onehot", rm_fallback="argmax"),
+]
+
+
+def _peaked(bias, **config):
+    """Zero head weights + a bias: the advantages equal ``bias`` everywhere, so the strategy is
+    deterministic (a one-hot from regret matching, or from the argmax fallback when all entries
+    are negative) and C++ / Python traversals take identical paths despite different RNG streams."""
+    m = BaseModel(**config)
     with torch.no_grad():
         m.action_head.bias.copy_(torch.tensor(bias, dtype=torch.float32))
     return m.numpy_weights()
@@ -39,6 +106,9 @@ def test_python_traversal_shapes():
     w = [BaseModel().numpy_weights(), BaseModel().numpy_weights()]
     adv, strat, nodes = run_traversals_python(w, 0, 20, 1.0, seed=0)
     assert isinstance(adv, Samples) and adv.obs.shape[1] == 31 and adv.target.shape[1] == 4
+    hw = [BaseModel(features="history").numpy_weights() for _ in range(2)]
+    hadv, hstrat, _ = run_traversals_python(hw, 0, 5, 1.0, seed=0)
+    assert hadv.obs.shape[1] == 79 and hstrat.obs.shape[1] == 79
     assert nodes >= len(adv) + len(strat) > 0
     assert np.all(adv.t == 1.0)
     # advantages are centred by the current strategy: uniform for fresh nets where fold is
@@ -52,16 +122,21 @@ def test_python_traversal_shapes():
 
 
 @pytest.mark.skipif(not native.available(), reason="C++ extension not built")
-def test_cpp_traversal_matches_python_reference():
+@pytest.mark.parametrize("config", VARIANTS)
+def test_cpp_traversal_matches_python_reference(config):
     cpp = native.module()
     rng = np.random.default_rng(0)
-    n = 100
+    n = 60
     decks = np.stack([rng.permutation(52)[:9] for _ in range(n)]).astype(np.int32)
-    w0, w1 = _peaked([0, 5, 0, 0]), _peaked([0, 0, 5, 0])  # deterministic strategies
+    if config.get("rm_fallback") == "argmax":  # all negative: every decision goes through the fallback
+        w0, w1 = _peaked([-3, -1, -2, -4], **config), _peaked([-2, -3, -1, -4], **config)
+    else:
+        w0, w1 = _peaked([0, 5, 0, 0], **config), _peaked([0, 0, 5, 0], **config)
     for traverser in (0, 1):
         pa, ps, pn = run_traversals_python([w0, w1], traverser, n, 3.0, 1, None, decks)
         out = cpp.run_traversals(native.make_model(w0), native.make_model(w1), traverser, n, 3.0, 1, native.engine_config(), decks)
         assert pn == out[6] and len(pa) == len(out[1]) and len(ps) == len(out[4])
+        assert pa.obs.shape[1] == out[0].shape[1] == (31 if config.get("features", "aggregated") == "aggregated" else 79)
         np.testing.assert_array_equal(pa.obs, out[0])
         np.testing.assert_allclose(pa.target, out[2], atol=1e-4)
         np.testing.assert_allclose(ps.target, out[5], atol=1e-5)
@@ -70,13 +145,13 @@ def test_cpp_traversal_matches_python_reference():
 def test_train_advantage_and_policy_smoke():
     from headsup.deepcfr.train import train_advantage_net, train_policy_net
 
-    buf = ReservoirBuffer(10000, "cpu", seed=0)
+    buf = ReservoirBuffer(10000, "cpu", obs_dim=31, seed=0)
     w = [BaseModel().numpy_weights(), BaseModel().numpy_weights()]
     adv, strat, _ = run_traversals_python(w, 0, 100, 1.0, seed=0)
     buf.add(adv.obs, adv.t, adv.target)
     net, final_loss = train_advantage_net(buf, "cpu", steps=5, batch_size=64, compile=False)
     assert isinstance(net, BaseModel) and np.isfinite(final_loss)
-    sbuf = ReservoirBuffer(10000, "cpu", seed=0)
+    sbuf = ReservoirBuffer(10000, "cpu", obs_dim=31, seed=0)
     sbuf.add(strat.obs, strat.t, strat.target)
     policy = train_policy_net(sbuf, "cpu", epochs=1, batch_size=64, compile=False, progress=False)
     assert isinstance(policy, BaseModel)

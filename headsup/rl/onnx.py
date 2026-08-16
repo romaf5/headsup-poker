@@ -1,4 +1,4 @@
-"""Export a trained rl_games exploiter to ONNX (input obs float32[N, 31] -> action probs).
+"""Export a trained rl_games exploiter to ONNX (input obs float32[N, OBS_DIM] -> action probs).
 
     python -m headsup.rl.onnx -f configs/rl_games_exploiter.yaml -m runs/<exp>/nn/exploitability.pth -o models/rl_games_exploiter.onnx
 """

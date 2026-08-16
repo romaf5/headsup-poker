@@ -21,30 +21,62 @@ def _observations(n=300, seed=0):
     return np.stack(rows[:n])
 
 
-def _bank(T, seed=0, device="cpu"):
+def _bank(T, seed=0, device="cpu", **config):
     torch.manual_seed(seed)
-    nets = [[BaseModel() for _ in range(T)] for _ in range(2)]
-    for seat in nets:  # non-trivial heads so strategies differ
+    nets = [[BaseModel(**config) for _ in range(T)] for _ in range(2)]
+    probe = torch.from_numpy(_observations(200, seed=99))
+    for seat in nets:  # non-trivial heads so strategies differ; centred so that some rows have no positive advantage
         for m in seat:
             torch.nn.init.normal_(m.action_head.weight, std=0.5)
-            torch.nn.init.normal_(m.action_head.bias, std=0.5)
-    return nets, IterateBank.from_state_dicts([[m.state_dict() for m in seat] for seat in nets], device)
+            with torch.no_grad():
+                m.action_head.bias.copy_(-m(probe).mean(0))
+    cfg = nets[0][0].config
+    return nets, IterateBank.from_state_dicts([[m.state_dict() for m in seat] for seat in nets], device, cfg)
 
 
-def test_iterates_match_regret_matching_players():
-    nets, bank = _bank(4)
+@pytest.mark.parametrize("config", [dict(), dict(rm_fallback="argmax"), dict(features="history", arch="paper", rm_fallback="argmax")])
+def test_iterates_match_regret_matching_players(config):
+    nets, bank = _bank(4, **config)
     obs = _observations()
     sig = bank.strategies(0, obs)  # every row evaluated with seat-0 nets
     for t in range(4):
         rm = RegretMatchingPlayer([nets[0][t], nets[0][t]], device="cpu")
-        np.testing.assert_allclose(sig[t].numpy(), rm.probs(obs), atol=1e-5)
+        np.testing.assert_allclose(sig[t].numpy(), rm.probs(obs), atol=3e-4)  # vmap vs plain kernels; tiny totals amplify fp noise
     assert np.allclose(sig.sum(-1).numpy(), 1.0, atol=1e-5)
+    assert np.all(sig[:, obs[:, 23] <= 0, 0].numpy() == 0)  # never fold for free
+    if config.get("rm_fallback") == "argmax":  # the fallback rows are one-hot
+        with torch.no_grad():
+            adv = nets[0][0](torch.from_numpy(obs)).clone()
+        adv[torch.from_numpy(obs[:, 23] <= 0), 0] = -1e30
+        fb = (adv.clamp(min=0).sum(1) <= 1e-6).numpy()
+        assert fb.any()
+        assert np.all(sig[0][fb].max(1).values.numpy() == 1.0)
+
+
+def test_truncated_bank_and_specs(tmp_path):
+    from headsup.players import make_player, parse_sdcfr_spec
+
+    assert parse_sdcfr_spec("x/it.pt@exact@g2@t50") == ("x/it.pt", "exact", 2.0, 50, None)
+    assert parse_sdcfr_spec("x/it.pt@k32") == ("x/it.pt", "sample", 1.0, None, 32)
+    nets, bank = _bank(5)
+    bank.save(tmp_path / "it.pt")
+    obs = _observations(40)
+    short = bank.truncate(3)
+    assert short.T == 3 and bank.truncate(9) is bank
+    np.testing.assert_allclose(short.strategies(0, obs).numpy(), bank.strategies(0, obs)[:3].numpy())
+    p = make_player(f"sdcfr:{tmp_path / 'it.pt'}@t3@exact", device="cpu", seed=0)
+    assert p.bank.T == 3 and p.mode == "exact"
+    assert make_player(f"sdcfr:{tmp_path / 'it.pt'}@k2", device="cpu", seed=0).bank.T == 2
+    it = make_player(f"iterate:{tmp_path / 'it.pt'}@t2", device="cpu", seed=0)
+    ref = RegretMatchingPlayer([nets[0][2], nets[1][2]], device="cpu")
+    np.testing.assert_allclose(it.probs(obs), ref.probs(obs), atol=1e-6)
 
 
 def test_bank_save_load(tmp_path):
-    _, bank = _bank(3)
+    _, bank = _bank(3, features="history", rm_fallback="argmax")
     bank.save(tmp_path / "it.pt")
     other = IterateBank.load(tmp_path / "it.pt", "cpu")
+    assert other.config == bank.config and other.rm_fallback == "argmax" and other.obs_dim == 79
     obs = _observations(50)
     np.testing.assert_allclose(bank.strategies(1, obs).numpy(), other.strategies(1, obs).numpy())
 
@@ -96,4 +128,4 @@ def test_sdcfr_as_opponent_with_subset_ids():
     opp = SDCFRPlayer(bank, mode="exact", seed=1)
     env = PokerVecEnv(64, opp, seed=0)
     r = play_hands(env, AlwaysCallPlayer(), 2000)
-    assert len(r) == 2000 and len(opp.reach) <= 64
+    assert len(r) == 2000 and opp.known.sum() <= 64

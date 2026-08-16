@@ -4,6 +4,23 @@ Status: engine, C++ kernels, DeepCFR + SD-CFR trainer, evaluation/exploitability
 browser UI are done and tested (see CLAUDE.md). The last completed model was trained on the old
 rules (free fold allowed); the no-free-fold rule is now in place and everything should be retrained.
 
+### Progress log (2026-08-16, 64-core / 2x RTX 3090 box)
+
+- Step 0: `runs/base` (aggregated features, current net, 300 it. x 40k traversals, 20 M memories)
+  trained; evaluation (compare 1.5 M hands, exploit 3 seeds, LBR) → README results table.
+- Step 1: DONE in code — `--features aggregated|history|both`, `--net current|paper`, `--cards embed|onehot`,
+  `--dim`, `--rm-fallback uniform|argmax`, `--preset paper` (all differential-tested torch/numpy/C++,
+  paper facts verified from arXiv 1811.00164 / 1901.07621, see README "How close..."). Ablation arms
+  under `runs/abl_*` ({aggregated, history} x {current, paper} + history/paper/argmax), same budget as
+  the base run; results → README.
+- Step 2: DONE — `headsup/lbr.py` (+ C++ `equity_vs_all`), duplicate hands, `--model-iterates` thinning
+  for SD-CFR banks, trainer `--lbr-every` / final `lbr_final/*`; `@t<N>` / `iterate:` specs for curves.
+- Step 3: DONE in code — `headsup/game.py` GameConfig (`--bet-sizes 0.5,1,2 --raise-cap --mask-redundant`),
+  engines / traversal / players / envs / SD-CFR / LBR / web UI / rl env generic in `num_actions`
+  (default 4-action game bit-identical). Not yet trained (see Step 3 below: retrain, more traversals).
+- Step 4: `--regret-power` (t^alpha sample weights, DCFR alpha = 1.5) and `--strategy-power` (gamma = 2)
+  options added; DREAM / ESCHER / search not started.
+
 ## Step 0 — retrain on the fixed rules (first thing on the new machine)
 
 ```bash

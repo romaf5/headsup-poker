@@ -13,10 +13,10 @@ import numpy as np
 from headsup.cards import card_to_str, describe_hand, hand_strength
 from headsup.engine import HeadsUpPoker
 from headsup.enums import Action, Stage
+from headsup.game import DEFAULT_GAME, action_label
 from headsup.paths import DEFAULT_POLICY_PATH
 from headsup.players import make_player
 
-ACTION_NAMES = {Action.FOLD: "fold", Action.CHECK_CALL: "call", Action.RAISE: "raise", Action.ALL_IN: "all-in"}
 BOT_LABELS = {
     "cfr": "DeepCFR", "sdcfr": "SD-CFR", "onnx": "PPO exploiter", "random": "Random bot", "call": "Calling station",
     "allin": "Maniac", "raise": "Always-raise bot",
@@ -34,18 +34,32 @@ RANK_LABEL = {"T": "10"}
 
 
 ACTION_ALIASES = {
-    "fold": Action.FOLD, "check": Action.CHECK_CALL, "call": Action.CHECK_CALL, "check_call": Action.CHECK_CALL,
-    "raise": Action.RAISE, "bet": Action.RAISE, "allin": Action.ALL_IN, "all_in": Action.ALL_IN, "all-in": Action.ALL_IN,
+    "fold": 0, "check": 1, "call": 1, "check_call": 1, "raise": 2, "bet": 2, "allin": "allin", "all_in": "allin", "all-in": "allin",
 }
 
 
-def parse_action(value):
+def parse_action(value, game=DEFAULT_GAME):
+    """Action index from an int, an alias (fold / check / call / raise / allin) or a game label
+    (``action_label``: fold, call, raise_min, raise_0.5p, ..., allin)."""
     if isinstance(value, (int, np.integer)) or str(value).lstrip("-").isdigit():
-        return Action(int(value))
+        a = int(value)
+        if not 0 <= a < game.num_actions:
+            raise ValueError(f"unknown action {value!r}")
+        return a
     key = str(value).strip().lower()
+    labels = [action_label(game, a) for a in range(game.num_actions)]
+    if key in labels:
+        return labels.index(key)
     if key not in ACTION_ALIASES:
         raise ValueError(f"unknown action {value!r}")
-    return ACTION_ALIASES[key]
+    a = ACTION_ALIASES[key]
+    return game.all_in if a == "allin" else a
+
+
+def size_label(size):
+    if size == "min":
+        return "min"
+    return {0.25: "¼ pot", 0.5: "½ pot", 0.75: "¾ pot", 1.0: "pot", 2.0: "2× pot"}.get(float(size), f"{float(size):g}× pot")
 
 
 def player_spec(value):
@@ -118,21 +132,26 @@ class GameSession:
         )
         self.device = device
         self.rng = np.random.default_rng(seed)
-        self.engine = HeadsUpPoker(
-            stack_size=int(stack_size),
-            small_blind=int(small_blind),
-            big_blind=int(big_blind),
-            raise_cap=int(raise_cap),
-            rng=np.random.default_rng(self.rng.integers(2**63)),
-        )
         self.opponent = make_player(player_spec(opponent), device=device, deterministic=deterministic, seed=int(self.rng.integers(2**31)))
         self.opponent_name = opponent
+        # the table plays the bot's action tree (bet sizes); stacks / blinds / raise cap from the settings
+        self.game = getattr(self.opponent, "game", DEFAULT_GAME).with_(
+            stack_size=int(stack_size), small_blind=int(small_blind), big_blind=int(big_blind), raise_cap=int(raise_cap)
+        )
+        self.engine = HeadsUpPoker(game=self.game, rng=np.random.default_rng(self.rng.integers(2**63)))
+        self.action_names = [action_label(self.game, a) for a in range(self.game.num_actions)]
+        self.action_labels = ["Fold", "Check/Call"] + [
+            "Raise" if s == "min" and len(self.game.bet_sizes) == 1 else f"Raise {size_label(s)}" for s in self.game.bet_sizes
+        ] + ["All-in"]
         self.advisor = None
         self.advisor_error = None
         if advisor:
             try:
-                self.advisor = make_player(player_spec(advisor), device=device, seed=int(self.rng.integers(2**31)))
+                self.advisor = make_player(player_spec(advisor), device=device, seed=int(self.rng.integers(2**31)), game=self.game)
+                if getattr(self.advisor, "game", self.game).num_actions != self.game.num_actions:
+                    raise ValueError("advisor plays a different action set than the bot")
             except Exception as exc:  # advisor is optional
+                self.advisor = None
                 self.advisor_error = f"{type(exc).__name__}: {exc}"
         self.me = 1  # flipped in new_hand -> human is dealer first
         self.results = []  # per-hand rewards for the human
@@ -158,23 +177,23 @@ class GameSession:
         o = 1 - seat
         to_call = before["stage_bets"][o] - before["stage_bets"][seat]
         stack = before["stacks"][seat]
-        action = Action(action)
+        action = int(action)
         if action == Action.FOLD:
             return "folds", 0
         if action == Action.CHECK_CALL:
             amt = min(to_call, stack)
             return ("checks", 0) if amt == 0 else (f"calls {amt}", amt)
-        if action == Action.RAISE:
+        if self.game.is_raise(action):
             verb = "bets" if to_call == 0 else "raises"
-            if before["consecutive_raises"] + 1 >= e.raise_cap or to_call + e.big_blind >= stack:
+            amt = self.game.raise_amount(action, to_call, before["pot"], stack)
+            if before["consecutive_raises"] + 1 >= e.raise_cap or amt >= stack:
                 return f"{verb} all-in {stack}", stack
-            amt = to_call + e.big_blind
             return (f"bets {amt}", amt) if to_call == 0 else (f"raises to {before['stage_bets'][seat] + amt}", amt)
         return f"all-in {stack}", stack
 
     def _snapshot(self):
         e = self.engine
-        return dict(stage_bets=list(e.stage_bets), stacks=list(e.stacks), consecutive_raises=e.consecutive_raises)
+        return dict(stage_bets=list(e.stage_bets), stacks=list(e.stacks), consecutive_raises=e.consecutive_raises, pot=e.pot)
 
     def _record(self, seat, action, before):
         text, amount = self._describe_action(seat, action, before)
@@ -182,7 +201,7 @@ class GameSession:
             {
                 "seat": "you" if seat == self.me else "bot",
                 "stage": Stage(self.engine.stage).name.lower() if not self.engine.done else "end",
-                "action": ACTION_NAMES[Action(action)],
+                "action": self.action_names[int(action)],
                 "text": text,
                 "amount": amount,
                 "t": time.time(),
@@ -212,7 +231,7 @@ class GameSession:
         action = int(self.opponent(obs)[0])
         probs = getattr(self.opponent, "last_probs", None)
         self.bot_last = {
-            "action": ACTION_NAMES[Action(action)],
+            "action": self.action_names[int(action)],
             "text": self._describe_action(self.opp, action, self._snapshot())[0],
             "probs": [float(p) for p in np.asarray(probs).reshape(-1)] if probs is not None else None,
             "hand": e.hands_played,
@@ -277,7 +296,7 @@ class GameSession:
     def act(self, action):
         if self.hand_over:
             raise ValueError("hand is over — start the next hand")
-        action = parse_action(action)
+        action = parse_action(action, self.game)
         if self.engine.current != self.me:
             raise ValueError("not your turn")
         obs = self.engine.observation(self.me)[None]
@@ -316,16 +335,24 @@ class GameSession:
         me, opp = self.me, self.opp
         to_call = e.stage_bets[opp] - e.stage_bets[me]
         stack = e.stacks[me]
-        out = [{"action": "fold", "label": "Fold", "key": "F"}] if to_call > 0 else []
+        legal = e.legal_mask()
+        out = [{"action": "fold", "label": "Fold", "key": "F"}] if legal[Action.FOLD] else []
         out.append({"action": "call", "label": "Check" if to_call == 0 else f"Call {min(to_call, stack)}", "key": "C"})
-        raise_amt = to_call + e.big_blind
         verb = "Bet" if to_call == 0 else "Raise"
-        if e.consecutive_raises + 1 >= e.raise_cap or raise_amt >= stack:
-            out.append({"action": "raise", "label": f"{verb} all-in {stack}", "key": "R", "allin": True})
-        elif to_call == 0:
-            out.append({"action": "raise", "label": f"Bet {raise_amt}", "key": "R"})
-        else:
-            out.append({"action": "raise", "label": f"Raise to {e.stage_bets[me] + raise_amt}", "key": "R"})
+        multi = len(self.game.bet_sizes) > 1
+        for k, size in enumerate(self.game.bet_sizes):
+            a = 2 + k
+            if not legal[a]:
+                continue
+            amt = e.raise_amount(a)
+            key = str(k + 1) if multi else "R"
+            suffix = f" ({size_label(size)})" if multi else ""
+            if e.consecutive_raises + 1 >= e.raise_cap or amt >= stack:
+                out.append({"action": self.action_names[a], "label": f"{verb} all-in {stack}{suffix}", "key": key, "allin": True})
+            elif to_call == 0:
+                out.append({"action": self.action_names[a], "label": f"Bet {amt}{suffix}", "key": key})
+            else:
+                out.append({"action": self.action_names[a], "label": f"Raise to {e.stage_bets[me] + amt}{suffix}", "key": key})
         out.append({"action": "allin", "label": f"All-in {stack}", "key": "A"})
         return out
 
@@ -383,6 +410,8 @@ class GameSession:
             "to_call": max(0, e.stage_bets[opp] - e.stage_bets[me]),
             "dealer_seat": e.dealer,
             "actions": self.legal_actions(),
+            "action_names": self.action_names,
+            "action_labels": self.action_labels,
             "result": self.result,
             "log": self.log,
             "history": self.hand_records[-30:][::-1],
@@ -399,8 +428,7 @@ class GameSession:
             return out
         if self.advisor is not None and e.current == self.me:
             probs = self.advisor.probs(e.observation(self.me)[None])[0]
-            labels = ["Fold", "Check/Call", "Raise", "All-in"]
-            out["probs"] = [{"action": a, "label": l, "p": float(p)} for a, l, p in zip(["fold", "call", "raise", "allin"], labels, probs)]
+            out["probs"] = [{"action": a, "label": l, "p": float(p)} for a, l, p in zip(self.action_names, self.action_labels, probs)]
         key = (tuple(e.hands[self.me]), tuple(e.visible_board))
         if key not in self._equity_cache:
             win, tie = equity(e.hands[self.me], e.visible_board, self.rng, equity_samples)
