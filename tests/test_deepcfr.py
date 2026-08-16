@@ -41,9 +41,14 @@ def test_python_traversal_shapes():
     assert isinstance(adv, Samples) and adv.obs.shape[1] == 31 and adv.target.shape[1] == 4
     assert nodes >= len(adv) + len(strat) > 0
     assert np.all(adv.t == 1.0)
-    # advantages are centred by the current strategy (uniform for fresh nets)
-    np.testing.assert_allclose(adv.target.mean(axis=1), 0, atol=1e-4)
+    # advantages are centred by the current strategy: uniform for fresh nets where fold is
+    # allowed, uniform over the 3 remaining actions (fold == check) where nothing is to call
+    fold_ok = adv.obs[:, 23] > 0
+    np.testing.assert_allclose(adv.target[fold_ok].mean(axis=1), 0, atol=1e-4)
+    np.testing.assert_allclose(adv.target[~fold_ok][:, 1:].mean(axis=1), 0, atol=1e-4)
+    np.testing.assert_allclose(adv.target[~fold_ok][:, 0], adv.target[~fold_ok][:, 1], atol=1e-6)
     np.testing.assert_allclose(strat.target.sum(axis=1), 1, atol=1e-5)
+    assert np.all(strat.target[strat.obs[:, 23] <= 0, 0] == 0)  # never fold for free
 
 
 @pytest.mark.skipif(not native.available(), reason="C++ extension not built")

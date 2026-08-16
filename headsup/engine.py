@@ -24,6 +24,11 @@ OBS_DIM = 31
 BOARD_CARDS_BY_STAGE = (0, 3, 4, 5, 5)  # PREFLOP, FLOP, TURN, RIVER, END
 
 
+def fold_allowed_mask(obs):
+    """bool[N]: rows where the acting player faces a bet (obs[23] = amount to call / pot)."""
+    return np.asarray(obs)[:, 23] > 0
+
+
 class HeadsUpPoker:
     NUM_PLAYERS = 2
 
@@ -97,9 +102,18 @@ class HeadsUpPoker:
     def visible_board(self):
         return self.board[: BOARD_CARDS_BY_STAGE[self.stage]]
 
+    @property
+    def to_call(self):
+        p = self.current
+        return self.stage_bets[1 - p] - self.stage_bets[p]
+
+    @property
+    def fold_allowed(self):
+        """Folding only exists when facing a bet (with nothing to call it would be a dominated check)."""
+        return self.to_call > 0
+
     def legal_actions(self):
-        """All four actions are always accepted; kept for API completeness."""
-        return list(Action)
+        return [a for a in Action if a != Action.FOLD or self.fold_allowed]
 
     def observation(self, seat=None):
         """Observation vector (float32[31]) from the point of view of ``seat``.
@@ -144,6 +158,9 @@ class HeadsUpPoker:
             raise ValueError(f"Invalid action {action}")
         p = self.current
         o = 1 - p
+
+        if action == Action.FOLD and self.stage_bets[o] == self.stage_bets[p]:
+            action = Action.CHECK_CALL  # nothing to call: folding is a (dominated) check
 
         if action == Action.RAISE:
             self.consecutive_raises += 1

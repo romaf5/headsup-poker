@@ -35,15 +35,20 @@ def _regret_matching(adv):
 class IterateBank:
     """Stacked parameters of the advantage nets of all iterations, for both seats."""
 
-    def __init__(self, stacked, device):
+    def __init__(self, stacked, device, weight_power=1.0):
         # stacked: {seat: {param_name: tensor (T, ...)}}
         self.device = torch.device(device)
         self.params = {s: {k: v.to(self.device) for k, v in d.items()} for s, d in stacked.items()}
         self.T = next(iter(self.params[0].values())).shape[0]
-        self.weights = torch.arange(1, self.T + 1, dtype=torch.float32, device=self.device)  # linear CFR
+        self.set_weight_power(weight_power)
         self._base = BaseModel().to(self.device).eval()
         self._fn = lambda params, obs: functional_call(self._base, params, (obs,))
         self._vmapped = vmap(self._fn, in_dims=(0, None))
+
+    def set_weight_power(self, gamma):
+        """Iterate t gets weight t^gamma: 1 = linear CFR (default), 2 = DCFR's average-strategy discount."""
+        self.weight_power = float(gamma)
+        self.weights = torch.arange(1, self.T + 1, dtype=torch.float32, device=self.device) ** self.weight_power
 
     @staticmethod
     def from_state_dicts(seat_dicts, device):
@@ -63,19 +68,26 @@ class IterateBank:
         torch.save({"seats": {s: {k: v.cpu() for k, v in d.items()} for s, d in self.params.items()}, "T": self.T}, path)
 
     @staticmethod
-    def load(path, device):
+    def load(path, device, weight_power=1.0):
         data = torch.load(path, map_location="cpu", weights_only=True)
-        return IterateBank({int(s): d for s, d in data["seats"].items()}, device)
+        return IterateBank({int(s): d for s, d in data["seats"].items()}, device, weight_power)
 
     @torch.no_grad()
     def strategies(self, seat, obs):
-        """Regret-matched strategies of every iterate: (T, B, 4)."""
-        x = torch.as_tensor(np.asarray(obs, dtype=np.float32)).to(self.device)
+        """Regret-matched strategies of every iterate: (T, B, 4); FOLD masked where nothing is to call."""
+        obs = np.asarray(obs, dtype=np.float32)
+        x = torch.as_tensor(obs).to(self.device)
         try:
             adv = self._vmapped(self.params[seat], x)
         except Exception:  # vmap unsupported op on this backend: fall back to a loop
             adv = torch.stack([self._fn({k: v[t] for k, v in self.params[seat].items()}, x) for t in range(self.T)])
-        return _regret_matching(adv)
+        free = torch.as_tensor(obs[:, 23] <= 0, device=self.device)
+        adv[:, free, 0] = -1e30  # fold not available: regret matching then ignores it (uniform fallback excludes it too)
+        sig = _regret_matching(adv)
+        if free.any():
+            sig[:, free, 0] = 0.0
+            sig[:, free] = sig[:, free] / sig[:, free].sum(-1, keepdim=True).clamp(min=1e-12)
+        return sig
 
 
 class SDCFRPlayer:
@@ -83,9 +95,11 @@ class SDCFRPlayer:
 
     wants_ids = True
 
-    def __init__(self, bank, mode="sample", seed=None, small_blind=1, big_blind=2):
+    def __init__(self, bank, mode="sample", seed=None, small_blind=1, big_blind=2, weight_power=None):
         assert mode in ("sample", "exact")
         self.bank = bank
+        if weight_power is not None:
+            bank.set_weight_power(weight_power)
         self.mode = mode
         self.rng = np.random.default_rng(seed)
         self.small_blind, self.big_blind = small_blind, big_blind
@@ -96,8 +110,8 @@ class SDCFRPlayer:
         self._w = w / w.sum()
 
     @staticmethod
-    def load(path, device, mode="sample", seed=None):
-        return SDCFRPlayer(IterateBank.load(path, device), mode=mode, seed=seed)
+    def load(path, device, mode="sample", seed=None, weight_power=1.0):
+        return SDCFRPlayer(IterateBank.load(path, device, weight_power), mode=mode, seed=seed)
 
     # ------------------------------------------------------------------ state
     def _first_decision(self, obs):

@@ -21,7 +21,7 @@ def test_session_flow_and_bookkeeping():
     s = GameSession(opponent="call", advisor="cfr", device="cpu", seed=3)
     st = s.state()
     assert st["hand_number"] == 1 and st["you"]["position"] == "dealer" and st["your_turn"]
-    assert [a["action"] for a in st["actions"]] == ["fold", "call", "raise", "allin"]
+    assert [a["action"] for a in st["actions"]] == ["fold", "call", "raise", "allin"]  # SB faces the big blind
     assert st["actions"][1]["label"] == "Call 1" and st["actions"][2]["label"] == "Raise to 4"
     adv = s.advice()
     assert adv["probs"] is not None and abs(sum(p["p"] for p in adv["probs"]) - 1) < 1e-4
@@ -65,7 +65,7 @@ def test_parse_action_and_labels():
     s.bot_step()  # bot checks -> flop, bot acts first post-flop
     s.bot_step()  # bot checks
     labels = [a["label"] for a in s.state()["actions"]]
-    assert labels[1] == "Check" and labels[2] == "Bet 2"
+    assert labels == ["Check", "Bet 2", "All-in 98"]  # no fold when nothing is to call
 
 
 def test_http_api_roundtrip():

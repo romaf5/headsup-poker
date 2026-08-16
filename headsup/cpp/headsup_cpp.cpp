@@ -184,8 +184,11 @@ struct Engine {
   }
 
   // returns true when the hand is over
+  bool fold_allowed() const { return stage_bets[1 - current] - stage_bets[current] > 0; }
+
   bool step(int action) {
     const int p = current, o = 1 - p;
+    if (action == FOLD && stage_bets[o] == stage_bets[p]) action = CHECK_CALL;  // nothing to call: fold is a dominated check
     if (action == RAISE) {
       if (++consecutive_raises >= cfg.raise_cap) action = ALL_IN;
     } else {
@@ -361,14 +364,15 @@ std::shared_ptr<Model> model_from_dict(const py::dict& d) {
   return m;
 }
 
-inline void regret_matching(const float* adv, float* sigma) {
+inline void regret_matching(const float* adv, float* sigma, bool fold_allowed = true) {
   float total = 0.0f;
   for (int a = 0; a < NUM_ACTIONS; ++a) {
-    sigma[a] = adv[a] > 0.0f ? adv[a] : 0.0f;
+    sigma[a] = (adv[a] > 0.0f && (a != FOLD || fold_allowed)) ? adv[a] : 0.0f;
     total += sigma[a];
   }
   if (total <= 1e-6f) {
-    for (int a = 0; a < NUM_ACTIONS; ++a) sigma[a] = 1.0f / NUM_ACTIONS;
+    const int n = fold_allowed ? NUM_ACTIONS : NUM_ACTIONS - 1;
+    for (int a = 0; a < NUM_ACTIONS; ++a) sigma[a] = (a == FOLD && !fold_allowed) ? 0.0f : 1.0f / n;
   } else {
     for (int a = 0; a < NUM_ACTIONS; ++a) sigma[a] /= total;
   }
@@ -422,11 +426,13 @@ struct Traverser {
     float obs[OBS_DIM], values[NUM_ACTIONS], sigma[NUM_ACTIONS];
     e.observation(-1, obs);
     nets[p]->forward(obs, values);
-    regret_matching(values, sigma);
+    const bool fold_ok = e.fold_allowed();
+    regret_matching(values, sigma, fold_ok);
     ++nodes;
     if (p == traverser) {
       float va[NUM_ACTIONS];
       for (int a = 0; a < NUM_ACTIONS; ++a) {
+        if (a == FOLD && !fold_ok) continue;  // fold == check here; filled in below
         if (a + 1 < NUM_ACTIONS) {
           Engine child = e;
           child.step(a);
@@ -436,6 +442,7 @@ struct Traverser {
           va[a] = traverse(e);
         }
       }
+      if (!fold_ok) va[FOLD] = va[CHECK_CALL];
       float mean = 0.0f;
       for (int a = 0; a < NUM_ACTIONS; ++a) mean += sigma[a] * va[a];
       for (int a = 0; a < NUM_ACTIONS; ++a) va[a] -= mean;
@@ -513,7 +520,7 @@ struct VecEnv {
   int opponent_action(int i, const float* obs) {
     switch (opp_kind) {
       case RANDOM: {
-        std::uniform_int_distribution<int> d(0, NUM_ACTIONS - 1);
+        std::uniform_int_distribution<int> d(engines[i].fold_allowed() ? 0 : 1, NUM_ACTIONS - 1);
         return d(rng);
       }
       case CALL:
@@ -526,6 +533,7 @@ struct VecEnv {
         float logits[NUM_ACTIONS];
         float* p = last_probs.data() + size_t(i) * NUM_ACTIONS;
         opp_model->forward(obs, logits);
+        if (!engines[i].fold_allowed()) logits[FOLD] = -1e30f;
         softmax(logits, p);
         if (opp_deterministic) return int(std::max_element(p, p + NUM_ACTIONS) - p);
         return sample(p, rng);

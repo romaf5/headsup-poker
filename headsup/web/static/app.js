@@ -107,9 +107,10 @@ async function mutate(fn) {
 }
 async function userAct(action) {
   if (!state || !state.your_turn) return;
+  const a = state.actions.find((x) => x.action === action);
+  if (!a) return;  // e.g. F with nothing to call
   await mutate(async () => {
-    const a = state.actions.find((x) => x.action === action);
-    if (a) flash("#you-flash", a.label);
+    flash("#you-flash", a.label);
     await refresh(await api("/api/action", { action }));
   });
 }

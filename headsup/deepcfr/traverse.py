@@ -24,11 +24,18 @@ from headsup.enums import NUM_ACTIONS
 from headsup.numpy_model import NumpyModel
 
 
-def regret_matching(adv, eps=1e-6):
+def regret_matching(adv, eps=1e-6, fold_allowed=True):
     pos = np.clip(adv, 0.0, None)
+    if not fold_allowed:
+        pos = pos.copy()
+        pos[0] = 0.0
     total = pos.sum()
     if total <= eps:
-        return np.full(NUM_ACTIONS, 1.0 / NUM_ACTIONS, dtype=np.float32)
+        sigma = np.full(NUM_ACTIONS, 1.0 / NUM_ACTIONS, dtype=np.float32)
+        if not fold_allowed:
+            sigma[0] = 0.0
+            sigma /= sigma.sum()
+        return sigma
     return (pos / total).astype(np.float32)
 
 
@@ -84,15 +91,20 @@ def traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats=None):
         return float(engine.rewards[traverser])
     p = engine.current
     obs = engine.observation()
-    sigma = regret_matching(nets[p](obs))
+    fold_ok = engine.fold_allowed
+    sigma = regret_matching(nets[p](obs), fold_allowed=fold_ok)
     if stats is not None:
         stats["nodes"] += 1
     if p == traverser:
         values = np.empty(NUM_ACTIONS, dtype=np.float32)
         for a in range(NUM_ACTIONS):
+            if a == 0 and not fold_ok:
+                continue  # fold == check here; filled in below
             child = engine.clone() if a + 1 < NUM_ACTIONS else engine
             child.step(a)
             values[a] = traverse(child, traverser, nets, t, rng, adv_mem, strat_mem, stats)
+        if not fold_ok:
+            values[0] = values[1]
         mean = float(np.dot(sigma, values))
         adv_mem.add(obs, t, values - mean)
         return mean

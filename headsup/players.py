@@ -18,11 +18,11 @@ class RandomPlayer:
         self.last_probs = None
 
     def probs(self, obs, ids=None):
-        return np.full((len(obs), NUM_ACTIONS), 1.0 / NUM_ACTIONS, dtype=np.float32)
+        return mask_fold(np.full((len(obs), NUM_ACTIONS), 1.0 / NUM_ACTIONS, dtype=np.float32), obs)
 
     def __call__(self, obs, ids=None):
         self.last_probs = self.probs(obs)
-        return self.rng.integers(NUM_ACTIONS, size=len(obs))
+        return sample_actions(self.last_probs, self.rng)
 
 
 class _FixedActionPlayer:
@@ -51,6 +51,18 @@ class AlwaysAllInPlayer(_FixedActionPlayer):
 
 class AlwaysRaisePlayer(_FixedActionPlayer):
     action = Action.RAISE
+
+
+def mask_fold(probs, obs):
+    """Zero the FOLD probability where nothing needs to be called and renormalise (in place)."""
+    from headsup.engine import fold_allowed_mask
+
+    free = ~fold_allowed_mask(obs)
+    if free.any():
+        probs[free, int(Action.FOLD)] = 0.0
+        s = probs[free].sum(axis=1, keepdims=True)
+        probs[free] = np.where(s > 0, probs[free] / np.maximum(s, 1e-12), np.array([[0, 1 / 3, 1 / 3, 1 / 3]], dtype=probs.dtype))
+    return probs
 
 
 def sample_actions(probs, rng, deterministic=False):
@@ -82,7 +94,7 @@ class TorchPolicyPlayer:
             x = torch.as_tensor(np.asarray(obs, dtype=np.float32)).to(self.device)
             logits = self.model(x)
             probs = torch.softmax(logits, dim=-1)
-        return probs.float().cpu().numpy()
+        return mask_fold(probs.float().cpu().numpy(), obs)
 
     def __call__(self, obs, ids=None):
         self.last_probs = self.probs(obs)
@@ -119,7 +131,7 @@ class RegretMatchingPlayer:
                     total = adv.sum(dim=1, keepdim=True)
                     p = torch.where(total > 1e-6, adv / total.clamp(min=1e-6), torch.full_like(adv, 1.0 / NUM_ACTIONS))
                     out[mask.cpu().numpy()] = p.float().cpu().numpy()
-        return out
+        return mask_fold(out, obs)
 
     def __call__(self, obs, ids=None):
         self.last_probs = self.probs(obs)
@@ -139,7 +151,7 @@ class NumpyPolicyPlayer:
         logits = self.model(np.asarray(obs, dtype=np.float32))
         logits = logits - logits.max(axis=1, keepdims=True)
         p = np.exp(logits)
-        return p / p.sum(axis=1, keepdims=True)
+        return mask_fold(p / p.sum(axis=1, keepdims=True), obs)
 
     def __call__(self, obs, ids=None):
         self.last_probs = self.probs(obs)
@@ -213,7 +225,10 @@ def make_player(spec: str, device=None, deterministic=False, seed=None):
         from headsup.device import get_device
         from headsup.sdcfr import SDCFRPlayer
 
-        path, _, mode = arg.partition("@")
+        parts = arg.split("@")
+        path, opts = parts[0], parts[1:]
+        mode = next((o for o in opts if o in ("exact", "sample")), "sample")
+        gamma = next((float(o[1:]) for o in opts if o.startswith("g")), 1.0)
         device = get_device(device) if not hasattr(device, "type") else device
-        return SDCFRPlayer.load(path, device=device, mode=mode or "sample", seed=seed)
+        return SDCFRPlayer.load(path, device=device, mode=mode, seed=seed, weight_power=gamma)
     raise ValueError(f"unknown player spec {spec!r}")

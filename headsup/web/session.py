@@ -316,7 +316,7 @@ class GameSession:
         me, opp = self.me, self.opp
         to_call = e.stage_bets[opp] - e.stage_bets[me]
         stack = e.stacks[me]
-        out = [{"action": "fold", "label": "Fold", "key": "F"}]
+        out = [{"action": "fold", "label": "Fold", "key": "F"}] if to_call > 0 else []
         out.append({"action": "call", "label": "Check" if to_call == 0 else f"Call {min(to_call, stack)}", "key": "C"})
         raise_amt = to_call + e.big_blind
         verb = "Bet" if to_call == 0 else "Raise"

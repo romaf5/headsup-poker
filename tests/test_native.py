@@ -41,10 +41,12 @@ def test_native_vecenv_rewards_are_consistent():
     from headsup.env import NativeVecEnv, PokerVecEnv, play_hands
     from headsup.players import AlwaysCallPlayer, RandomPlayer
 
-    native_env = NativeVecEnv(512, "random", seed=0)
-    py_env = PokerVecEnv(512, RandomPlayer(seed=0), seed=0)
-    r_native = play_hands(native_env, AlwaysCallPlayer(), 40000)
-    r_py = play_hands(py_env, AlwaysCallPlayer(), 40000)
-    # same game, different random deals: means agree within a few standard errors (~0.1)
-    assert abs(r_native.mean() - r_py.mean()) < 0.4
-    assert abs(r_native.std() - r_py.std()) < 2.0
+    # calling station vs calling station: low variance, so means/stds are tightly comparable
+    r_native = play_hands(NativeVecEnv(512, "call", seed=0), AlwaysCallPlayer(), 40000)
+    r_py = play_hands(PokerVecEnv(512, AlwaysCallPlayer(), seed=0), AlwaysCallPlayer(), 40000)
+    assert abs(r_native.mean() - r_py.mean()) < 0.15
+    assert abs(r_native.std() - r_py.std()) < 0.5
+    # random opponent: fold is never taken when nothing is to call (both implementations)
+    r_native = play_hands(NativeVecEnv(512, "random", seed=0), AlwaysCallPlayer(), 20000)
+    r_py = play_hands(PokerVecEnv(512, RandomPlayer(seed=0), seed=0), AlwaysCallPlayer(), 20000)
+    assert abs(r_native.mean() - r_py.mean()) < 3 * (r_native.std() + r_py.std()) / np.sqrt(20000)

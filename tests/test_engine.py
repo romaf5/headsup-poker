@@ -95,6 +95,18 @@ def test_river_check_check_ends_hand():
     assert done and rewards == [2, -2]
 
 
+def test_fold_with_nothing_to_call_is_a_check():
+    e = HeadsUpPoker(rng=np.random.default_rng(0))
+    e.reset(AA_vs_72)
+    e.step(Action.CHECK_CALL)  # SB limps
+    assert not e.fold_allowed and Action.FOLD not in e.legal_actions()
+    _, _, done, _ = e.step(Action.FOLD)  # BB "folds" facing no bet -> treated as check
+    assert not done and e.stage == Stage.FLOP and e.folded == -1
+    assert e.fold_allowed is False  # BB first to act on the flop, nothing to call
+    e.step(Action.RAISE)  # BB bets 2
+    assert e.fold_allowed  # SB now faces a bet
+
+
 def test_clone_is_independent():
     e = HeadsUpPoker(rng=np.random.default_rng(0))
     e.reset(AA_vs_72)

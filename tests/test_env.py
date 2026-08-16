@@ -38,8 +38,8 @@ def test_open_fold_during_reset_is_paid_on_next_step():
             return np.zeros(len(obs), dtype=np.int64)
 
     env = SingleAgentEnv(FoldBot(), seat_mode="alternate", seed=0)
-    env.reset()  # agent seat 0 (dealer): agent acts first, bot (BB) folds after agent's call
-    _, reward, done, _ = env.step(1)
+    env.reset()  # agent seat 0 (dealer): agent raises, bot (BB) folds
+    _, reward, done, _ = env.step(2)
     assert done and reward == 2
     env.reset()  # agent seat 1: bot open-folds its small blind during reset
     assert env.engine.done
