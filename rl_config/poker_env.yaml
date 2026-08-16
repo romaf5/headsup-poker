@@ -1,14 +1,15 @@
-params:  
+params:
+  seed: 42
   algo:
     name: a2c_discrete
 
   model:
     name: discrete_a2c
-  
+
   network:
     name: actor_critic
     separate: False
-    space: 
+    space:
       discrete:
     mlp:
       units: [256, 128]
@@ -19,6 +20,12 @@ params:
         name: None
 
   config:
+      name: exploitability
+      env_name: headsup_poker
+      # cpu is the safe default on a Mac; "mps" also works (python exploitability.py --device mps)
+      device: cpu
+      device_name: cpu
+
       reward_shaper:
         scale_value: 0.1
 
@@ -28,12 +35,10 @@ params:
       gamma: 0.99
       tau: 0.9
       learning_rate: 3e-4
-      name: exploitability
       score_to_win: 100080
       grad_norm: 1.0
       entropy_coef: 0.02
       truncate_grads: True
-      env_name: openai_gym
       e_clip: 0.2
       clip_value: True
       num_actors: 64
@@ -45,6 +50,8 @@ params:
       kl_threshold: 0.008
       bounds_loss_coef: 0.0001
       max_epochs: 1000
+      save_best_after: 50
+      save_frequency: 100
 
       player:
         games_num: 200000
@@ -53,4 +60,11 @@ params:
         use_vecenv: True
 
       env_config:
-        name: HeadsUpPokerRLGames-v0
+        # opponent player spec: cfr[:path.pth] | onnx[:path.onnx] | random | call | allin
+        opponent: cfr
+        seat_mode: alternate
+        # engine parameters are passed through, e.g. stack_size / small_blind / big_blind /
+        # raise_cap.  The DeepCFR bots are trained with raise_cap: 3 (3rd raise in a row =
+        # all-in); the original poker_env.py had no cap, which is what the old "500 mbb/g"
+        # number was measured with (raise_cap: 1000000 reproduces it).
+        raise_cap: 3

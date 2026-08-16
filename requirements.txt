@@ -1,13 +1,9 @@
-treys
-gym
+# core (engine, DeepCFR training, evaluation, pygame app)
 numpy
-pygame
-cairosvg
-torch
+torch>=2.4
+treys
 tqdm
 tensorboard
-ray
-# exploitability rl-games
-rl-games
-onnx
-onnxruntime
+pybind11>=2.12   # to build the optional C++ extension: python setup.py build_ext --inplace
+# tests
+pytest

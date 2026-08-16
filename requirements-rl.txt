@@ -1,0 +1,6 @@
+# optional: rl_games exploitability evaluation + ONNX export
+-r requirements.txt
+rl-games>=1.6.5
+gymnasium
+onnx
+onnxruntime

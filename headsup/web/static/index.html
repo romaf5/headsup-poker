@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Heads-Up Poker · DeepCFR</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">♠</span>
+    <div>
+      <h1>Heads-Up <span class="accent">Poker</span></h1>
+      <div id="subtitle" class="muted small">…</div>
+    </div>
+  </div>
+  <div class="topstats">
+    <div class="stat"><span class="label">Net chips</span><span id="net" class="value">–</span></div>
+    <div class="stat"><span class="label">Chips / hand</span><span id="avg-top" class="value">–</span></div>
+    <div class="stat"><span class="label">Hands</span><span id="hands" class="value">0</span></div>
+    <button id="btn-settings" class="ghost" title="Table settings (opponent, stacks, blinds)">⚙ Table</button>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="table-wrap">
+    <div class="table" id="table">
+      <div class="seat seat-bot" id="seat-bot">
+        <div class="seat-info">
+          <div class="avatar">🤖</div>
+          <div class="who">
+            <div class="name" id="bot-name">Bot</div>
+            <div class="stack"><span id="bot-stack">0</span> chips</div>
+          </div>
+          <div class="badges"><span id="bot-pos" class="pos"></span><span id="bot-status" class="status hidden"></span></div>
+        </div>
+        <div class="cards" id="bot-cards"></div>
+        <div class="bet" id="bot-bet"></div>
+        <div class="flash hidden" id="bot-flash"></div>
+      </div>
+
+      <div class="center">
+        <div class="pot" id="pot">Pot 0</div>
+        <div class="board" id="board"></div>
+        <div class="stage" id="stage">PREFLOP</div>
+      </div>
+
+      <div class="seat seat-you" id="seat-you">
+        <div class="bet" id="you-bet"></div>
+        <div class="flash hidden" id="you-flash"></div>
+        <div class="cards" id="you-cards"></div>
+        <div class="seat-info">
+          <div class="avatar you">🙂</div>
+          <div class="who">
+            <div class="name">You <span id="you-class" class="hand-class"></span></div>
+            <div class="stack"><span id="you-stack">0</span> chips</div>
+          </div>
+          <div class="badges"><span id="you-pos" class="pos"></span><span id="you-status" class="status hidden"></span></div>
+        </div>
+      </div>
+
+      <div id="banner" class="banner hidden">
+        <div id="banner-main" class="banner-main"></div>
+        <div id="banner-sub" class="banner-sub"></div>
+        <button id="btn-next" class="primary big">Next hand <kbd>Enter</kbd></button>
+      </div>
+
+      <div id="actions" class="actions"></div>
+      <div id="turn-hint" class="turn-hint"></div>
+    </div>
+  </section>
+
+  <aside class="side">
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Bot</h2>
+        <label class="switch"><input type="checkbox" id="toggle-peek"><span>peek cards <kbd>S</kbd></span></label>
+      </div>
+      <div class="panel-body">
+        <div class="kv"><span>Last decision</span><b id="bot-last">–</b></div>
+        <div id="bot-bars" class="bars"></div>
+        <div class="muted small" id="bot-note"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Advisor</h2>
+        <label class="switch"><input type="checkbox" id="toggle-advice" checked><span>show <kbd>D</kbd></span></label>
+      </div>
+      <div id="advice-body" class="panel-body">
+        <div class="kv"><span>Equity vs random hand</span><b id="equity-text">–</b></div>
+        <div class="equity"><div id="eq-win" class="win"></div><div id="eq-tie" class="tie"></div></div>
+        <div class="kv" style="margin-top:10px"><span id="advisor-name">Policy</span><b id="advice-best">–</b></div>
+        <div id="advice-bars" class="bars"></div>
+        <div class="muted small" id="advice-note"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Autoplay</h2></div>
+      <div class="panel-body">
+        <div class="row">
+          <button id="btn-auto" class="primary">▶ Let the advisor play</button>
+          <button id="btn-step" class="ghost" title="Advisor makes one decision">step</button>
+        </div>
+        <div class="row">
+          <label class="small muted" for="speed">speed</label>
+          <input type="range" id="speed" min="0" max="1500" step="50" value="600">
+          <label class="small muted check"><input type="checkbox" id="auto-argmax"> argmax</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Session</h2></div>
+      <div class="panel-body">
+        <canvas id="spark" width="300" height="72"></canvas>
+        <div class="kv small"><span>W / L / T</span><b id="wlt">0 / 0 / 0</b></div>
+        <div class="kv small"><span>Winrate</span><b id="avg">–</b></div>
+        <div class="kv small"><span>mbb / hand</span><b id="mbb">–</b></div>
+        <div class="muted small" id="rate-note"></div>
+      </div>
+    </div>
+
+    <div class="panel grow">
+      <div class="panel-head"><h2>Hand log</h2></div>
+      <div class="panel-body log" id="log"></div>
+      <div class="panel-head sub"><h2>Previous hands</h2></div>
+      <div class="panel-body history" id="history"></div>
+    </div>
+  </aside>
+</main>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-card">
+    <h2>New table</h2>
+    <form id="settings-form">
+      <div class="grid">
+        <label>Opponent
+          <select name="opponent" id="opponent-select"></select>
+        </label>
+        <label>Advisor / autoplay policy
+          <select name="advisor" id="advisor-select"></select>
+        </label>
+        <label>Custom opponent spec <input name="opponent_custom" type="text" placeholder="cfr:runs/my_run/policy.pth"></label>
+        <label>Stack <input name="stack_size" type="number" min="4" max="10000" value="100"></label>
+        <label>Small blind <input name="small_blind" type="number" min="1" value="1"></label>
+        <label>Big blind <input name="big_blind" type="number" min="2" value="2"></label>
+        <label>Raise cap <input name="raise_cap" type="number" min="1" value="3" title="the N-th consecutive raise becomes an all-in"></label>
+        <label>Seed (optional) <input name="seed" type="text" value=""></label>
+      </div>
+      <div class="checks">
+        <label class="check-row"><input type="checkbox" name="deterministic"><span>Bot plays argmax (deterministic) instead of sampling</span></label>
+      </div>
+      <div class="modal-actions">
+        <button type="button" id="btn-cancel" class="ghost">Cancel</button>
+        <button type="submit" class="primary">Start new table</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

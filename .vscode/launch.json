@@ -1,51 +1,43 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "PokerEnv",
+            "name": "Play vs bot (browser)",
             "type": "debugpy",
             "request": "launch",
-            "program": "poker_env.py",
+            "module": "headsup.web",
+            "args": ["--opponent", "cfr"],
             "console": "integratedTerminal"
         },
         {
-            "name": "DeepCFRPokerEnv",
+            "name": "Engine CLI",
             "type": "debugpy",
             "request": "launch",
-            "program": "pokerenv_cfr.py",
-            "cwd": "${workspaceFolder}/deepcfr",
+            "module": "headsup.engine",
             "console": "integratedTerminal"
         },
         {
-            "name": "DeepCFRTraining",
+            "name": "DeepCFR training (short)",
             "type": "debugpy",
             "request": "launch",
-            "program": "train_deepcfr.py",
-            "cwd": "${workspaceFolder}/deepcfr",
-            "console": "integratedTerminal",
-            "env": {
-                "CUDA_VISIBLE_DEVICES": "1"
-            }
+            "module": "headsup.deepcfr.train",
+            "args": ["--iterations", "20", "--traversals", "5000", "--value-steps", "1000", "--out", "runs/deepcfr_debug"],
+            "console": "integratedTerminal"
         },
         {
-            "name": "DeepCFRPolicyEval",
+            "name": "Evaluate policy",
             "type": "debugpy",
             "request": "launch",
-            "program": "eval_policy.py",
-            "cwd": "${workspaceFolder}/deepcfr",
-            "console": "integratedTerminal",
-            "env": {
-                "CUDA_VISIBLE_DEVICES": "1"
-            }
+            "module": "headsup.deepcfr.evaluate",
+            "args": ["--policy", "cfr", "--hands", "50000"],
+            "console": "integratedTerminal"
         },
         {
-            "name": "Visualize",
+            "name": "Exploitability (rl_games) train",
             "type": "debugpy",
             "request": "launch",
-            "program": "visualize.py",
+            "program": "exploitability.py",
+            "args": ["-f", "rl_config/poker_env.yaml", "-t"],
             "console": "integratedTerminal"
         }
     ]
