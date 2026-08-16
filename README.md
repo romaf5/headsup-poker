@@ -162,8 +162,36 @@ models/                  deepcfr_policy.pth, rl_games_exploiter.onnx
 tests/                   pytest suite (rules, C++ ⇔ Python equivalence, envs, memories, web API)
 ```
 
+## How close is this to the papers?
+
+**Matches DeepCFR** (Brown et al. 2019): external-sampling traversals (all actions at the
+traverser's infosets, sampled opponent/chance), advantage samples `v(a) − Σσv` weighted by
+the iteration (linear CFR), advantage nets re-initialised and trained from scratch every
+iteration (Adam 1e-3, grad-norm clip 1, 4000 minibatch steps), reservoir memories, the
+average-strategy net fitted with `t`-weighted MSE, and the paper's card-embedding network.
+**Matches SD-CFR** (Steinberger 2019): all iterates kept, exact reach-weighted linear
+average at play time and the trajectory-sampling variant.
+
+**Deviations** (inherited from the original project or chosen for this game): the bet
+features are 8 aggregated numbers instead of the paper's per-bet round history (a mild
+imperfect-recall abstraction — the raise count is still recoverable from the street bets
+here); regret matching falls back to uniform when no advantage is positive; memories are
+10 M instead of 40 M samples; batch 16 384 instead of 10 000; the game itself is a small
+action abstraction of no-limit hold'em (fold / call / min-raise / all-in, 3rd raise → all-in)
+rather than HULH/FHP; exploitability is a PPO best-response lower bound, not exact.
+
 ## References
 
-- N. Brown, A. Lerer, S. Gross, T. Sandholm — *Deep Counterfactual Regret Minimization* (ICML 2019)
-- E. Steinberger — *Single Deep Counterfactual Regret Minimization* (2019)
-- [treys](https://github.com/ihendley/treys) hand evaluator, [rl_games](https://github.com/Denys88/rl_games)
+- N. Brown, A. Lerer, S. Gross, T. Sandholm. *Deep Counterfactual Regret Minimization.*
+  ICML 2019. [arXiv:1811.00164](https://arxiv.org/abs/1811.00164)
+- E. Steinberger. *Single Deep Counterfactual Regret Minimization.* 2019.
+  [arXiv:1901.07621](https://arxiv.org/abs/1901.07621)
+- E. Steinberger, A. Lerer, N. Brown. *DREAM: Deep Regret minimization with Advantage
+  baselines and Model-free learning.* 2020. [arXiv:2006.10410](https://arxiv.org/abs/2006.10410)
+  (learned baselines for the sampled-regret variance — the natural next step here)
+- M. Zinkevich, M. Johanson, M. Bowling, C. Piccione. *Regret Minimization in Games with
+  Incomplete Information.* NeurIPS 2007 (CFR)
+- M. Lanctot, K. Waugh, M. Zinkevich, M. Bowling. *Monte Carlo Sampling for Regret
+  Minimization in Extensive Games.* NeurIPS 2009 (external sampling MCCFR)
+- Tools: [treys](https://github.com/ihendley/treys) (hand evaluator),
+  [rl_games](https://github.com/Denys88/rl_games) (PPO), [pybind11](https://github.com/pybind/pybind11)
