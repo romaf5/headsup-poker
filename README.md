@@ -35,7 +35,7 @@ python3.11 -m venv .venv311 && source .venv311/bin/activate
 pip install -r requirements.txt            # engine, training, evaluation, web UI
 pip install -r requirements-rl.txt         # + rl_games exploitability, onnx (optional)
 python setup.py build_ext --inplace        # C++ kernels (needs a C++17 compiler; optional but recommended)
-python -m pytest tests -q                  # 38 tests, ~12 s
+python -m pytest tests -q                  # 39 tests, ~25 s
 ```
 
 Device selection is automatic (`mps` → `cuda` → `cpu`); override with `--device` or
@@ -58,7 +58,11 @@ opponent / advisor / stacks / blinds / raise cap / seed without restarting.
 ## The game & observations
 
 Seat 0 is dealer/small blind and acts first pre-flop; seat 1 posts the big blind and acts
-first on later streets. Reward = chips won per hand (1 chip = 500 mbb at blinds 1/2).
+first on later streets. Actions: fold, check/call, min-raise (call + one big blind), all-in;
+the third raise in a row becomes an all-in (finite tree). Folding only exists when facing a
+bet — with nothing to call it would be a dominated check, and leaving it in the tree let
+early CFR iterations put lasting weight on it (the average strategy folded ~17 % of flops
+for free before this rule). Reward = chips won per hand (1 chip = 500 mbb at blinds 1/2).
 Observations are `float32[31]`: hand (2 × [rank+1, suit+1, card+1]), board (5 × same,
 0-padded), stage, position, 8 normalised bet/stack features. The encoding is unchanged from
 the original project, so old checkpoints still load.
@@ -175,7 +179,8 @@ average at play time and the trajectory-sampling variant.
 **Deviations** (inherited from the original project or chosen for this game): the bet
 features are 8 aggregated numbers instead of the paper's per-bet round history (a mild
 imperfect-recall abstraction — the raise count is still recoverable from the street bets
-here); regret matching falls back to uniform when no advantage is positive; memories are
+here); regret matching falls back to uniform when no advantage is positive; SD-CFR's iterate
+weights are `t^γ` (γ = 1 linear, `@g2` for DCFR-style quadratic weighting); memories are
 10 M instead of 40 M samples; batch 16 384 instead of 10 000; the game itself is a small
 action abstraction of no-limit hold'em (fold / call / min-raise / all-in, 3rd raise → all-in)
 rather than HULH/FHP; exploitability is a PPO best-response lower bound, not exact.
