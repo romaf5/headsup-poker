@@ -14,24 +14,42 @@ from headsup.enums import NUM_ACTIONS, Action
 class RandomPlayer:
     def __init__(self, seed=None):
         self.rng = np.random.default_rng(seed)
+        self.last_probs = None
+
+    def probs(self, obs):
+        return np.full((len(obs), NUM_ACTIONS), 1.0 / NUM_ACTIONS, dtype=np.float32)
 
     def __call__(self, obs):
+        self.last_probs = self.probs(obs)
         return self.rng.integers(NUM_ACTIONS, size=len(obs))
 
 
-class AlwaysCallPlayer:
+class _FixedActionPlayer:
+    action = Action.CHECK_CALL
+
+    def __init__(self, seed=None):
+        self.last_probs = None
+
+    def probs(self, obs):
+        p = np.zeros((len(obs), NUM_ACTIONS), dtype=np.float32)
+        p[:, int(self.action)] = 1.0
+        return p
+
     def __call__(self, obs):
-        return np.full(len(obs), int(Action.CHECK_CALL), dtype=np.int64)
+        self.last_probs = self.probs(obs)
+        return np.full(len(obs), int(self.action), dtype=np.int64)
 
 
-class AlwaysAllInPlayer:
-    def __call__(self, obs):
-        return np.full(len(obs), int(Action.ALL_IN), dtype=np.int64)
+class AlwaysCallPlayer(_FixedActionPlayer):
+    action = Action.CHECK_CALL
 
 
-class AlwaysRaisePlayer:
-    def __call__(self, obs):
-        return np.full(len(obs), int(Action.RAISE), dtype=np.int64)
+class AlwaysAllInPlayer(_FixedActionPlayer):
+    action = Action.ALL_IN
+
+
+class AlwaysRaisePlayer(_FixedActionPlayer):
+    action = Action.RAISE
 
 
 def sample_actions(probs, rng, deterministic=False):
@@ -179,8 +197,7 @@ def make_player(spec: str, device=None, deterministic=False, seed=None):
     kind, _, arg = spec.partition(":")
     kind = kind.lower()
     if kind in SIMPLE_PLAYERS:
-        cls = SIMPLE_PLAYERS[kind]
-        return cls(seed=seed) if kind == "random" else cls()
+        return SIMPLE_PLAYERS[kind](seed=seed)
     if kind in ("cfr", "torch", "policy"):
         from headsup.device import get_device
         from headsup.model import load_model

@@ -44,6 +44,18 @@ def test_session_flow_and_bookkeeping():
     json.dumps(s.state())  # serialisable
 
 
+def test_simple_bot_as_advisor_autoplays():
+    s = GameSession(opponent="call", advisor="allin", device="cpu", seed=4)
+    for _ in range(3):
+        while not s.hand_over:
+            s.agent_step()
+        s.next_hand()
+    assert s.stats()["hands"] == 3
+    adv = s.advice() if s.state()["your_turn"] else None
+    if adv:
+        assert adv["probs"][3]["p"] == 1.0  # all-in advisor
+
+
 def test_parse_action_and_labels():
     assert parse_action("fold") == 0 and parse_action("Check") == 1 and parse_action("all-in") == 3 and parse_action(2) == 2
     with pytest.raises(ValueError):
