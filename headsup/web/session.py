@@ -18,7 +18,7 @@ from headsup.players import make_player
 
 ACTION_NAMES = {Action.FOLD: "fold", Action.CHECK_CALL: "call", Action.RAISE: "raise", Action.ALL_IN: "all-in"}
 BOT_LABELS = {
-    "cfr": "DeepCFR", "onnx": "PPO exploiter", "random": "Random bot", "call": "Calling station",
+    "cfr": "DeepCFR", "sdcfr": "SD-CFR", "onnx": "PPO exploiter", "random": "Random bot", "call": "Calling station",
     "allin": "Maniac", "raise": "Always-raise bot",
 }
 
@@ -49,12 +49,14 @@ def parse_action(value):
 
 
 def player_spec(value):
-    """Accept player specs ('cfr', 'onnx:path', 'call', ...) as well as bare model paths."""
+    """Accept player specs ('cfr', 'onnx:path', 'sdcfr:path', 'call', ...) as well as bare model paths."""
     value = str(value).strip()
     if ":" in value or value in ("cfr", "onnx", "random", "call", "allin", "raise"):
         return value
     if value.endswith(".onnx"):
         return f"onnx:{value}"
+    if value.endswith("iterates.pt"):
+        return f"sdcfr:{value}"
     return f"cfr:{value}"
 
 
@@ -278,7 +280,14 @@ class GameSession:
         action = parse_action(action)
         if self.engine.current != self.me:
             raise ValueError("not your turn")
+        obs = self.engine.observation(self.me)[None]
         self._step(self.me, action)
+        if self.advisor is not None and hasattr(self.advisor, "observe"):
+            try:  # SD-CFR exact mode tracks the human's own reach within the hand
+                self.advisor.probs(obs, [0])
+                self.advisor.observe(obs, [0], [int(action)])
+            except Exception:
+                pass
         return self.state()
 
     def next_hand(self):

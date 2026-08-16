@@ -126,6 +126,9 @@ class BaseModel(nn.Module):
         z = self.normalize(z)
         return self.action_head(z)
 
+    def state_dict_cpu(self):
+        return {k: v.detach().cpu().clone() for k, v in self.state_dict().items()}
+
     def numpy_weights(self):
         """State dict as float32 numpy arrays (for :class:`headsup.numpy_model.NumpyModel`)."""
         return {k: v.detach().cpu().float().numpy() for k, v in self.state_dict().items()}

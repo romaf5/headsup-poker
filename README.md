@@ -17,8 +17,13 @@ browser table to play against the bots — with a DeepCFR advisor at your side.
   differential-tested against its Python twin.
 - **DeepCFR trainer** (`headsup/deepcfr/`): reservoir memories on the GPU, `torch.compile`,
   checkpoint/resume, Ctrl-C-safe, TensorBoard with signals that actually mean something.
-- **Exploitability**: rl_games PPO exploiter against a frozen policy through our own
-  vectorised env (no Ray), ONNX export of the exploiter.
+- **Single Deep CFR** (Steinberger 2019, `headsup/sdcfr.py`): the same run also keeps every
+  iteration's advantage net and plays the exact linear-CFR average strategy from them — no
+  strategy memory / policy net approximation. `--algo deepcfr|sdcfr|both` picks the variant;
+  `both` gives an apples-to-apples comparison from one training run.
+- **Comparison & exploitability tools**: `headsup.compare` (round-robin head-to-head with
+  standard errors) and `headsup.exploit` (several PPO best responses in parallel, argmax and
+  sampled play, hundreds of thousands of hands, max = exploitability lower bound).
 - **Browser UI** (`headsup/web/`, no JS build step, dependency-free HTTP server): play vs.
   the DeepCFR bot or the exploiter, see the bot's action distribution, get advice + Monte-Carlo
   equity from the DeepCFR policy, autoplay, hand history, session sparkline.
@@ -30,7 +35,7 @@ python3.11 -m venv .venv311 && source .venv311/bin/activate
 pip install -r requirements.txt            # engine, training, evaluation, web UI
 pip install -r requirements-rl.txt         # + rl_games exploitability, onnx (optional)
 python setup.py build_ext --inplace        # C++ kernels (needs a C++17 compiler; optional but recommended)
-python -m pytest tests -q                  # 32 tests, ~7 s
+python -m pytest tests -q                  # 38 tests, ~12 s
 ```
 
 Device selection is automatic (`mps` → `cuda` → `cpu`); override with `--device` or
@@ -70,40 +75,53 @@ tensorboard --logdir runs
 
 Per iteration and seat: 10 000 external-sampling traversals (C++, all cores) → advantage
 samples into a reservoir memory on the GPU → the seat's advantage network is re-fitted from
-scratch (4000 steps × 16 384). At the end (or on `Ctrl-C`) the average-strategy network is
-fitted on the strategy memory, saved to `<out>/policy.pth` and evaluated against simple
-opponents. On an M2 Max an iteration takes ≈ 40–50 s.
+scratch (4000 steps × 16 384). At the end (or on `Ctrl-C`):
+
+- **DeepCFR** (`--algo deepcfr` / `both`): the average-strategy network is fitted on the
+  strategy memory → `<out>/policy.pth` (player spec `cfr:<out>/policy.pth`);
+- **SD-CFR** (`--algo sdcfr` / `both`): all iterates are written to `<out>/iterates.pt`
+  (player spec `sdcfr:<out>/iterates.pt`, or `…@exact` for exact per-infoset averaging
+  instead of per-hand trajectory sampling — same distribution, see `headsup/sdcfr.py`).
+
+Both are evaluated against simple opponents and, with `both`, head-to-head (`eval.json`).
+On an M2 Max an iteration takes ≈ 40–55 s (traversals grow as the bots stop folding).
 
 What to watch in TensorBoard:
 
 | tag | meaning |
 |---|---|
 | `eval_current_strategy/*` | current CFR iterate (regret matching on the advantage nets) vs random / call / all-in, chips/hand, every 5 it. |
-| `eval_avg_strategy/*` | quick fit of the *average* strategy — the thing CFR converges — every 25 it. |
+| `eval_avg_strategy/*` | quick fit of the DeepCFR *average* strategy — the thing CFR converges — every 25 it. |
+| `eval_sdcfr/*` | the SD-CFR average strategy (no fitting needed) vs the same bots, every 25 it. |
 | `advantage/seat*/final_loss` | the training loss; it is weighted by the iteration `t` (linear CFR) so it grows ~linearly by design |
 | `advantage/seat*/mse_unweighted`, `target_rms` | unweighted fit error vs the scale of the sampled regrets (single-sample targets are very noisy, so the ratio stays high) |
 | `samples/nodes_per_traversal` | game-tree size per traversal — grows as the bots stop folding |
 
-Evaluate any policy (chips/hand, batched, native env):
+Evaluate any policy against the simple bots (chips/hand, batched, native env), or compare
+policies head-to-head (round-robin, alternating seats, ± standard error):
 
 ```bash
 python -m headsup.deepcfr.evaluate --policy cfr --hands 200000
-python -m headsup.deepcfr.evaluate --policy cfr:runs/deepcfr/policy.pth --opponents random,call,allin,onnx
+python -m headsup.compare cfr sdcfr:runs/deepcfr/iterates.pt cfr:models/deepcfr_policy_v1.pth --hands 400000 --bots
 ```
 
 ## Exploitability (best-response lower bound with rl_games)
 
 `rl_games_env.py` registers `headsup_poker` with rl_games using our vectorised env (all
-tables in one process, opponent inference batched / native in C++).
+tables in one process, opponent inference batched / native in C++). `headsup.exploit` trains
+several PPO best responses (different seeds, in parallel), exports them to ONNX and
+evaluates each against the policy with argmax and sampled play over many hands; the largest
+exploiter reward is the number to quote (a lower bound on exploitability, ± SE):
 
 ```bash
-python exploitability.py -f rl_config/poker_env.yaml -t                        # train the exploiter (CPU)
-python exploitability.py -f rl_config/poker_env.yaml -t --opponent cfr:runs/deepcfr/policy.pth
-python exploitability.py -f rl_config/poker_env.yaml -p -c runs/<exp>/nn/exploitability.pth   # av reward = chips/hand
-python rl_games_onnx.py -f rl_config/poker_env.yaml -m runs/<exp>/nn/exploitability.pth -o models/rl_games_exploiter.onnx
+python -m headsup.exploit --policy cfr --seeds 3 --epochs 1000 --hands 400000 --out runs/exploit_cfr
+python -m headsup.exploit --policy sdcfr:runs/deepcfr/iterates.pt --seeds 3
+python -m headsup.exploit --policy cfr --onnx models/rl_games_exploiter.onnx     # evaluate existing exploiters
 ```
 
-`--device mps` works too, but the exploiter's MLP is tiny and CPU is faster.
+The lower-level pieces are still available: `exploitability.py -t/-p` (one exploiter,
+rl_games CLI semantics) and `rl_games_onnx.py` (export). `--device mps` works, but the
+exploiter's MLP is tiny and CPU is faster.
 
 **About the old "500 mbb/g".** The original `poker_env.py` (used for the exploiter) had no
 raise cap while the DeepCFR training env converted the 3rd consecutive raise into an all-in,
@@ -136,6 +154,8 @@ headsup/players.py       batched players: random/call/allin/raise, torch policy,
 headsup/model.py         DeepCFR network (torch); numpy_model.py = numpy mirror for CPU workers
 headsup/cpp/             C++ kernels (pybind11): engine, evaluator, MLP, MCCFR traversal, VecEnv
 headsup/deepcfr/         memory.py (reservoir), traverse.py, train.py, evaluate.py
+headsup/sdcfr.py         Single Deep CFR: iterate bank + average-strategy player (exact / trajectory sampling)
+headsup/compare.py       head-to-head comparison CLI;  headsup/exploit.py: multi-seed PPO exploitability CLI
 headsup/web/             browser table: server.py (http.server), session.py (game logic), static/ (HTML/CSS/JS)
 rl_games_env.py          rl_games registration;  exploitability.py / rl_games_onnx.py: exploiter tools
 models/                  deepcfr_policy.pth, rl_games_exploiter.onnx
@@ -145,4 +165,5 @@ tests/                   pytest suite (rules, C++ ⇔ Python equivalence, envs, 
 ## References
 
 - N. Brown, A. Lerer, S. Gross, T. Sandholm — *Deep Counterfactual Regret Minimization* (ICML 2019)
+- E. Steinberger — *Single Deep Counterfactual Regret Minimization* (2019)
 - [treys](https://github.com/ihendley/treys) hand evaluator, [rl_games](https://github.com/Denys88/rl_games)

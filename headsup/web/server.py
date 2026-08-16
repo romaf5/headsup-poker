@@ -44,6 +44,9 @@ def available_players():
             continue
         rel = os.path.relpath(path, ROOT)
         out.append({"spec": f"onnx:{rel}", "label": f"ONNX exploiter ({rel})"})
+    for path in sorted(glob.glob(os.path.join(MODELS_DIR, "*iterates*.pt")) + glob.glob(os.path.join(ROOT, "runs", "*", "iterates.pt"))):
+        rel = os.path.relpath(path, ROOT)
+        out.append({"spec": f"sdcfr:{rel}", "label": f"SD-CFR average strategy ({rel})"})
     return out
 
 

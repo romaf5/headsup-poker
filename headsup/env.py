@@ -25,6 +25,13 @@ except ImportError:  # pragma: no cover
     _spaces = None
 
 
+def _call_player(player, obs, ids):
+    """Call a batched player, passing table ids to players that track per-table state."""
+    if getattr(player, "wants_ids", False):
+        return player(obs, ids=ids)
+    return player(obs)
+
+
 def _make_spaces():
     if _spaces is None:
         return None, None
@@ -76,7 +83,7 @@ class PokerVecEnv:
             if not idx:
                 return
             obs = np.stack([self.engines[i].observation() for i in idx])
-            actions = self.opponent(obs)
+            actions = _call_player(self.opponent, obs, np.asarray(idx))
             for i, a in zip(idx, actions):
                 self.engines[i].step(int(a))
 
@@ -196,8 +203,9 @@ def play_hands(vec_env, agent, num_hands, progress=False):
         from tqdm import tqdm
 
         bar = tqdm(total=num_hands, leave=False)
+    ids = np.arange(vec_env.num_envs)
     while len(rewards) < num_hands:
-        obs, r, d, _ = vec_env.step(agent(obs))
+        obs, r, d, _ = vec_env.step(_call_player(agent, obs, ids))
         got = r[d]
         rewards.extend(got.tolist())
         if bar is not None:

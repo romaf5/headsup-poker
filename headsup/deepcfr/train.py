@@ -138,13 +138,18 @@ class DeepCFRTrainer:
         self.seed_seq = np.random.SeedSequence(args.seed)
         torch.manual_seed(args.seed)
 
+        self.algo = args.algo
+        self.use_deepcfr = self.algo in ("deepcfr", "both")
+        self.use_sdcfr = self.algo in ("sdcfr", "both")
         self.adv_memory = [ReservoirBuffer(args.adv_capacity, self.device, seed=args.seed + i) for i in range(2)]
-        self.strat_memory = ReservoirBuffer(args.strat_capacity, self.device, seed=args.seed + 2)
+        self.strat_memory = ReservoirBuffer(args.strat_capacity, self.device, seed=args.seed + 2) if self.use_deepcfr else None
         self.nets = [BaseModel().to(self.device).eval() for _ in range(2)]
+        # SD-CFR: keep every iteration's advantage net (iterate 0 = the untrained, uniform net)
+        self.iterates = [[n.state_dict_cpu()] for n in self.nets] if self.use_sdcfr else None
         self.runner = TraversalRunner(args.workers, backend=args.backend)
         print(
-            f"device={self.device}  traversal backend={self.runner.backend} x{self.runner.num_workers} workers  "
-            f"memories: adv {args.adv_capacity:,} x2, strat {args.strat_capacity:,}"
+            f"device={self.device}  algo={self.algo}  traversal backend={self.runner.backend} x{self.runner.num_workers} workers  "
+            f"memories: adv {args.adv_capacity:,} x2" + (f", strat {args.strat_capacity:,}" if self.use_deepcfr else "")
         )
 
     # -- logging ---------------------------------------------------------------------
@@ -159,13 +164,32 @@ class DeepCFRTrainer:
             "iteration": self.iteration,
             "nets": [n.state_dict() for n in self.nets],
             "adv_memory": [m.state_dict() for m in self.adv_memory],
-            "strat_memory": self.strat_memory.state_dict(),
+            "strat_memory": self.strat_memory.state_dict() if self.strat_memory is not None else None,
+            "iterates": self._stacked_iterates() if self.iterates is not None else None,
             "args": vars(self.args),
         }
         tmp = path + ".tmp"
         torch.save(state, tmp)
         os.replace(tmp, path)
+        if self.iterates is not None:
+            self.save_iterates()
         return path
+
+    def _stacked_iterates(self):
+        return {s: {k: torch.stack([sd[k] for sd in dicts]) for k in dicts[0]} for s, dicts in enumerate(self.iterates)}
+
+    def save_iterates(self, path=None):
+        """Write the SD-CFR iterate bank (all advantage nets) in IterateBank format."""
+        path = path or os.path.join(self.args.out, "iterates.pt")
+        stacked = self._stacked_iterates()
+        torch.save({"seats": stacked, "T": len(self.iterates[0])}, path)
+        return path
+
+    def sdcfr_player(self, mode="sample", seed=None):
+        from headsup.sdcfr import IterateBank, SDCFRPlayer
+
+        bank = IterateBank(self._stacked_iterates(), self.device)
+        return SDCFRPlayer(bank, mode=mode, seed=seed)
 
     def load_checkpoint(self, path):
         state = torch.load(path, map_location="cpu", weights_only=True)
@@ -174,7 +198,17 @@ class DeepCFRTrainer:
             n.load_state_dict(sd)
         for m, sd in zip(self.adv_memory, state["adv_memory"]):
             m.load_state_dict(sd)
-        self.strat_memory.load_state_dict(state["strat_memory"])
+        if self.strat_memory is not None and state.get("strat_memory") is not None:
+            self.strat_memory.load_state_dict(state["strat_memory"])
+        if self.iterates is not None:
+            stacked = state.get("iterates")
+            if stacked is not None:
+                self.iterates = [
+                    [{k: v[t].clone() for k, v in d.items()} for t in range(next(iter(d.values())).shape[0])]
+                    for _, d in sorted(stacked.items())
+                ]
+            else:
+                print("(checkpoint has no iterate bank: SD-CFR average will only cover iterations from here on)")
         print(f"resumed from {path} at iteration {self.iteration}")
 
     # -- one CFR iteration -----------------------------------------------------------
@@ -189,7 +223,8 @@ class DeepCFRTrainer:
             adv, strat, nodes = self.runner.collect(weights, seat, a.traversals, t, seed)
             t_trav = time.perf_counter() - t0
             self.adv_memory[seat].add(adv.obs, adv.t, adv.target)
-            self.strat_memory.add(strat.obs, strat.t, strat.target)
+            if self.strat_memory is not None:
+                self.strat_memory.add(strat.obs, strat.t, strat.target)
 
             t0 = time.perf_counter()
             self.nets[seat], final_loss = train_advantage_net(
@@ -204,6 +239,8 @@ class DeepCFRTrainer:
                 log_step_offset=(self.iteration - 1) * a.value_steps,
             )
             weights[seat] = self.nets[seat].numpy_weights()
+            if self.iterates is not None:
+                self.iterates[seat].append(self.nets[seat].state_dict_cpu())
             synchronize(self.device)
             t_train = time.perf_counter() - t0
 
@@ -218,7 +255,8 @@ class DeepCFRTrainer:
             self.log(f"samples/strat_per_traversal/seat{seat}", len(strat) / a.traversals, it)
             self.log(f"samples/nodes_per_traversal/seat{seat}", nodes / a.traversals, it)
             self.log(f"memory/adv/seat{seat}", len(self.adv_memory[seat]), it)
-            self.log("memory/strat", len(self.strat_memory), it)
+            if self.strat_memory is not None:
+                self.log("memory/strat", len(self.strat_memory), it)
             self.last_stats = dict(trav=t_trav, train=t_train, nodes=nodes / a.traversals, adv=len(adv), strat=len(strat))
 
     def _advantage_fit_quality(self, seat, n=65536):
@@ -239,6 +277,16 @@ class DeepCFRTrainer:
         scores = evaluate(player, self.args.iterate_eval_hands, num_envs=1024, seed=self.args.seed)
         for k, v in scores.items():
             self.log(f"eval_current_strategy/{k}", v, self.iteration)
+        return scores
+
+    def evaluate_sdcfr(self):
+        """SD-CFR average strategy (trajectory sampling over the iterate bank) vs simple bots."""
+        from headsup.deepcfr.evaluate import evaluate
+
+        player = self.sdcfr_player(mode="sample", seed=self.args.seed + self.iteration)
+        scores = evaluate(player, self.args.iterate_eval_hands, num_envs=1024, seed=self.args.seed)
+        for k, v in scores.items():
+            self.log(f"eval_sdcfr/{k}", v, self.iteration)
         return scores
 
     def evaluate_quick_policy(self):
@@ -269,9 +317,7 @@ class DeepCFRTrainer:
         scores = evaluate_model(policy, self.device, self.args.eval_hands, seed=self.args.seed)
         for k, v in scores.items():
             self.log(f"eval/{k}", v, self.iteration)
-        print("chips/hand vs", {k: round(v, 3) for k, v in scores.items()})
-        with open(os.path.join(self.args.out, "eval.json"), "w") as f:
-            json.dump({"iteration": self.iteration, "hands": self.args.eval_hands, "chips_per_hand": scores}, f, indent=2)
+        print("DeepCFR policy net, chips/hand vs", {k: round(v, 3) for k, v in scores.items()})
         return scores
 
     # -- main loop -------------------------------------------------------------------
@@ -287,9 +333,13 @@ class DeepCFRTrainer:
                 if a.eval_every and self.iteration % a.eval_every == 0:
                     scores = self.evaluate_iterate()
                     post["cur_vs_call"] = f"{scores['call']:+.2f}"
-                if a.policy_eval_every and self.iteration % a.policy_eval_every == 0 and len(self.strat_memory) >= a.batch_size:
-                    scores = self.evaluate_quick_policy()
-                    post["avg_vs_call"] = f"{scores['call']:+.2f}"
+                if a.policy_eval_every and self.iteration % a.policy_eval_every == 0:
+                    if self.strat_memory is not None and len(self.strat_memory) >= a.batch_size:
+                        scores = self.evaluate_quick_policy()
+                        post["avg_vs_call"] = f"{scores['call']:+.2f}"
+                    if self.iterates is not None:
+                        scores = self.evaluate_sdcfr()
+                        post["sdcfr_vs_call"] = f"{scores['call']:+.2f}"
                 bar.set_postfix(**post)
                 bar.update(1)
                 if a.checkpoint_every and self.iteration % a.checkpoint_every == 0:
@@ -304,20 +354,61 @@ class DeepCFRTrainer:
             self.save_checkpoint()
         elif interrupted:
             print("(no checkpoint written: pass --checkpoint-every N to keep resumable state)")
-        if len(self.strat_memory) == 0:
-            print("no strategy samples collected; nothing to train")
-            return None
-        policy = self.train_policy()
+        return self.finish()
+
+    def finish(self):
+        """Produce the final artefacts: DeepCFR policy net and/or SD-CFR iterate bank, then evaluate."""
+        a = self.args
+        results = {"iteration": self.iteration, "hands": a.eval_hands, "algo": self.algo}
+        policy = None
+        if self.iterates is not None:
+            path = self.save_iterates()
+            print(f"SD-CFR iterate bank: {len(self.iterates[0])} nets per seat -> {path}")
+        if self.strat_memory is not None:
+            if len(self.strat_memory) == 0:
+                print("no strategy samples collected; skipping the policy net")
+            else:
+                policy = self.train_policy()
         if a.eval_hands > 0:
-            self.evaluate(policy)
+            from headsup.env import make_vec_env, play_hands
+            from headsup.players import TorchPolicyPlayer
+
+            if policy is not None:
+                results["deepcfr_chips_per_hand"] = self.evaluate(policy)
+            if self.iterates is not None:
+                sd = self.evaluate_sdcfr_final()
+                results["sdcfr_chips_per_hand"] = sd
+            if policy is not None and self.iterates is not None:
+                sd_player = self.sdcfr_player(mode="sample", seed=a.seed + 1)
+                r = play_hands(make_vec_env(1024, sd_player, seed=a.seed), TorchPolicyPlayer(policy, device=self.device, seed=a.seed), a.eval_hands)
+                h2h = float(r.mean())
+                se = float(r.std() / np.sqrt(len(r)))
+                results["deepcfr_vs_sdcfr_chips_per_hand"] = h2h
+                results["deepcfr_vs_sdcfr_se"] = se
+                self.log("eval/deepcfr_vs_sdcfr", h2h, self.iteration)
+                print(f"head-to-head DeepCFR policy vs SD-CFR average: {h2h:+.3f} ± {se:.3f} chips/hand")
+            with open(os.path.join(a.out, "eval.json"), "w") as f:
+                json.dump(results, f, indent=2)
         if self.writer is not None:
             self.writer.close()
         return policy
+
+    def evaluate_sdcfr_final(self):
+        from headsup.deepcfr.evaluate import evaluate
+
+        player = self.sdcfr_player(mode="sample", seed=self.args.seed)
+        scores = evaluate(player, self.args.eval_hands, seed=self.args.seed)
+        for k, v in scores.items():
+            self.log(f"eval_sdcfr/{k}", v, self.iteration)
+        print("SD-CFR average strategy, chips/hand vs", {k: round(v, 3) for k, v in scores.items()})
+        return scores
 
 
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out", default="runs/deepcfr", help="output directory (policy.pth, checkpoint.pt, tensorboard)")
+    p.add_argument("--algo", default="both", choices=["deepcfr", "sdcfr", "both"],
+                   help="deepcfr: strategy memory + policy net; sdcfr: keep all iterates (Single Deep CFR); both (default)")
     p.add_argument("--iterations", type=int, default=300, help="CFR iterations")
     p.add_argument("--traversals", type=int, default=10_000, help="traversals per seat per iteration")
     p.add_argument("--workers", type=int, default=None, help="traversal workers (default: cores-1)")
@@ -336,7 +427,7 @@ def build_parser():
     p.add_argument("--iterate-eval-hands", type=int, default=20_000, help="hands per opponent for the periodic evaluations")
     p.add_argument("--checkpoint-every", type=int, default=0, help="save a resumable checkpoint (nets + memories, up to ~150 bytes/sample) every N iterations (0 = off)")
     p.add_argument("--resume", default=None, help="checkpoint.pt to resume from")
-    p.add_argument("--policy-only", default=None, help="skip CFR: train the policy from this checkpoint's strategy memory")
+    p.add_argument("--policy-only", default=None, help="skip CFR: build the final artefacts (policy net / iterate bank) from this checkpoint and evaluate")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-tensorboard", action="store_true")
     p.add_argument("--no-compile", action="store_true", help="disable torch.compile for the network fits")
@@ -349,9 +440,7 @@ def main(argv=None):
     if args.policy_only:
         trainer.load_checkpoint(args.policy_only)
         trainer.runner.close()
-        policy = trainer.train_policy()
-        if args.eval_hands > 0:
-            trainer.evaluate(policy)
+        trainer.finish()
         return
     if args.resume:
         trainer.load_checkpoint(args.resume)

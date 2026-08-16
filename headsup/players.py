@@ -1,9 +1,10 @@
 """Batched players.
 
-A player is a callable ``player(obs_batch: float32[N, 31]) -> int64[N]`` returning one
-action per row.  Batching lets one network forward pass serve many tables at once (see
-:class:`headsup.env.PokerVecEnv`).  Players may expose ``last_probs`` (float32[N, 4]) for
-visualisation.
+A player is a callable ``player(obs_batch: float32[N, 31], ids=None) -> int64[N]`` returning
+one action per row.  Batching lets one network forward pass serve many tables at once (see
+:class:`headsup.env.PokerVecEnv`).  ``ids`` are the table indices of the rows; stateless
+players ignore them, stateful ones (SD-CFR) use them to track per-table state.  Players may
+expose ``last_probs`` (float32[N, 4]) and ``probs(obs, ids=None)`` for visualisation/advice.
 """
 
 import numpy as np
@@ -16,10 +17,10 @@ class RandomPlayer:
         self.rng = np.random.default_rng(seed)
         self.last_probs = None
 
-    def probs(self, obs):
+    def probs(self, obs, ids=None):
         return np.full((len(obs), NUM_ACTIONS), 1.0 / NUM_ACTIONS, dtype=np.float32)
 
-    def __call__(self, obs):
+    def __call__(self, obs, ids=None):
         self.last_probs = self.probs(obs)
         return self.rng.integers(NUM_ACTIONS, size=len(obs))
 
@@ -30,12 +31,12 @@ class _FixedActionPlayer:
     def __init__(self, seed=None):
         self.last_probs = None
 
-    def probs(self, obs):
+    def probs(self, obs, ids=None):
         p = np.zeros((len(obs), NUM_ACTIONS), dtype=np.float32)
         p[:, int(self.action)] = 1.0
         return p
 
-    def __call__(self, obs):
+    def __call__(self, obs, ids=None):
         self.last_probs = self.probs(obs)
         return np.full(len(obs), int(self.action), dtype=np.int64)
 
@@ -75,7 +76,7 @@ class TorchPolicyPlayer:
         self.rng = np.random.default_rng(seed)
         self.last_probs = None
 
-    def probs(self, obs):
+    def probs(self, obs, ids=None):
         torch = self.torch
         with torch.no_grad():
             x = torch.as_tensor(np.asarray(obs, dtype=np.float32)).to(self.device)
@@ -83,7 +84,7 @@ class TorchPolicyPlayer:
             probs = torch.softmax(logits, dim=-1)
         return probs.float().cpu().numpy()
 
-    def __call__(self, obs):
+    def __call__(self, obs, ids=None):
         self.last_probs = self.probs(obs)
         return sample_actions(self.last_probs, self.rng, self.deterministic)
 
@@ -104,7 +105,7 @@ class RegretMatchingPlayer:
         self.rng = np.random.default_rng(seed)
         self.last_probs = None
 
-    def probs(self, obs):
+    def probs(self, obs, ids=None):
         torch = self.torch
         obs = np.asarray(obs, dtype=np.float32)
         out = np.empty((len(obs), NUM_ACTIONS), dtype=np.float32)
@@ -120,7 +121,7 @@ class RegretMatchingPlayer:
                     out[mask.cpu().numpy()] = p.float().cpu().numpy()
         return out
 
-    def __call__(self, obs):
+    def __call__(self, obs, ids=None):
         self.last_probs = self.probs(obs)
         return sample_actions(self.last_probs, self.rng)
 
@@ -134,13 +135,13 @@ class NumpyPolicyPlayer:
         self.rng = np.random.default_rng(seed)
         self.last_probs = None
 
-    def probs(self, obs):
+    def probs(self, obs, ids=None):
         logits = self.model(np.asarray(obs, dtype=np.float32))
         logits = logits - logits.max(axis=1, keepdims=True)
         p = np.exp(logits)
         return p / p.sum(axis=1, keepdims=True)
 
-    def __call__(self, obs):
+    def __call__(self, obs, ids=None):
         self.last_probs = self.probs(obs)
         return sample_actions(self.last_probs, self.rng, self.deterministic)
 
@@ -161,7 +162,7 @@ class ONNXPolicyPlayer:
         self.rng = np.random.default_rng(seed)
         self.last_probs = None
 
-    def probs(self, obs):
+    def probs(self, obs, ids=None):
         obs = np.ascontiguousarray(obs, dtype=np.float32)
         if self.fixed_batch is None or len(obs) == self.fixed_batch:
             return self.session.run([self.output_name], {self.input_name: obs})[0]
@@ -174,7 +175,7 @@ class ONNXPolicyPlayer:
             out[i : i + b] = self.session.run([self.output_name], {self.input_name: chunk})[0][: len(out) - i]
         return out
 
-    def __call__(self, obs):
+    def __call__(self, obs, ids=None):
         self.last_probs = self.probs(obs)
         return sample_actions(self.last_probs, self.rng, self.deterministic)
 
@@ -190,7 +191,8 @@ SIMPLE_PLAYERS = {
 def make_player(spec: str, device=None, deterministic=False, seed=None):
     """Build a player from a CLI spec.
 
-    ``random`` | ``call`` | ``allin`` | ``raise`` | ``cfr[:path.pth]`` | ``onnx[:path.onnx]``
+    ``random`` | ``call`` | ``allin`` | ``raise`` | ``cfr[:path.pth]`` | ``onnx[:path.onnx]`` |
+    ``sdcfr:path/iterates.pt[@exact]`` (Single Deep CFR average strategy; default trajectory sampling)
     """
     from headsup.paths import DEFAULT_ONNX_PATH, DEFAULT_POLICY_PATH
 
@@ -207,4 +209,11 @@ def make_player(spec: str, device=None, deterministic=False, seed=None):
         return TorchPolicyPlayer(model, device=device, deterministic=deterministic, seed=seed)
     if kind == "onnx":
         return ONNXPolicyPlayer(arg or DEFAULT_ONNX_PATH, deterministic=deterministic, seed=seed)
+    if kind == "sdcfr":
+        from headsup.device import get_device
+        from headsup.sdcfr import SDCFRPlayer
+
+        path, _, mode = arg.partition("@")
+        device = get_device(device) if not hasattr(device, "type") else device
+        return SDCFRPlayer.load(path, device=device, mode=mode or "sample", seed=seed)
     raise ValueError(f"unknown player spec {spec!r}")
