@@ -1,5 +1,7 @@
 # headsup-poker
 
+[![tests](https://github.com/romaf5/headsup-poker/actions/workflows/tests.yml/badge.svg)](https://github.com/romaf5/headsup-poker/actions/workflows/tests.yml)
+
 Heads-up no-limit-style Texas Hold'em: a fast game engine, **DeepCFR** training on Apple
 Silicon (MPS) / CUDA / CPU, exploitability evaluation with a PPO best-response agent, and a
 browser table to play against the bots — with a DeepCFR advisor at your side.
