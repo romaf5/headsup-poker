@@ -1,4 +1,4 @@
-"""rl_games integration: registers the ``headsup_poker`` environment.
+"""rl_games integration: registers the ``headsup_poker`` environment (import this module).
 
 Importing this module registers
 * an env config ``headsup_poker`` (``env_configurations``) whose vecenv type ``HEADSUP``

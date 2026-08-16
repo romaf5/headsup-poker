@@ -1,6 +1,6 @@
 """Export a trained rl_games exploiter to ONNX (input obs float32[N, 31] -> action probs).
 
-    python rl_games_onnx.py -f rl_config/poker_env.yaml -m runs/<exp>/nn/exploitability.pth -o models/rl_games_exploiter.onnx
+    python -m headsup.rl.onnx -f configs/rl_games_exploiter.yaml -m runs/<exp>/nn/exploitability.pth -o models/rl_games_exploiter.onnx
 """
 
 import argparse
@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 
-import rl_games_env  # noqa: F401
+from headsup.rl import env as rl_games_env  # noqa: F401
 from headsup.engine import OBS_DIM
 from rl_games.torch_runner import Runner
 

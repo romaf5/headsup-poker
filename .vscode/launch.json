@@ -36,8 +36,8 @@
             "name": "Exploitability (rl_games) train",
             "type": "debugpy",
             "request": "launch",
-            "program": "exploitability.py",
-            "args": ["-f", "rl_config/poker_env.yaml", "-t"],
+            "module": "headsup.rl.exploitability",
+            "args": ["-f", "configs/rl_games_exploiter.yaml", "-t"],
             "console": "integratedTerminal"
         }
     ]

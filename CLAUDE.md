@@ -17,7 +17,7 @@ python -m pytest tests -q                                  # 39 tests, ~25 s; in
 
 - Device: automatic (`mps` > `cuda` > `cpu`); force with `--device` flags or `HEADSUP_DEVICE=cuda`.
   `torch.compile` is used for network fits (works on CUDA and MPS; falls back to eager).
-- rl_games (exploiter) config `rl_config/poker_env.yaml` sets `device: cpu`; on a CUDA box pass
+- rl_games (exploiter) config `configs/rl_games_exploiter.yaml` sets `device: cpu`; on a CUDA box pass
   `--device cuda:0` to `exploitability.py` / `headsup.exploit` (tiny MLP — CPU is often faster anyway).
 - macOS notes: build with Apple clang (setup.py forces `/usr/bin/clang` and strips a pyenv
   `-I<SDK>` flag that breaks libc++); MPS reductions over short strided dims are slow — avoided
@@ -43,7 +43,7 @@ headsup/deepcfr/evaluate.py  evaluate a player vs simple bots
 headsup/sdcfr.py         IterateBank (all iterations' nets, vmapped) + SDCFRPlayer (exact / sample averaging, t^gamma weights)
 headsup/compare.py       head-to-head round robin CLI;   headsup/exploit.py: K PPO exploiters -> exploitability lower bound
 headsup/web/             browser table: server.py (stdlib http.server), session.py (game logic), static/ (HTML/CSS/JS)
-rl_games_env.py          registers `headsup_poker` (own vec env, no Ray) with rl_games; exploitability.py / rl_games_onnx.py
+headsup/rl/              rl_games integration: env.py (registration, own vec env, no Ray), exploitability.py (PPO CLI), onnx.py (export)
 models/                  deepcfr_policy.pth (shipped), deepcfr_policy_v1.pth (original), rl_games_exploiter.onnx, README.json
 tests/                   pytest suite (rules, golden observations, C++ <-> Python, envs, memories, SD-CFR, web API)
 ```

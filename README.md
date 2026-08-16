@@ -111,7 +111,7 @@ python -m headsup.compare cfr sdcfr:runs/deepcfr/iterates.pt cfr:models/deepcfr_
 
 ## Exploitability (best-response lower bound with rl_games)
 
-`rl_games_env.py` registers `headsup_poker` with rl_games using our vectorised env (all
+`headsup/rl/env.py` registers `headsup_poker` with rl_games using our vectorised env (all
 tables in one process, opponent inference batched / native in C++). `headsup.exploit` trains
 several PPO best responses (different seeds, in parallel), exports them to ONNX and
 evaluates each against the policy with argmax and sampled play over many hands; the largest
@@ -123,8 +123,8 @@ python -m headsup.exploit --policy sdcfr:runs/deepcfr/iterates.pt --seeds 3
 python -m headsup.exploit --policy cfr --onnx models/rl_games_exploiter.onnx     # evaluate existing exploiters
 ```
 
-The lower-level pieces are still available: `exploitability.py -t/-p` (one exploiter,
-rl_games CLI semantics) and `rl_games_onnx.py` (export). `--device mps` works, but the
+The lower-level pieces are still available: `python -m headsup.rl.exploitability -t/-p` (one
+exploiter, rl_games CLI semantics) and `python -m headsup.rl.onnx` (export). `--device mps` works, but the
 exploiter's MLP is tiny and CPU is faster.
 
 **About the old "500 mbb/g".** The original `poker_env.py` (used for the exploiter) had no
@@ -161,7 +161,7 @@ headsup/deepcfr/         memory.py (reservoir), traverse.py, train.py, evaluate.
 headsup/sdcfr.py         Single Deep CFR: iterate bank + average-strategy player (exact / trajectory sampling)
 headsup/compare.py       head-to-head comparison CLI;  headsup/exploit.py: multi-seed PPO exploitability CLI
 headsup/web/             browser table: server.py (http.server), session.py (game logic), static/ (HTML/CSS/JS)
-rl_games_env.py          rl_games registration;  exploitability.py / rl_games_onnx.py: exploiter tools
+headsup/rl/              rl_games registration (env.py), exploiter CLI (exploitability.py), ONNX export (onnx.py)
 models/                  deepcfr_policy.pth, rl_games_exploiter.onnx
 tests/                   pytest suite (rules, C++ ⇔ Python equivalence, envs, memories, web API)
 ```
