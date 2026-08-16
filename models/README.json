@@ -1,0 +1,26 @@
+{
+  "deepcfr_policy.pth": {
+    "trained": "2026-08-16",
+    "hardware": "Apple M2 Max (MPS), 11 traversal threads",
+    "iterations": 300,
+    "traversals_per_iteration": "10000 (it. 1-70), 40000 (it. 71-300)",
+    "advantage_fit": "4000 steps x 16384, Adam 1e-3, from scratch each iteration",
+    "memories": "reservoir 10M advantage samples per seat, 10M strategy samples",
+    "policy_fit": "50 epochs over the strategy memory",
+    "wall_clock_hours": 3.6,
+    "chips_per_hand_vs": {
+      "random": 3.702665090560913,
+      "call": 6.202459812164307,
+      "allin": 3.040635108947754
+    },
+    "exploiter_max_chips_per_hand": 0.31,
+    "head_to_head_vs_v1": "-0.06 +- 0.05 chips/hand (tie)"
+  },
+  "deepcfr_policy_v1.pth": {
+    "note": "original 300-iteration model from the previous code base",
+    "exploiter_max_chips_per_hand": 0.37
+  },
+  "rl_games_exploiter.onnx": {
+    "note": "PPO best response to deepcfr_policy.pth, 1000 epochs, rl_config/poker_env.yaml; argmax play wins +0.31 chips/hand vs it"
+  }
+}

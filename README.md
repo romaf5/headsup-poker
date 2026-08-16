@@ -114,12 +114,18 @@ now share one engine; `env_config.raise_cap` selects the game (`1000000` = uncap
 
 ## Results
 
-Chips/hand (1 chip = 500 mbb), 200 000 hands each:
+Chips/hand (1 chip = 500 mbb), measured with this code (`headsup.deepcfr.evaluate`, 200k–400k
+hands, ± ≈ 0.05). "Exploiter" = the larger reward of two PPO best responses (1000 epochs each,
+argmax play), a lower bound on exploitability.
 
-| policy | vs random | vs call | vs all-in | PPO exploiter, 400 epochs, argmax |
+| policy | vs random | vs call | vs all-in | exploiter |
 |---|---|---|---|---|
-| `models/deepcfr_policy.pth` (300 it., original run) | +3.61 | +4.72 | +2.27 | **+0.13** (≈ 66 mbb/g) |
-| 100 it., `--value-steps 2000` (50 min on M2 Max) | +3.53 | +6.47 | +3.34 | +1.32 |
+| `models/deepcfr_policy.pth` — 300 it., 40k traversals/it., 3.6 h on an M2 Max | **+3.70** | **+6.26** | **+3.00** | **+0.31** (≈ 150 mbb/g) |
+| `models/deepcfr_policy_v1.pth` — original 300-it. model | +3.61 | +4.72 | +2.27 | +0.37 (≈ 185 mbb/g) |
+
+Head-to-head the two are tied (−0.06 ± 0.05 chips/hand for the new one), as expected for
+two near-equilibrium strategies. `models/rl_games_exploiter.onnx` is the exploiter trained
+against the shipped policy; `models/README.json` records the training settings.
 
 ## Layout
 
