@@ -22,7 +22,7 @@ import torch
 from tqdm import tqdm
 
 from headsup.deepcfr.evaluate import evaluate_model
-from headsup.deepcfr.memory import ReservoirBuffer
+from headsup.deepcfr.memory import CircularBuffer, ReservoirBuffer
 from headsup.deepcfr.traverse import TraversalRunner
 from headsup.device import get_device, synchronize
 from headsup.game import GameConfig, parse_bet_sizes
@@ -179,8 +179,11 @@ class DeepCFRTrainer:
         torch.manual_seed(args.seed)
 
         self.algo = args.algo
-        self.use_deepcfr = self.algo in ("deepcfr", "both")
-        self.use_sdcfr = self.algo in ("sdcfr", "both")
+        # DeepCFR / SD-CFR: external sampling.  DREAM: outcome sampling with learned baselines,
+        # SD-CFR averaging (the paper's setting).  ESCHER: outcome sampling with a history value net,
+        # DeepCFR-style average policy net (+ the iterate bank for evaluation).
+        self.use_deepcfr = self.algo in ("deepcfr", "both", "escher")
+        self.use_sdcfr = self.algo in ("sdcfr", "both", "dream", "escher")
         if args.game and args.game not in ("nlhe", "holdem"):  # limit presets (FHP / HULH)
             from headsup.games.holdem import make_holdem
 
@@ -206,6 +209,18 @@ class DeepCFRTrainer:
         # SD-CFR: keep every iteration's advantage net (iterate 0 = the untrained, uniform net)
         self.iterates = [[n.state_dict_cpu()] for n in self.nets] if self.use_sdcfr else None
         self.runner = TraversalRunner(args.workers, backend=args.backend, game=self.game)
+        # history value networks (both players' cards): DREAM baselines Q_p(h, a) per player, the
+        # ESCHER value net q(h, a) (player 0's return); trained continually on a FIFO of recent rows
+        self.value_config = normalize_config(dict(self.model_config, opp_cards=True))
+        self.value_nets, self.value_opts, self.value_memory = [], [], []
+        if self.algo in ("dream", "escher"):
+            n_value = 2 if self.algo == "dream" else 1
+            self.value_nets = [BaseModel(config=self.value_config).to(self.device).eval() for _ in range(n_value)]
+            self.value_opts = [torch.optim.Adam(n.parameters(), lr=args.lr) for n in self.value_nets]
+            self.value_memory = [CircularBuffer(args.q_capacity, self.device, self.value_nets[0].obs_dim, seed=args.seed + 10 + i)
+                                 for i in range(n_value)]
+            if self.runner.backend != "cpp":
+                raise SystemExit("DREAM / ESCHER need the C++ extension (python setup.py build_ext)")
         cfg = self.model_config
         print(
             f"device={self.device}  algo={self.algo}  traversal backend={self.runner.backend} x{self.runner.num_workers} workers  "
@@ -236,6 +251,9 @@ class DeepCFRTrainer:
             "iterates": self._stacked_iterates() if self.iterates is not None else None,
             "args": vars(self.args),
             "model_config": dict(self.model_config),
+            "value_nets": [n.state_dict() for n in self.value_nets],
+            "value_opts": [o.state_dict() for o in self.value_opts],
+            "value_memory": [m.state_dict() for m in self.value_memory],
         }
         tmp = path + ".tmp"
         torch.save(state, tmp)
@@ -277,6 +295,12 @@ class DeepCFRTrainer:
             m.load_state_dict(sd)
         if self.strat_memory is not None and state.get("strat_memory") is not None:
             self.strat_memory.load_state_dict(state["strat_memory"])
+        for n, sd in zip(self.value_nets, state.get("value_nets", [])):
+            n.load_state_dict(sd)
+        for o, sd in zip(self.value_opts, state.get("value_opts", [])):
+            o.load_state_dict(sd)
+        for m, sd in zip(self.value_memory, state.get("value_memory", [])):
+            m.load_state_dict(sd)
         if self.iterates is not None:
             stacked = state.get("iterates")
             if stacked is not None:
@@ -289,18 +313,63 @@ class DeepCFRTrainer:
         print(f"resumed from {path} at iteration {self.iteration}")
 
     # -- one CFR iteration -----------------------------------------------------------
+    def _seed(self):
+        return int(self.seed_seq.spawn(1)[0].generate_state(1)[0])
+
+    def train_value_net(self, i, steps=None, batch=None):
+        """Continue training value net ``i`` on its FIFO (masked MSE on the taken action's output;
+        DREAM / ESCHER: Adam 1e-3, grad clip 1, 1000 x 512 per iteration by default)."""
+        a = self.args
+        steps, batch = steps or a.q_steps, batch or a.q_batch
+        net, opt, mem = self.value_nets[i], self.value_opts[i], self.value_memory[i]
+        if len(mem) < batch:
+            return float("nan")
+        net.train()
+        loss_val = float("nan")
+        for _ in range(steps):
+            obs, action, target = mem.sample(batch)
+            pred = net(obs).gather(1, action[:, None]).squeeze(1)
+            loss = torch.mean((pred - target) ** 2)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0, foreach=False)
+            opt.step()
+            loss_val = float(loss.detach())
+        net.eval()
+        return loss_val
+
+    def _sample_seat(self, seat, weights, t):
+        """Collect this iteration's samples for ``seat`` with the algorithm's sampler; returns
+        (adv Samples, strat Samples or None, nodes)."""
+        a = self.args
+        if self.algo == "dream":
+            adv, val, nodes = self.runner.collect_dream(weights, self.value_nets[seat].numpy_weights(), seat, a.traversals, t, a.epsilon, self._seed())
+            self.value_memory[seat].add(val.obs, val.t, val.target[np.arange(len(val)), val.t.astype(int)])
+            self.log(f"value/seat{seat}/loss", self.train_value_net(seat), self.iteration)
+            return adv, None, nodes
+        if self.algo == "escher":
+            adv, strat, _, nodes = self.runner.collect_escher_regrets(weights, self.value_nets[0].numpy_weights(), seat, a.traversals, t, self._seed())
+            return adv, strat, nodes
+        adv, strat, nodes = self.runner.collect(weights, seat, a.traversals, t, self._seed())
+        return adv, strat, nodes
+
     def cfr_iteration(self):
         a = self.args
         self.iteration += 1
         t = float(self.iteration)  # linear CFR weight
         weights = [n.numpy_weights() for n in self.nets]
+        if self.algo == "escher":  # value trajectories under the current strategies, then the value net
+            t0 = time.perf_counter()
+            val, _ = self.runner.collect_escher_values(weights, a.value_trajectories or a.traversals, self._seed())
+            self.value_memory[0].add(val.obs, val.t, val.target[np.arange(len(val)), val.t.astype(int)])
+            self.log("value/loss", self.train_value_net(0), self.iteration)
+            self.log("time/value", time.perf_counter() - t0, self.iteration)
         for seat in range(2):
             t0 = time.perf_counter()
-            seed = int(self.seed_seq.spawn(1)[0].generate_state(1)[0])
-            adv, strat, nodes = self.runner.collect(weights, seat, a.traversals, t, seed)
+            adv, strat, nodes = self._sample_seat(seat, weights, t)
             t_trav = time.perf_counter() - t0
             self.adv_memory[seat].add(adv.obs, adv.t, adv.target)
-            if self.strat_memory is not None:
+            if self.strat_memory is not None and strat is not None:
                 self.strat_memory.add(strat.obs, strat.t, strat.target)
 
             t0 = time.perf_counter()
@@ -331,12 +400,13 @@ class DeepCFRTrainer:
             self.log(f"time/traverse/seat{seat}", t_trav, it)
             self.log(f"time/train_advantage/seat{seat}", t_train, it)
             self.log(f"samples/adv_per_traversal/seat{seat}", len(adv) / a.traversals, it)
-            self.log(f"samples/strat_per_traversal/seat{seat}", len(strat) / a.traversals, it)
+            self.log(f"samples/strat_per_traversal/seat{seat}", (len(strat) if strat is not None else 0) / a.traversals, it)
             self.log(f"samples/nodes_per_traversal/seat{seat}", nodes / a.traversals, it)
             self.log(f"memory/adv/seat{seat}", len(self.adv_memory[seat]), it)
             if self.strat_memory is not None:
                 self.log("memory/strat", len(self.strat_memory), it)
-            self.last_stats = dict(trav=t_trav, train=t_train, nodes=nodes / a.traversals, adv=len(adv), strat=len(strat))
+            self.last_stats = dict(trav=t_trav, train=t_train, nodes=nodes / a.traversals, adv=len(adv),
+                                   strat=len(strat) if strat is not None else 0)
 
     def _advantage_fit_quality(self, seat, n=65536):
         """Unweighted MSE of the freshly fitted net on a memory sample, and the target scale."""
@@ -437,7 +507,8 @@ class DeepCFRTrainer:
             while self.iteration < a.iterations:
                 self.cfr_iteration()
                 s = self.last_stats
-                post = dict(trav=f"{s['trav']:.1f}s", train=f"{s['train']:.1f}s", nodes=f"{s['nodes']:.0f}", strat=f"{len(self.strat_memory):,}")
+                post = dict(trav=f"{s['trav']:.1f}s", train=f"{s['train']:.1f}s", nodes=f"{s['nodes']:.0f}",
+                            strat=f"{len(self.strat_memory):,}" if self.strat_memory is not None else "-")
                 if a.eval_every and self.iteration % a.eval_every == 0:
                     scores = self.evaluate_iterate()
                     post["cur_vs_call"] = f"{scores['call']:+.2f}"
@@ -523,8 +594,15 @@ class DeepCFRTrainer:
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out", default="runs/deepcfr", help="output directory (policy.pth, checkpoint.pt, tensorboard)")
-    p.add_argument("--algo", default="both", choices=["deepcfr", "sdcfr", "both"],
-                   help="deepcfr: strategy memory + policy net; sdcfr: keep all iterates (Single Deep CFR); both (default)")
+    p.add_argument("--algo", default="both", choices=["deepcfr", "sdcfr", "both", "dream", "escher"],
+                   help="deepcfr: strategy memory + policy net; sdcfr: keep all iterates (Single Deep CFR); both (default); "
+                        "dream: outcome sampling with learned baselines + SD-CFR averaging (Steinberger et al. 2020); "
+                        "escher: outcome sampling with a history value net + average policy net (McAleer et al. 2023)")
+    p.add_argument("--epsilon", type=float, default=0.5, help="DREAM: exploration of the traverser (xi = eps * uniform + (1 - eps) * sigma)")
+    p.add_argument("--q-steps", type=int, default=1000, help="DREAM / ESCHER: value-net SGD steps per iteration (paper: 1000)")
+    p.add_argument("--q-batch", type=int, default=512, help="DREAM / ESCHER: value-net batch size (paper: 512)")
+    p.add_argument("--q-capacity", type=int, default=200_000, help="DREAM / ESCHER: value-net FIFO capacity (paper: 200 000)")
+    p.add_argument("--value-trajectories", type=int, default=None, help="ESCHER: value trajectories per iteration (default: --traversals)")
     p.add_argument("--iterations", type=int, default=300, help="CFR iterations")
     p.add_argument("--preset", default="default", choices=sorted(PRESETS),
                    help="hyperparameter preset; 'paper' = DeepCFR / SD-CFR papers (10k traversals, batch 10k, 40M memories, "
