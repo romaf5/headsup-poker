@@ -92,3 +92,42 @@ def test_training_reduces_fhp_exploitability_and_the_player_round_trips(tmp_path
     assert probs.shape == (NUM_COMBOS, FHP.num_actions)
     np.testing.assert_allclose(probs.sum(1), 1.0, atol=1e-5)
     assert np.all(probs[:, 0] == 0)  # nothing to call: never fold
+
+
+def test_table_abstraction_features_and_round_trip(tmp_path):
+    from headsup.blueprint import TabularBlueprint, TabularPlayer
+
+    mod = native.module()
+    bp = TabularBlueprint(DEFAULT_GAME, buckets=30, mode="table", completions=40)
+    board = [4, 18, 33, 47, 8]
+    # river: the features are the exact equities (std 0), matching the BoardTable
+    f = np.array(bp.cpp.features(3, board))
+    eq = np.array(mod.BoardTable(board, 5).equity)
+    ok = eq >= 0
+    np.testing.assert_allclose(f[ok, 0], eq[ok], atol=1e-6)
+    assert np.all(f[ok, 1] == 0) and np.all(f[~ok, 0] < 0)
+    # turn: mean over all rivers, std > 0 for drawing hands; the set of tens (Th Td) is strong
+    f = np.array(bp.cpp.features(2, board[:4]))
+    h = mod.combo_index(21, 34)
+    assert f[h, 0] > 0.75 and f[:, 1][ok].max() > 0.05
+    bp.fit_abstraction(20 * 1326, 0, 4)  # 20 random boards per round
+    assert [len(c) // 2 for c in bp.cpp.centroids] == [0, 30, 30, 30]
+    b = np.array(bp.cpp.strategy_for_hands(0, np.array([[12, 25], [0, 14]], dtype=np.int32), [], 0))  # preflop still works
+    assert b.shape == (2, 4)
+    bp.configure(strategy_interval=5)
+    bp.run(3000, 1, 4)
+    assert bp.cpp.cache_sizes[1] > 0 and bp.cpp.cache_sizes[2] > 0  # per-board caches filled by the traversals
+    bp.save(tmp_path / "t.pt")
+    other = TabularBlueprint.load(tmp_path / "t.pt")
+    assert other.mode == "table" and other.cpp.table_mode and [len(c) for c in other.cpp.centroids] == [len(c) for c in bp.cpp.centroids]
+    p = TabularPlayer(other, seed=0)
+    from headsup.engine import HeadsUpPoker
+    from headsup.lbr import NUM_COMBOS, substitute_hands
+
+    e = HeadsUpPoker(rng=np.random.default_rng(3))
+    e.reset()
+    e.step(1)
+    e.step(1)
+    probs = p.probs(substitute_hands(e.observation(1)))
+    assert probs.shape == (NUM_COMBOS, 4)
+    np.testing.assert_allclose(probs.sum(1), 1.0, atol=1e-5)
