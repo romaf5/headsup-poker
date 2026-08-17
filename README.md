@@ -328,7 +328,7 @@ DeepCFR / SD-CFR arms, 300 iterations × 40 000 traversals, 20 M memories each (
 | base | aggregated | current | uniform | +4.19/+7.30/+3.55 | +4.25/+7.37/+3.63 | −0.06 ± 0.05 | 1.62 ± 0.09 | 1.35 ± 0.11 | 0.44 ± 0.04 | 0.56 ± 0.04 | 3.71 (1855 mbb/g) |
 | history / paper | history | paper | uniform | +4.31/+7.86/+3.27 | +4.29/+7.75/+3.18 | −0.04 ± 0.05 | **1.33 ± 0.09** | **1.28 ± 0.11** | 0.01 ± 0.03 | 0.09 ± 0.03 | **3.24 (1620 mbb/g)** |
 | aggregated / paper | aggregated | paper | uniform | +4.23/+6.96/+3.55 | +4.26/+6.86/+3.36 | −0.07 ± 0.05 | 1.49 ± 0.09 | 1.31 ± 0.11 | – | – | 3.68 (1839 mbb/g) |
-| history / paper / argmax | history | paper | argmax | +2.21/+3.20/+0.95 | +2.24/+3.30/+0.97 | −0.05 ± 0.03 | 1.00 ± 0.09 | 0.88 ± 0.11 | – | – | (running) |
+| history / paper / argmax | history | paper | argmax | +2.21/+3.20/+0.95 | +2.24/+3.30/+0.97 | −0.05 ± 0.03 | 1.00 ± 0.09 | 0.88 ± 0.11 | – | – | 2.96 (1478 mbb/g) |
 
 Findings: the paper's bet-history features and network are less exploitable than the aggregated
 features / current network (LBR 1.33 vs 1.62); the argmax regret-matching fallback (paper) lowers
@@ -341,8 +341,10 @@ SD-CFR average tie head-to-head in every arm (±0.05 at 1.5 M hands). Longer run
 Linear-MCCFR-P iterations, 200 EHS buckets, ~40 min on 24 threads): LBR **0.67 ± 0.09** chips/hand
 (336 mbb/g) — half of what LBR finds against the DeepCFR nets — and head-to-head over 300 000
 hands it beats the DeepCFR policy by **+0.81 ± 0.04** chips/hand (≈ 405 mbb/g) and the SD-CFR
-average by +0.82 ± 0.04, while scoring less against the fixed bots (+1.8 / +2.5 / +0.9). Its BR
-estimate is running. The table-mode abstraction (exact per-board (mean, std) equity features,
+average by +0.82 ± 0.04, while scoring less against the fixed bots (+1.8 / +2.5 / +0.9). By the
+12-board BR estimate the two are equal (blueprint 3.29 chips = 1646 mbb/g, DeepCFR policy 3.24,
+its SD-CFR average 3.46) — the head-to-head and LBR rank the blueprint ahead, the BR estimate is
+noisy at 12 boards. The table-mode abstraction (exact per-board (mean, std) equity features,
 k-means, cached per board) trains at ~60 000 iterations/s once its caches are warm (20 M in
 15 min); its evaluation is running too.
 
