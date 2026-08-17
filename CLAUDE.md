@@ -158,8 +158,9 @@ epochs ~30 min in parallel; the final 50-epoch policy fit ~3 min. Checkpoints wi
   exploiter 0.01; best-response exploitability (holdem_br, 12 boards) 3.24 chips = 1620 mbb/g. All DeepCFR
   arms tie head-to-head with their SD-CFR averages (+-0.05 at 1.5 M hands).
 - Shipped `models/blueprint_nlhe.pt` = tabular MCCFR-P blueprint (20 M it., 200 EHS buckets, 40 min): LBR
-  0.67 +- 0.09; beats its 400k-iteration version +0.33 +- 0.09 head-to-head; scores less vs fixed bots
-  (+1.8 / +2.5 / +0.9) - equilibria don't exploit. Table-mode abstraction trains at ~60k it/s once warm.
+  0.67 +- 0.09; beats the DeepCFR policy +0.81 +- 0.04 and its SD-CFR average +0.82 head-to-head (300k
+  hands) and its own 400k-iteration version +0.33 +- 0.09; scores less vs fixed bots (+1.8 / +2.5 / +0.9) -
+  equilibria don't exploit. Table-mode abstraction trains at ~60k it/s once warm.
 - Exploiter power: PPO << LBR << BR (BR finds ~2.5x LBR); use `holdem_br` for exploitability claims.
 - FHP: EHS-bucket tabular blueprints floor at ~380 mbb/g regardless of buckets / iterations (1-D
   abstraction floor; cf. DeepCFR paper Fig. 2 abstraction baselines). Leduc (1 seed, 200 it., mA/g):

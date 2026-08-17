@@ -9,7 +9,11 @@
     "advantage_fit": "4000 steps x 16384, Adam 1e-3, from scratch each iteration",
     "memories": "reservoir 20M advantage samples per seat, 20M strategy samples",
     "policy_fit": "50 epochs over the strategy memory",
-    "chips_per_hand_vs": {"random": 4.31, "call": 7.86, "allin": 3.27},
+    "chips_per_hand_vs": {
+      "random": 4.31,
+      "call": 7.86,
+      "allin": 3.27
+    },
     "lbr_chips_per_hand": "1.33 +- 0.09 (30 000 duplicate pairs)",
     "ppo_exploiter_chips_per_hand": "0.01 +- 0.03 (best of 3 seeds x 1000 epochs)",
     "best_response_exploitability": "3.24 chips/hand = 1620 mbb/g (headsup.algos.holdem_br, 12 boards)",
@@ -20,8 +24,13 @@
     "algorithm": "tabular Pluribus-style MCCFR-P blueprint (headsup.blueprint): Linear MCCFR with negative-regret pruning, 169 lossless preflop classes + 200 equal-mass EHS buckets per later round (Monte-Carlo EHS, 500 runouts), 20M iterations; play-only file (average-strategy counters, no regrets)",
     "public_nodes": 8426,
     "infosets": 436366,
-    "chips_per_hand_vs": {"random": 1.76, "call": 2.53, "allin": 0.85},
+    "chips_per_hand_vs": {
+      "random": 1.76,
+      "call": 2.53,
+      "allin": 0.85
+    },
     "lbr_chips_per_hand": "0.67 +- 0.09 (30 000 duplicate pairs)",
-    "note": "an equilibrium approximation exploits fixed bots less than the DeepCFR nets do; use it with real-time search: python -m headsup.web --opponent pluribus"
+    "note": "an equilibrium approximation exploits fixed bots less than the DeepCFR nets do; use it with real-time search: python -m headsup.web --opponent pluribus",
+    "head_to_head": "+0.81 +- 0.04 chips/hand vs models/deepcfr_policy.pth, +0.82 +- 0.04 vs its SD-CFR average (300 000 hands each)"
   }
 }

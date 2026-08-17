@@ -337,10 +337,12 @@ SD-CFR average tie head-to-head in every arm (±0.05 at 1.5 M hands). Longer run
 (`long_history_paper`: 1000 it. × 100 000 traversals) and the 0.5 / 1 / 2-pot action tree
 (`betsize_history_paper`) are still training / evaluating.
 
-**Tabular Pluribus blueprint** (`runs/bp/nlhe_20m.pt`: 20 M Linear-MCCFR-P iterations, 200
-EHS buckets, ~40 min on 24 threads): LBR **0.67 ± 0.09** chips/hand (336 mbb/g) — half of what
-LBR finds against the DeepCFR nets; head-to-head vs the DeepCFR policy / SD-CFR average and the
-BR estimate are running. The table-mode abstraction (exact per-board (mean, std) equity features,
+**Tabular Pluribus blueprint** (`runs/bp/nlhe_20m.pt` = `models/blueprint_nlhe.pt`: 20 M
+Linear-MCCFR-P iterations, 200 EHS buckets, ~40 min on 24 threads): LBR **0.67 ± 0.09** chips/hand
+(336 mbb/g) — half of what LBR finds against the DeepCFR nets — and head-to-head over 300 000
+hands it beats the DeepCFR policy by **+0.81 ± 0.04** chips/hand (≈ 405 mbb/g) and the SD-CFR
+average by +0.82 ± 0.04, while scoring less against the fixed bots (+1.8 / +2.5 / +0.9). Its BR
+estimate is running. The table-mode abstraction (exact per-board (mean, std) equity features,
 k-means, cached per board) trains at ~60 000 iterations/s once its caches are warm (20 M in
 15 min); its evaluation is running too.
 
