@@ -325,9 +325,9 @@ DeepCFR / SD-CFR arms, 300 iterations × 40 000 traversals, 20 M memories each (
 
 | run | features | net | rm | policy vs bots | SD-CFR vs bots | policy vs SD-CFR | LBR policy | LBR SD-CFR | PPO policy | PPO SD-CFR | BR policy |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| base | aggregated | current | uniform | +4.19/+7.30/+3.55 | +4.25/+7.37/+3.63 | −0.06 ± 0.05 | 1.62 ± 0.09 | 1.35 ± 0.11 | 0.44 ± 0.04 | 0.56 ± 0.04 | (running) |
-| history / paper | history | paper | uniform | +4.31/+7.86/+3.27 | +4.29/+7.75/+3.18 | −0.04 ± 0.05 | **1.33 ± 0.09** | **1.28 ± 0.11** | 0.01 ± 0.03 | 0.09 ± 0.03 | 3.24 (1620 mbb/g) |
-| aggregated / paper | aggregated | paper | uniform | +4.23/+6.96/+3.55 | +4.26/+6.86/+3.36 | −0.07 ± 0.05 | 1.49 ± 0.09 | 1.31 ± 0.11 | – | – | (running) |
+| base | aggregated | current | uniform | +4.19/+7.30/+3.55 | +4.25/+7.37/+3.63 | −0.06 ± 0.05 | 1.62 ± 0.09 | 1.35 ± 0.11 | 0.44 ± 0.04 | 0.56 ± 0.04 | 3.71 (1855 mbb/g) |
+| history / paper | history | paper | uniform | +4.31/+7.86/+3.27 | +4.29/+7.75/+3.18 | −0.04 ± 0.05 | **1.33 ± 0.09** | **1.28 ± 0.11** | 0.01 ± 0.03 | 0.09 ± 0.03 | **3.24 (1620 mbb/g)** |
+| aggregated / paper | aggregated | paper | uniform | +4.23/+6.96/+3.55 | +4.26/+6.86/+3.36 | −0.07 ± 0.05 | 1.49 ± 0.09 | 1.31 ± 0.11 | – | – | 3.68 (1839 mbb/g) |
 | history / paper / argmax | history | paper | argmax | +2.21/+3.20/+0.95 | +2.24/+3.30/+0.97 | −0.05 ± 0.03 | 1.00 ± 0.09 | 0.88 ± 0.11 | – | – | (running) |
 
 Findings: the paper's bet-history features and network are less exploitable than the aggregated
