@@ -351,8 +351,9 @@ k-means, cached per board) trains at ~60 000 iterations/s once its caches are wa
 **Real-time search**: LBR against the Pluribus-mode player on the tabular blueprint
 (`search:tab:…@pluribus@it300`, 2 000 duplicate pairs) is **−0.78 ± 0.39** chips/hand — LBR
 cannot exploit it at all (vs +0.67 for the blueprint alone, +1.33 for the DeepCFR net); Pluribus
-mode on top of the DeepCFR net: **−0.00 ± 0.28** (same conclusion); the depth-limited solver and a
-head-to-head round robin of the search players are running (`runs/bp/eval.log`).
+mode on top of the DeepCFR net: **−0.00 ± 0.28**; the depth-limited solver on the DeepCFR net
+(`search:cfr:…@it20000`): **−0.41 ± 0.26** — every search variant is beyond LBR's reach; a
+head-to-head round robin of the search players is running (`runs/bp/eval.log`).
 
 ### Reproductions on the papers' games
 
