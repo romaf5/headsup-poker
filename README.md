@@ -107,6 +107,21 @@ scratch (4000 steps × 16 384). At the end (or on `Ctrl-C`):
   thinned to 64 representative iterates; `iterate:<out>/iterates.pt@t100` plays iteration 100's
   current strategy).
 
+- **DREAM** (`--algo dream`, Steinberger, Lerer & Brown 2020): outcome-sampling traversals (one
+  trajectory each, the traverser exploring with ε = 0.5) with a learned per-player baseline
+  Q̂ᵢ(h, a) — a history-input network that sees both players' hole cards (`opp_cards` model
+  variant, expected-SARSA targets, FIFO of 200 000 rows, 1000 × 512 updates per iteration) —
+  giving the baseline-corrected advantage estimates of the paper's eq. 6–7 (weights t / own
+  sample reach); the average strategy is SD-CFR's iterate bank, as in the paper;
+- **ESCHER** (`--algo escher`, McAleer et al. 2023): value trajectories under the current
+  strategies train a history value net q(h, a) (player 0's return, same FIFO / updates); regret
+  trajectories let the update player sample uniformly and the opponent play σ, regrets are
+  q(h, ·) − σ·q read off the value net (no importance weights), the average policy is a network
+  fitted on (I, t, σ) samples (plus the iterate bank for evaluation).
+  Both samplers are C++ (`run_dream`, `run_escher_values` / `run_escher_regrets`), differential-
+  tested against a Python reference (`tests/test_deepcfr.py`), and work for any of the games
+  (`--game fhp` reproduces the papers' FHP setting: `--traversals 50000`).
+
 Both are evaluated against simple opponents and, with `both`, head-to-head (`eval.json`).
 On an M2 Max an iteration takes ≈ 40–55 s (traversals grow as the bots stop folding), on a
 64-core box with an RTX 3090 ≈ 25–30 s (the fit dominates; traversals take ~1–3 s).
@@ -358,6 +373,13 @@ lossless current-round / bucketed later-round infosets, final-iterate play, Baye
 with the average strategy at round ends (`@pluribus`, see the search section); the blueprint's
 Linear MCCFR with negative-regret pruning is in `headsup/algos/tabular.py`
 (`MCCFR(..., prune_threshold=...)`) for the small games — the hold'em blueprint here is DeepCFR / SD-CFR.
+
+**DREAM / ESCHER** on hold'em: exact samplers (baseline correction, expected-SARSA targets, ε-
+exploration; ESCHER's uniform update-player sampling and value-net regrets) and buffer sizes /
+update counts from the papers; the history input is seat 0's observation plus seat 1's hole
+cards (the papers concatenate both players' infostates — the same information); on Leduc /
+Kuhn the generic implementations in `headsup/algos/deep.py` are used instead (see the
+reproduction tables).
 
 **Deviations** (design choices for this game): the default bet features are 8 aggregated
 numbers (a mild imperfect-recall abstraction; the paper-faithful history is one flag away);
