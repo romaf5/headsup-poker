@@ -219,7 +219,11 @@ def main(argv=None):
     p.add_argument("--json", default=None)
     args = p.parse_args(argv)
     game = make_holdem(args.game)
-    player = make_player(args.policy, device=args.device, seed=args.seed)
+    player = make_player(args.policy, device=args.device, seed=args.seed, game=game)
+    if getattr(player, "game", None) is not None:  # network / tabular players carry their action tree
+        if player.game.tree_dict() != game.tree_dict():
+            print(f"(using the player's action tree {player.game.tree_dict()} instead of --game {args.game})")
+        game = player.game
     t0 = time.perf_counter()
     res = HoldemBestResponse(player, game, boards=args.boards, seed=args.seed).run()
     res["seconds"] = time.perf_counter() - t0
