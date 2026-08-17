@@ -174,6 +174,10 @@ epochs ~30 min in parallel; the final 50-epoch policy fit ~3 min. Checkpoints wi
 - Keep C++ and Python behaviour identical; every engine/traversal change needs both implementations
   and the differential tests. Rebuild the extension after touching `headsup/cpp/`.
 - Commit/push only when asked; results changes go with README + `models/README.json` updates.
+- Host RAM: the WSL2 VM is capped at 96 GB and rebooted once (2026-08-17) under three host-memory trainers
+  + evaluations. Keep total RSS < ~50 GB: one `--memory-device cpu` trainer per GPU, reproductions
+  sequential (`runs/scripts/chain_gpu1_seq.sh`), search players evaluated with `--num-envs 128` and
+  `MALLOC_ARENA_MAX=4` (many solver threads bloat glibc arenas), checkpoints every 25-50 iterations.
 - Search: pre-river subgames use *sampled* MCCFR where LCFR beats DCFR/CFR+/PCFR+ (measured); the
   river uses full-width vector CFR where DCFR/CFR+/PCFR+ win. Do not "improve" the sampled solver with
   regret flooring. `search:` players are stateful (wants_ids) and slow (~1-2 s/decision): evaluate on
