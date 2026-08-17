@@ -96,7 +96,7 @@ def regret_matching_torch(adv, legal, fallback="uniform"):
     import torch
 
     adv = adv.clone()
-    legal = torch.as_tensor(np.asarray(legal), dtype=torch.bool, device=adv.device)
+    legal = (legal if torch.is_tensor(legal) else torch.as_tensor(np.asarray(legal))).to(device=adv.device, dtype=torch.bool)
     adv[..., ~legal] = -float("inf")
     pos = adv.clamp(min=0.0)
     total = pos.sum(dim=-1, keepdim=True)

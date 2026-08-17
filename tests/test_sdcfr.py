@@ -72,6 +72,21 @@ def test_truncated_bank_and_specs(tmp_path):
     np.testing.assert_allclose(it.probs(obs), ref.probs(obs), atol=1e-6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="checks the CUDA code path")
+def test_gpu_players_regret_matching():
+    """RegretMatchingPlayer / SDCFRPlayer hand CUDA masks to regret_matching_torch (a CPU-only CI cannot see this)."""
+    from headsup.deepcfr.evaluate import evaluate
+
+    nets, bank = _bank(3, device="cuda")
+    nets = [[m.to("cuda") for m in seat] for seat in nets]
+    obs = _observations(64)
+    p = RegretMatchingPlayer([nets[0][0], nets[1][0]], device="cuda", seed=0)
+    assert p.probs(obs).shape == (64, 4)
+    np.testing.assert_allclose(bank.strategies(0, obs)[0].cpu().numpy(), RegretMatchingPlayer([nets[0][0]] * 2, device="cuda").probs(obs), atol=3e-4)
+    scores = evaluate(SDCFRPlayer(bank, mode="sample", seed=0), 500, num_envs=64, seed=0)
+    assert set(scores) == {"random", "call", "allin"}
+
+
 def test_bank_save_load(tmp_path):
     _, bank = _bank(3, features="history", rm_fallback="argmax")
     bank.save(tmp_path / "it.pt")
