@@ -37,6 +37,8 @@ def actions_for_amount(engine, amount):
     stack = engine.stacks[engine.current]
     if amount == min(to_call, stack):
         return [int(Action.CHECK_CALL)]
+    if amount == 0 and to_call > 0:  # a fold (recorded with size 0): only seen in terminal observations
+        return [int(Action.FOLD)]
     out = []
     capped = engine.consecutive_raises + 1 >= engine.raise_cap
     for a in range(2, engine.all_in):

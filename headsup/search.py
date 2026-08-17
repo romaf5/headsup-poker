@@ -204,7 +204,7 @@ class SearchPlayer:
         self._cpp = native.module()
         self._cfg = native.engine_config(game=self.game)
         self.rng = np.random.default_rng(seed)
-        self._pool = ThreadPoolExecutor(workers or 8)
+        self._pool = ThreadPoolExecutor(workers or 16)
         self.state = {}  # table id -> dict(villain, hero, processed, last_root)
         self.last_probs = None
         self.solve_time = 0.0
@@ -319,9 +319,14 @@ class SearchPlayer:
         self._update_ranges(jobs)
         t0 = time.perf_counter()
         seeds = self.rng.integers(2**63, size=len(ids))
-        futs = {int(t): self._pool.submit(self._solve, *jobs[int(t)][:3], jobs[int(t)][5], sd) for t, sd in zip(ids, seeds)}
+        # a finished hand (the opponent open-folded during the env's reset): any action is accepted
+        futs = {int(t): self._pool.submit(self._solve, *jobs[int(t)][:3], jobs[int(t)][5], sd)
+                for t, sd in zip(ids, seeds) if not jobs[int(t)][0].done}
         out = np.zeros((len(obs), self.game.num_actions), dtype=np.float32)
         for i, t in enumerate(ids):
+            if int(t) not in futs:
+                out[i, 1] = 1.0
+                continue
             root, hh = futs[int(t)].result()
             jobs[int(t)][5]["last_root"] = root.astype(np.float64)
             out[i] = root[hh]
