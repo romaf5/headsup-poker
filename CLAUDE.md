@@ -52,16 +52,19 @@ headsup/deepcfr/train.py     trainer CLI (DeepCFR / SD-CFR / both), checkpoints,
 headsup/deepcfr/evaluate.py  evaluate a player vs simple bots
 headsup/sdcfr.py         IterateBank (all iterations' nets, vmapped) + SDCFRPlayer (exact / sample averaging, t^gamma weights)
 headsup/compare.py       head-to-head round robin CLI;   headsup/exploit.py: K PPO exploiters -> exploitability lower bound
-headsup/lbr.py           Local Best Response: range over 1326 combos, C++ equity_vs_all kernel, one-street lookahead; CLI;
-                         trainer hook --lbr-every (lbr/current_strategy, lbr/sdcfr; final lbr_final/* incl. avg_strategy)
-headsup/public.py        replay_from_obs(): rebuild the public state (engine) from an observation's bet history
-headsup/search.py        SearchPlayer (spec `search:<blueprint>@it..@rit..`): unsafe depth-limited subgame solving; C++
-                         SubgameSolver (sampled LCFR, hero-hand focus, blueprint rollouts) / RiverSolver (vector-form
-                         CFR: lcfr|dcfr|cfr+|pcfr+); exploitability() = exact BR check on river subgames
+headsup/lbr.py           Local Best Response evaluator (CLI: python -m headsup.lbr --policy spec --hands N)
+headsup/search.py        real-time search player: depth mode (SubgameSolver MCCFR + continuations, exact river) and
+                         Pluribus mode @pluribus (VectorSolver: full remaining-game vector LCFR from the round start)
+headsup/public.py        rebuild the public state (engine replay) from an observation row
+headsup/blueprint.py     tabular Pluribus MCCFR-P blueprint (C++ TabularBlueprint; player spec tab:path.pt); trainer CLI
+headsup/games/           Game interface for the generic algorithms: Kuhn/Leduc (leduc.py), hold'em presets (holdem.py)
+headsup/algos/           tabular CFR family + MCCFR (tabular.py), exact best response (best_response.py),
+                         DeepCFR/SD-CFR/DREAM/ESCHER on small games (deep.py), hold'em BR exploitability (holdem_br.py)
 headsup/web/             browser table: server.py (stdlib http.server), session.py (game logic), static/ (HTML/CSS/JS)
 headsup/rl/              rl_games integration: env.py (registration, own vec env, no Ray), exploitability.py (PPO CLI), onnx.py (export)
-models/                  deepcfr_policy.pth (shipped), deepcfr_policy_v1.pth (original), rl_games_exploiter.onnx, README.json
-tests/                   pytest suite (rules, golden observations, C++ <-> Python, envs, memories, SD-CFR, web API)
+headsup/cpp/headsup_cpp.cpp  also: SubgameSolver, BoardTable, VectorSolver, PublicTree, Abstraction, TabularBlueprint
+models/                  shipped models + README.json (retrain on the current rules/code before shipping)
+tests/                   pytest suite (~115 tests, ~8 min on CPU; CI runs it on GitHub Actions)
 ```
 
 ## Game and data conventions (do not change without retraining everything)
@@ -132,7 +135,16 @@ python -m headsup.compare cfr:runs/x/policy.pth sdcfr:runs/x/iterates.pt cfr --h
 python -m headsup.exploit --policy sdcfr:runs/x/iterates.pt --seeds 3 --epochs 1000 --hands 400000 --parallel 3
 python -m headsup.lbr --policy sdcfr:runs/x/iterates.pt --hands 20000 --model-iterates 32     # LBR bound, duplicate pairs
 python -m headsup.web --opponent sdcfr:runs/x/iterates.pt --advisor cfr --port 8000
+python -m headsup.lbr --policy cfr:runs/x/policy.pth --hands 30000 --num-tables 128 --workers 24
+python -m headsup.blueprint --game nlhe --iterations 20000000 --threads 24 --out runs/bp/nlhe.pt   # tabular blueprint
+python -m headsup.web --opponent search:tab:runs/bp/nlhe.pt@pluribus@th16                            # Pluribus-style bot
+python -m headsup.algos.holdem_br --policy cfr:runs/fhp/policy.pth --game fhp --boards 200           # FHP/HULH exploitability
+python -m headsup.algos.deep --game leduc --algo dream --iterations 200 --eval-every 10               # small-game algorithms
 ```
+
+Player specs also: ``search:<blueprint>[@it..][@pluribus][@th<threads>]``, ``tab:path.pt``, ``iterate:iterates.pt[@t<N>]``.
+Rebuild the extension with ``python setup.py build_ext`` and ``mv`` the .so into place (never ``--inplace``
+while trainers run: they map the file).
 
 Timings on an M2 Max (12 cores, MPS): traversals ~20k/s (C++ threads), 4000-step fit ~18 s,
 one iteration 40–55 s at 40k traversals; 300 iterations ~4.5 h; `headsup.exploit` 3 seeds x 1000
