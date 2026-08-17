@@ -100,7 +100,7 @@ def small_game_table(directory, iterations=(10, 20, 50, 100, 200), unit=1000.0):
     for path in sorted(glob.glob(os.path.join(directory, "*.json"))):
         name = os.path.splitext(os.path.basename(path))[0]
         data = _load(path)
-        if not data or name == "tabular":
+        if not data or name.startswith("tabular"):
             continue
         curve = {c["iteration"]: c for c in data.get("curve", [])}
         deep[name] = (data.get("args", {}), curve)
