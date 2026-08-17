@@ -74,15 +74,21 @@ class TabularBlueprint:
     def iterations(self):
         return int(self.cpp.iterations)
 
-    def save(self, path):
+    def save(self, path, play_only=False):
+        """``play_only``: keep the average-strategy counters only (half the size; the regrets - needed to
+        continue training or for ``@current`` play - are dropped)."""
         import torch
 
-        torch.save({"kind": "tabular_blueprint", "game": self.game.to_dict(), "buckets": self.cpp.buckets, "samples": self.cpp.samples,
-                    "mode": self.mode, "completions": self.completions,
-                    "edges": [np.asarray(e, dtype=np.float32) for e in self.cpp.edges],
-                    "centroids": [np.asarray(c, dtype=np.float32) for c in self.cpp.centroids],
-                    "regret": np.asarray(self.cpp.regret), "phi": np.asarray(self.cpp.phi), "iterations": self.iterations,
-                    "params": self.params}, path)
+        phi = np.asarray(self.cpp.phi)
+        data = {"kind": "tabular_blueprint", "game": self.game.to_dict(), "buckets": self.cpp.buckets, "samples": self.cpp.samples,
+                "mode": self.mode, "completions": self.completions,
+                "edges": [np.asarray(e, dtype=np.float32) for e in self.cpp.edges],
+                "centroids": [np.asarray(c, dtype=np.float32) for c in self.cpp.centroids],
+                "phi": phi / max(1.0, float(np.abs(phi).max())) if play_only else phi,  # counters: only ratios matter
+                "iterations": self.iterations, "params": self.params}
+        if not play_only:
+            data["regret"] = np.asarray(self.cpp.regret)
+        torch.save(data, path)
 
     @classmethod
     def load(cls, path):
@@ -98,7 +104,8 @@ class TabularBlueprint:
             bp.cpp.edges = [list(map(float, e)) for e in data["edges"]]
         if data.get("centroids"):
             bp.cpp.centroids = [list(map(float, c)) for c in data["centroids"]]
-        bp.cpp.regret = np.asarray(data["regret"], dtype=np.float32)
+        if "regret" in data:
+            bp.cpp.regret = np.asarray(data["regret"], dtype=np.float32)
         bp.cpp.phi = np.asarray(data["phi"], dtype=np.float32)
         bp.cpp.iterations = int(data["iterations"])
         return bp
