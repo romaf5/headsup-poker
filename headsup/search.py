@@ -32,8 +32,9 @@ at the start of a round come from Bayes' rule with the previous round's solve (i
 strategy, for both players - "nested unsafe search"), preflop with the blueprint.
 
 Player spec: ``search:<blueprint spec>[@it<N>][@rit<N>][@rv<variant>][@focus<f>][@cont<policy|iterate|bank>][@thin<K>]``,
-e.g. ``search:cfr:runs/x/policy.pth@it20000@rit200``; Pluribus mode
-``search:<blueprint>@pluribus[@it<N>][@b<buckets>][@th<threads>][@avg][@pfsearch]``.
+e.g. ``search:cfr:runs/x/policy.pth@it20000@rit200`` (``@k4``: Pluribus's four biased continuation
+strategies chosen by both players at the depth-limited leaves instead of one sampled continuation);
+Pluribus mode ``search:<blueprint>@pluribus[@it<N>][@b<buckets>][@th<threads>][@avg][@pfsearch]``.
 """
 
 import time
@@ -198,7 +199,7 @@ class SearchPlayer:
 
     def __init__(self, blueprint, iterations=None, focus=0.5, continuation=None, thin=8, device=None, seed=0,
                  workers=None, game=None, river_iterations=200, river_variant="dcfr", warm_start=5000,
-                 mode="depth", buckets=500, threads=4, play="final", preflop="blueprint"):
+                 mode="depth", buckets=500, threads=4, play="final", preflop="blueprint", leaf_choices=1):
         from headsup import native
         from headsup.lbr import _model_for
         from headsup.players import make_player
@@ -208,6 +209,7 @@ class SearchPlayer:
         self.spec = blueprint
         self.mode = mode
         self.buckets, self.threads, self.play, self.preflop = int(buckets), int(threads), play, preflop
+        self.leaf_choices = int(leaf_choices)  # depth-limited leaves: 1 sampled continuation, or Pluribus's 4 biased choices
         # depth mode: sampled MCCFR iterations (20k, ~0.2 s); Pluribus mode: vector iterations of the
         # whole remaining game (500: ~2-3 s on the flop with 16 threads, well under a second later)
         self.iterations = int(iterations) if iterations is not None else (20_000 if mode == "depth" else 500)
@@ -400,6 +402,8 @@ class SearchPlayer:
         sv.set_ranges(ranges[0].astype(np.float32), ranges[1].astype(np.float32))
         n0, n1, rm, w = self.conts
         sv.set_continuations(n0, n1, rm, w)
+        if self.leaf_choices > 1:
+            sv.set_leaf_choices(self.leaf_choices)
         prev, prev_actions = st.get("solver"), st.get("solver_actions")
         if self.warm_start and prev is not None and prev_actions is not None and actions[: len(prev_actions)] == prev_actions:
             node = 0  # the new root inside the previous tree, if the street did not change
@@ -466,7 +470,7 @@ class SearchPlayer:
 
 def parse_search_spec(arg):
     """``<blueprint spec>[@it<N>][@rit<N>][@rv<variant>][@focus<f>][@cont<policy|iterate|bank>][@thin<K>]``
-    ``[@pluribus][@b<buckets>][@th<threads>][@avg][@pfsearch]`` -> kwargs."""
+    ``[@pluribus][@b<buckets>][@th<threads>][@avg][@pfsearch][@k<leaf choices>]`` -> kwargs."""
     parts = arg.split("@")
     # the blueprint spec itself may contain '@' options (sdcfr:...@g2): the search options are the
     # trailing ones that parse as ours
@@ -497,6 +501,8 @@ def parse_search_spec(arg):
             kw["play"] = "average"
         elif o == "pfsearch":
             kw["preflop"] = "search"
+        elif o.startswith("k") and o[1:].isdigit():
+            kw["leaf_choices"] = int(o[1:])
         else:
             break
         parts.pop()

@@ -180,6 +180,18 @@ def test_pre_river_subgame_needs_and_uses_continuations():
     st = sv.root_strategy()
     np.testing.assert_allclose(st.sum(1), 1.0, atol=1e-5)
     assert np.all(st[:, 0] == 0)  # nothing to call for the BB: never fold
+    # Pluribus's leaf choice: both players pick among 4 biased continuations at every leaf
+    sv2 = cpp.SubgameSolver()
+    sv2.build(e)
+    sv2.set_ranges(r, r.copy())
+    sv2.set_continuations([nets[0]], [nets[1]], [True], [1.0])
+    sv2.set_leaf_choices(4)
+    sv2.run(300, 0, 1, cpp.combo_index(2, 3), 0.5)
+    st2 = sv2.root_strategy()
+    np.testing.assert_allclose(st2.sum(1), 1.0, atol=1e-5)
+    with pytest.raises(RuntimeError):
+        sv2.set_leaf_choices(5)
+    assert parse_search_spec("cfr:x.pth@k4@it100") == ("cfr:x.pth", {"leaf_choices": 4, "iterations": 100})
 
 
 def test_search_spec_and_player_bookkeeping(tmp_path):

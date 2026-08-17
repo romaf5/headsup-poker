@@ -1216,6 +1216,13 @@ struct SubgameSolver {
   std::vector<double> range[2], cum[2];  // per seat: 1326 combo weights and cumulative sums
   std::vector<Continuation> conts;
   std::vector<double> cont_cum;
+  // Pluribus's leaf continuation choice: at a street-end leaf each player picks one of `n_choices`
+  // continuation strategies for the rest of the hand (0: the blueprint as is, 1: fold x5, 2: call x5,
+  // 3: every raise x5, renormalised) - one more (leaf, hand) infoset per player, solved by the same
+  // regret matching (linear weights).  n_choices = 1: a single sampled continuation for both.
+  int n_choices = 1;
+  std::vector<int> leaf_index;               // node -> leaf number (-1 for non-leaves)
+  std::vector<float> leaf_regret;            // (leaves x 2 seats x NUM_COMBOS x n_choices)
   std::vector<float> regret, strat_sum;  // (nodes x NUM_COMBOS x n_actions)
   std::vector<float> last_regret;        // PCFR+: the previous instantaneous regret (the prediction)
   std::vector<int> touched;              // per infoset: iteration of the last regret / strategy update (lazy discounting)
@@ -1279,7 +1286,20 @@ struct SubgameSolver {
     strat_sum.assign(nodes.size() * NUM_COMBOS * n_actions, 0.0f);
     last_regret.assign(nodes.size() * NUM_COMBOS * n_actions, 0.0f);
     touched.assign(nodes.size() * NUM_COMBOS, 0);
+    leaf_index.assign(nodes.size(), -1);
+    int nl = 0;
+    for (size_t i = 0; i < nodes.size(); ++i)
+      if (nodes[i].kind == 3) leaf_index[i] = nl++;
+    leaf_regret.assign(size_t(nl) * 2 * NUM_COMBOS * std::max(1, n_choices), 0.0f);
     iteration = 0;
+  }
+
+  void set_leaf_choices(int k) {
+    if (k < 1 || k > 4) throw std::runtime_error("leaf choices must be 1..4 (blueprint, fold-, call-, raise-biased)");
+    n_choices = k;
+    int nl = 0;
+    for (size_t i = 0; i < nodes.size(); ++i) nl += nodes[i].kind == 3;
+    leaf_regret.assign(size_t(nl) * 2 * NUM_COMBOS * n_choices, 0.0f);
   }
 
   void prepare_discounts(int total_iterations) {
@@ -1396,14 +1416,16 @@ struct SubgameSolver {
     }
   }
 
-  float rollout(const SubgameNode& nd) {
-    // continue from the street-end leaf with a sampled continuation strategy until the hand ends
+  // continue from the street-end leaf with a sampled continuation strategy pair until the hand ends;
+  // choice[s] biases seat s's play (Pluribus: the probability of the chosen action class x5)
+  float rollout(const SubgameNode& nd, int choice0 = 0, int choice1 = 0) {
     Engine e = nd.state;
     e.hands[0][0] = hand[0][0]; e.hands[0][1] = hand[0][1];
     e.hands[1][0] = hand[1][0]; e.hands[1][1] = hand[1][1];
     for (int i = 0; i < 5; ++i) e.board[i] = board[i];
     std::uniform_real_distribution<double> u(0.0, cont_cum.back());
     const Continuation& c = conts[size_t(std::lower_bound(cont_cum.begin(), cont_cum.end(), u(rng)) - cont_cum.begin())];
+    const int choice[2] = {choice0, choice1};
     float obs[OBS_DIM], out[MAX_ACTIONS], sigma[MAX_ACTIONS];
     bool legal[MAX_ACTIONS];
     while (!e.done) {
@@ -1418,9 +1440,44 @@ struct SubgameSolver {
           if (!legal[a]) out[a] = -1e30f;
         softmax(out, sigma, n_actions);
       }
+      if (choice[p] > 0) {  // bias: 1 fold, 2 check/call, 3 raises (every raise size and the all-in)
+        float total = 0.0f;
+        for (int a = 0; a < n_actions; ++a) {
+          const bool biased = choice[p] == 1 ? a == 0 : choice[p] == 2 ? a == 1 : a >= 2;
+          if (biased && legal[a]) sigma[a] *= 5.0f;
+          total += sigma[a];
+        }
+        if (total > 0) for (int a = 0; a < n_actions; ++a) sigma[a] /= total;
+      }
       e.step(sample(sigma, n_actions, rng));
     }
     return float(e.rewards[traverser]);
+  }
+
+  // leaf value with the continuation choices: the traverser's choice infoset is updated with the
+  // rollout values of all its choices, the opponent samples its choice by regret matching
+  float leaf_value(int node_id) {
+    const SubgameNode& nd = nodes[node_id];
+    if (n_choices <= 1) return rollout(nd);
+    const int li = leaf_index[node_id];
+    const int me = traverser, op = 1 - traverser;
+    const int hm = combo_index(std::min(hand[me][0], hand[me][1]), std::max(hand[me][0], hand[me][1]));
+    const int ho = combo_index(std::min(hand[op][0], hand[op][1]), std::max(hand[op][0], hand[op][1]));
+    float* Rm = leaf_regret.data() + ((size_t(li) * 2 + me) * NUM_COMBOS + hm) * n_choices;
+    const float* Ro = leaf_regret.data() + ((size_t(li) * 2 + op) * NUM_COMBOS + ho) * n_choices;
+    bool all[MAX_ACTIONS];
+    for (int k = 0; k < n_choices; ++k) all[k] = true;
+    float sm[MAX_ACTIONS], so[MAX_ACTIONS];
+    regret_matching(Rm, sm, all, n_choices, false);
+    regret_matching(Ro, so, all, n_choices, false);
+    const int co = sample(so, n_choices, rng);
+    float v[MAX_ACTIONS], value = 0.0f;
+    for (int k = 0; k < n_choices; ++k) {
+      v[k] = me == 0 ? rollout(nd, k, co) : rollout(nd, co, k);
+      value += sm[k] * v[k];
+    }
+    for (int k = 0; k < n_choices; ++k) Rm[k] += t_weight * (v[k] - value);  // linear weights
+    return value;
   }
 
   float terminal_value(const SubgameNode& nd) {
@@ -1438,7 +1495,7 @@ struct SubgameSolver {
   float traverse(int node_id) {
     const SubgameNode& nd = nodes[node_id];
     if (nd.kind == 1 || nd.kind == 2) return terminal_value(nd);
-    if (nd.kind == 3) return rollout(nd);
+    if (nd.kind == 3) return leaf_value(node_id);
     const int p = nd.player;
     const int h = combo_index(std::min(hand[p][0], hand[p][1]), std::max(hand[p][0], hand[p][1]));
     float sigma[MAX_ACTIONS];
@@ -2799,6 +2856,8 @@ PYBIND11_MODULE(headsup_cpp, m) {
         if (r0.size() != NUM_COMBOS || r1.size() != NUM_COMBOS) throw std::runtime_error("ranges must have 1326 entries");
         sv.set_ranges(r0.data(), r1.data());
       })
+      .def("set_leaf_choices", &SubgameSolver::set_leaf_choices, py::arg("k"),
+           "Pluribus's continuation choice at street-end leaves: 1 (a sampled continuation) or up to 4 (blueprint, fold / call / raise biased x5)")
       .def("set_continuations", [](SubgameSolver& sv, std::vector<std::shared_ptr<Model>> nets0, std::vector<std::shared_ptr<Model>> nets1,
                                    std::vector<bool> rm, std::vector<double> weights) {
         if (nets0.size() != nets1.size() || nets0.size() != rm.size() || nets0.size() != weights.size() || nets0.empty())

@@ -293,7 +293,11 @@ k-means over equity distributions), the blueprint is a neural DeepCFR / SD-CFR s
 rather than a tabular MCCFR one, no action translation (the abstraction is played as is), and
 depth-limited search with the four biased continuation strategies is only relevant pre-flop
 (heads-up Pluribus solves to the end of the game from the flop), where we play the blueprint
-(`@pfsearch` uses the depth-limited solver instead).
+(`@pfsearch` uses the depth-limited solver instead). The depth-limited solver does implement
+Pluribus's leaf mechanism (`@k4`): at every street-end leaf each player chooses one of four
+continuation strategies for the rest of the hand — the blueprint, or the blueprint with the
+fold / call / raise probabilities multiplied by 5 and renormalised — as an extra regret-matched
+decision of the subgame (one sampled continuation for both, `@k1`, is the default).
 
 **About the old "500 mbb/g".** The original `poker_env.py` (used for the exploiter) had no
 raise cap while the DeepCFR training env converted the 3rd consecutive raise into an all-in,
