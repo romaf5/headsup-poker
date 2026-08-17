@@ -348,9 +348,11 @@ noisy at 12 boards. The table-mode abstraction (exact per-board (mean, std) equi
 k-means, cached per board) trains at ~60 000 iterations/s once its caches are warm (20 M in
 15 min); its evaluation is running too.
 
-**Real-time search**: LBR of the search players (depth-limited MCCFR `search:...@it20000`,
-Pluribus mode `@pluribus` on the DeepCFR and on the tabular blueprint) over 2 000 pairs and a
-head-to-head round robin are running (`runs/bp/eval.log`).
+**Real-time search**: LBR against the Pluribus-mode player on the tabular blueprint
+(`search:tab:…@pluribus@it300`, 2 000 duplicate pairs) is **−0.78 ± 0.39** chips/hand — LBR
+cannot exploit it at all (vs +0.67 for the blueprint alone, +1.33 for the DeepCFR net); the
+same measurement for Pluribus mode on the DeepCFR net, the depth-limited solver, and a
+head-to-head round robin of the search players are running (`runs/bp/eval.log`).
 
 ### Reproductions on the papers' games
 
