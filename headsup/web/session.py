@@ -19,12 +19,15 @@ from headsup.players import make_player
 
 BOT_LABELS = {
     "cfr": "DeepCFR", "sdcfr": "SD-CFR", "onnx": "PPO exploiter", "random": "Random bot", "call": "Calling station",
-    "allin": "Maniac", "raise": "Always-raise bot",
+    "allin": "Maniac", "raise": "Always-raise bot", "tab": "Tabular blueprint", "pluribus": "Pluribus-style (blueprint + search)",
+    "search": "Search",
 }
 
 
 def bot_label(spec):
     kind, _, arg = str(spec).partition(":")
+    if kind.startswith("pluribus"):
+        return BOT_LABELS["pluribus"]
     if kind in BOT_LABELS and not arg:
         return BOT_LABELS[kind]
     name = os.path.basename(arg or spec)
@@ -69,7 +72,7 @@ def size_label(size):
 def player_spec(value):
     """Accept player specs ('cfr', 'onnx:path', 'sdcfr:path', 'call', ...) as well as bare model paths."""
     value = str(value).strip()
-    if ":" in value or value in ("cfr", "onnx", "random", "call", "allin", "raise"):
+    if ":" in value or value in ("cfr", "onnx", "random", "call", "allin", "raise", "tab") or value.startswith("pluribus"):
         return value
     if value.endswith(".onnx"):
         return f"onnx:{value}"
