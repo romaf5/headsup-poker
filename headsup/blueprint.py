@@ -94,7 +94,8 @@ class TabularBlueprint:
         bp = cls(GameConfig.from_dict(data["game"]), data["buckets"], data["samples"], data.get("mode", "mc"), data.get("completions", 300))
         bp.params.update(data["params"])
         bp._apply_params()
-        bp.cpp.edges = [list(map(float, e)) for e in data["edges"]]
+        if data.get("edges"):
+            bp.cpp.edges = [list(map(float, e)) for e in data["edges"]]
         if data.get("centroids"):
             bp.cpp.centroids = [list(map(float, c)) for c in data["centroids"]]
         bp.cpp.regret = np.asarray(data["regret"], dtype=np.float32)
