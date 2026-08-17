@@ -50,6 +50,27 @@ F. **Towards the full game**: more bet sizes, deeper stacks, 6-max engine (Pluri
 Order of work: A (Leduc + FHP/HULH limit betting + protocol) → B → C (DREAM, ESCHER, tabular) → D → E → F.
 Rule: every algorithm ships with a Leduc convergence test against exact exploitability.
 
+### Progress log (2026-08-17)
+
+- A, B, C: DONE — `headsup/games/` (Kuhn, Leduc, hold'em presets nlhe/fhp/hulh), `headsup/algos/`
+  (tabular CFR family + MCCFR with pruning, exact BR, DeepCFR/SD-CFR/DREAM/ESCHER on small games,
+  `holdem_br.py` = exact-over-hands / Monte-Carlo-over-boards best response for FHP / HULH / the NL
+  abstraction), DREAM / ESCHER for hold'em in the trainer (`--algo dream|escher`, C++ samplers, history
+  value nets with the `opp_cards` model variant), all tested (differential tests vs Python references).
+- E: DONE — Pluribus-style play: tabular Linear-MCCFR-P blueprint with card abstraction
+  (`headsup/blueprint.py`; mc / table abstractions), search `@pluribus` mode (full remaining-game vector
+  LCFR from the round start, `VectorSolver`, frozen own actions, final-iterate play). Not done: the k = 4
+  biased continuation choice at leaves (only relevant pre-flop / 3+ players), safe (Reach) solving.
+- D: in progress — Leduc curves (runs/leduc, `python -m headsup.summarize --small-game runs/leduc`), FHP
+  DeepCFR / DREAM / ESCHER runs queued on GPU 1 (runs/scripts/chain_gpu1_*.sh), NL arms evaluated with
+  LBR / PPO / BR-exploitability (`headsup.summarize --br`). Finding: best-response exploitability (12
+  boards) of the DeepCFR NL policy ≈ 1600 mbb/g, LBR finds ~40 % of it; the tabular blueprint ties it.
+- F: 0.5/1/2-pot blueprint (224 k public nodes) training; deeper stacks / 6-max not started.
+
+Next: results tables in README (NL arms, tabular vs deep, search modes; Leduc / FHP reproductions),
+ship retrained models (`models/`), finer flop / turn abstraction (lossless canonical flops) for the
+tabular blueprint, Reach / continuation-choice search, 6-max engine.
+
 ## Step 0 — retrain on the fixed rules (first thing on the new machine)
 
 ```bash
