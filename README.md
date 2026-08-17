@@ -308,18 +308,73 @@ now share one engine; `env_config.raise_cap` selects the game (`1000000` = uncap
 
 ## Results
 
-Chips/hand (1 chip = 500 mbb), measured with this code (`headsup.deepcfr.evaluate`, 200k–400k
-hands, ± ≈ 0.05). "Exploiter" = the larger reward of two PPO best responses (1000 epochs each,
-argmax play), a lower bound on exploitability.
+All numbers below were measured with this code on the 64-core / 2×RTX 3090 box (2026-08-17);
+1 chip = 500 mbb. Three exploiters of increasing power are reported: **PPO** (`headsup.exploit`,
+best of 3 seeds × 1000 epochs — a weak lower bound), **LBR** (`headsup.lbr`, 30 000 duplicate
+pairs, ± SE) and **BR** (`headsup.algos.holdem_br`: the exact best response over all 1326 hands
+of the full remaining game, Monte-Carlo over 12 boards — the tightest estimate; it finds ~2.5×
+what LBR finds and ~10× what PPO finds). Bot columns are chips/hand vs random / call / all-in
+over 400 000 hands (a *near-equilibrium strategy exploits fixed bots less the closer it gets*).
 
-| policy | vs random | vs call | vs all-in | exploiter |
-|---|---|---|---|---|
-| `models/deepcfr_policy.pth` — 300 it., 40k traversals/it., 3.6 h on an M2 Max | **+3.70** | **+6.26** | **+3.00** | **+0.31** (≈ 150 mbb/g) |
-| `models/deepcfr_policy_v1.pth` — original 300-it. model | +3.61 | +4.72 | +2.27 | +0.37 (≈ 185 mbb/g) |
+### Heads-up NL abstraction (100 bb, fold / call / min-raise / all-in, 3rd raise → all-in)
 
-Head-to-head the two are tied (−0.06 ± 0.05 chips/hand for the new one), as expected for
-two near-equilibrium strategies. `models/rl_games_exploiter.onnx` is the exploiter trained
-against the shipped policy; `models/README.json` records the training settings.
+DeepCFR / SD-CFR arms, 300 iterations × 40 000 traversals, 20 M memories each (`runs/abl_*`;
+`python -m headsup.summarize runs/... --br`):
+
+| run | features | net | rm | policy vs bots | SD-CFR vs bots | policy vs SD-CFR | LBR policy | LBR SD-CFR | PPO policy | PPO SD-CFR | BR policy |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | aggregated | current | uniform | +4.19/+7.30/+3.55 | +4.25/+7.37/+3.63 | −0.06 ± 0.05 | 1.62 ± 0.09 | 1.35 ± 0.11 | 0.44 ± 0.04 | 0.56 ± 0.04 | (running) |
+| history / paper | history | paper | uniform | +4.31/+7.86/+3.27 | +4.29/+7.75/+3.18 | −0.04 ± 0.05 | **1.33 ± 0.09** | **1.28 ± 0.11** | 0.01 ± 0.03 | 0.09 ± 0.03 | 3.24 (1620 mbb/g) |
+| aggregated / paper | aggregated | paper | uniform | +4.23/+6.96/+3.55 | +4.26/+6.86/+3.36 | −0.07 ± 0.05 | 1.49 ± 0.09 | 1.31 ± 0.11 | – | – | (running) |
+| history / paper / argmax | history | paper | argmax | +2.21/+3.20/+0.95 | +2.24/+3.30/+0.97 | −0.05 ± 0.03 | 1.00 ± 0.09 | 0.88 ± 0.11 | – | – | (running) |
+
+Findings: the paper's bet-history features and network are less exploitable than the aggregated
+features / current network (LBR 1.33 vs 1.62); the argmax regret-matching fallback (paper) lowers
+LBR further but the strategy is far more passive against the bots; DeepCFR's policy net and the
+SD-CFR average tie head-to-head in every arm (±0.05 at 1.5 M hands). Longer runs
+(`long_history_paper`: 1000 it. × 100 000 traversals) and the 0.5 / 1 / 2-pot action tree
+(`betsize_history_paper`) are still training / evaluating.
+
+**Tabular Pluribus blueprint** (`runs/bp/nlhe_20m.pt`: 20 M Linear-MCCFR-P iterations, 200
+EHS buckets, ~40 min on 24 threads): LBR **0.67 ± 0.09** chips/hand (336 mbb/g) — half of what
+LBR finds against the DeepCFR nets; head-to-head vs the DeepCFR policy / SD-CFR average and the
+BR estimate are running. The table-mode abstraction (exact per-board (mean, std) equity features,
+k-means, cached per board) trains at ~60 000 iterations/s once its caches are warm (20 M in
+15 min); its evaluation is running too.
+
+**Real-time search**: LBR of the search players (depth-limited MCCFR `search:...@it20000`,
+Pluribus mode `@pluribus` on the DeepCFR and on the tabular blueprint) over 2 000 pairs and a
+head-to-head round robin are running (`runs/bp/eval.log`).
+
+### Reproductions on the papers' games
+
+**Leduc hold'em** (`python -m headsup.summarize --small-game runs/leduc`; exploitability of the
+average strategy in milli-antes/game, one seed, CPU, the papers' Leduc hyperparameters: 346 / 900 /
+1000 traversals per iteration, advantage nets 3000 × 2048, 2 M memories):
+
+| algorithm (traversals / it.) | it. 10 | it. 20 | it. 50 | it. 100 | it. 200 |
+|---|---|---|---|---|---|
+| DeepCFR (346) | 471 | 501 | 310 | 415 | 307 |
+| SD-CFR (346) | 521 | 481 | 321 | 300 | **270** |
+| DREAM (900) | 666 | 523 | 442 | 427 | 385 |
+| ESCHER (1000) | 961 | 721 | 935 | 727 | 528 |
+
+Tabular references on the same game: CFR+ 92 / 71 / 35 / 21 mA/g at 100 / 200 / 1000 / 3000
+iterations, DCFR 70 / 54 / 32, PCFR+ 141 / 90 / 60 / 34, external-sampling MCCFR 91 at 50 000
+iterations, outcome sampling 592 at 100 000. The deep curves sit in the range of the SD-CFR /
+DREAM papers' Leduc figures at 200 iterations (they run to 1000 iterations over several seeds;
+ours are single seeds — the ordering SD-CFR < DeepCFR is the papers' too, DREAM matching SD-CFR
+in the paper is not reproduced at this length).
+
+**FHP** (flop hold'em, DeepCFR / DREAM papers): the DeepCFR reproduction (paper hyperparameters:
+10 000 traversals, batch 10 000, 40 M memories, 450 iterations; paper: 37 mbb/g), DREAM and
+ESCHER (50 000 outcome-sampling traversals per iteration, 300 iterations) are queued on the GPU;
+their exploitability curves come from `headsup.algos.holdem_br` (200 boards). Already measured:
+tabular MCCFR blueprints on FHP plateau at **~380 mbb/g** whatever the number of EHS buckets
+(50 … 1000), iterations (0.3 … 10 M) or averaging — the floor of a one-dimensional
+equity-vs-uniform-range abstraction (the DeepCFR paper's own 40 000-cluster MCCFR baseline
+plateaus at a few hundred mbb/g in its Fig. 2; only its 3.6 M-cluster abstraction reaches
+DeepCFR's level).
 
 ## Layout
 
