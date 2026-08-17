@@ -95,6 +95,10 @@ def _model_for(spec, device, seed, model_iterates=0, game=None):
     from headsup.players import make_player, parse_sdcfr_spec
 
     kind, _, arg = spec.partition(":")
+    if kind.lower() == "search":  # a search player is modelled by its blueprint (still a valid lower bound)
+        from headsup.search import parse_search_spec
+
+        return _model_for(parse_search_spec(arg)[0], device, seed, model_iterates, game)
     if kind.lower() == "sdcfr":
         from headsup.device import get_device
         from headsup.sdcfr import IterateBank, SDCFRPlayer
