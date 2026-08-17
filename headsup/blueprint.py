@@ -215,6 +215,8 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--game", default="nlhe", choices=["nlhe", "fhp", "hulh"])
     p.add_argument("--bet-sizes", default=None, help="NL raise sizes, e.g. 'min' or '0.5,1,2' (pot fractions)")
+    p.add_argument("--stack-size", type=int, default=None, help="starting stacks in chips (default 100 = 50 bb)")
+    p.add_argument("--raise-cap", type=int, default=None, help="NL: consecutive raises before the next one becomes an all-in (default 3)")
     p.add_argument("--iterations", type=int, default=10_000_000, help="MCCFR iterations (each = one traversal per seat)")
     p.add_argument("--threads", type=int, default=32)
     p.add_argument("--buckets", type=int, default=200)
@@ -238,7 +240,15 @@ def main(argv=None):
     args = p.parse_args(argv)
     from headsup.game import parse_bet_sizes
 
-    game = make_holdem(args.game, **({"bet_sizes": parse_bet_sizes(args.bet_sizes)} if args.bet_sizes else {}))
+    overrides = {}
+    if args.bet_sizes:
+        overrides["bet_sizes"] = parse_bet_sizes(args.bet_sizes)
+        overrides["mask_redundant"] = overrides["bet_sizes"] != ("min",)
+    if args.stack_size:
+        overrides["stack_size"] = args.stack_size
+    if args.raise_cap:
+        overrides["raise_cap"] = args.raise_cap
+    game = make_holdem(args.game, **overrides)
     bp = TabularBlueprint(game, args.buckets, args.samples, args.abstraction, args.completions)
     bp.configure(lcfr_iterations=int(args.lcfr * args.iterations), discount_interval=max(1, int(args.discount_every * args.iterations)),
                  prune_after=0 if args.no_prune else int(args.prune_after * args.iterations),
