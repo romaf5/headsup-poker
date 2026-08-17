@@ -23,6 +23,33 @@ rules (free fold allowed); the no-free-fold rule is now in place and everything 
   sampled LCFR pre-river + vector-form DCFR/CFR+/PCFR+ river solver, verified with exact best responses);
   its evaluation vs the blueprint is pending; DREAM / ESCHER not started.
 
+## Roadmap v2 (2026-08-16 evening, per the new direction: reproduce the papers, many games, DREAM/ESCHER/Pluribus)
+
+Goal: a clean, game-agnostic research codebase that reproduces the papers' *numbers* on their
+*games*, and applies the same algorithms to (near-)full no-limit hold'em with real-time search.
+
+A. **Game layer** (`headsup/games/`): one `Game` protocol (states, chance, legal actions, info-state
+   encoding, returns, public tree) with implementations Kuhn, Leduc (Southey et al. 2005; the DREAM /
+   ESCHER / SD-CFR test game), FHP and HULH (limit betting, DeepCFR Appendix A), and our NL abstraction
+   (bet sizes); shared observation conventions where possible, per-game network factory. Everything else
+   (traversal, memories, trainer, evaluation, search) becomes game-agnostic; hold'em keeps its C++ fast path.
+B. **Exact evaluation**: exploitability by full-tree best response for Kuhn / Leduc; public-tree best
+   response with hand vectors (exact over hands, Monte-Carlo over boards) for FHP / HULH; keep LBR + PPO
+   for NL. Report in the papers' units (mbb/g; Leduc: chips or "mbb"/A(nte)).
+C. **Algorithms** (one trainer, `--algo`): DeepCFR, SD-CFR (done), DREAM (Steinberger, Lerer, Brown 2020:
+   outcome sampling + learned baseline), ESCHER (McAleer et al. 2022: history value net, no importance
+   weights), tabular MCCFR (linear, with Pluribus' regret-based pruning), vanilla / DCFR / PCFR+ tabular CFR
+   for the small games (reference curves).
+D. **Reproduce**: DeepCFR / SD-CFR on Leduc & FHP (DeepCFR: 37 mbb/g on FHP after 450 it.), DREAM /
+   ESCHER Leduc curves, SD-CFR vs DeepCFR head-to-head; then transfer the winning setups to NL.
+E. **Pluribus-style play**: blueprint = tabular linear MCCFR with pruning on an abstracted game (card
+   bucketing) or the deep blueprint; search with k = 4 biased continuation strategies where the opponent
+   chooses at leaves (Brown, Sandholm & Amos 2018 / Pluribus), nested unsafe + safe (Reach) solving.
+F. **Towards the full game**: more bet sizes, deeper stacks, 6-max engine (Pluribus' game) later.
+
+Order of work: A (Leduc + FHP/HULH limit betting + protocol) → B → C (DREAM, ESCHER, tabular) → D → E → F.
+Rule: every algorithm ships with a Leduc convergence test against exact exploitability.
+
 ## Step 0 — retrain on the fixed rules (first thing on the new machine)
 
 ```bash
