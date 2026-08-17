@@ -60,10 +60,11 @@ def legal_mask_from_obs(obs, game=DEFAULT_GAME):
     obs = np.asarray(obs)
     to_call, pot, stack, raises = public_state_from_obs(obs)
     stage = np.rint(obs[:, 21]).astype(np.int64)
-    keys = np.stack([to_call, pot, stack, raises, stage], axis=1)
-    uniq, inverse = np.unique(keys, axis=0, return_inverse=True)
-    masks = np.array([game.legal_mask(int(c), int(p), int(s), int(r), round_index=min(int(st), game.num_rounds - 1))
-                      for c, p, s, r, st in uniq], dtype=bool)
+    # one integer key per distinct (to-call, pot, stack, raises, round) - all small non-negative ints
+    keys = (((to_call * 4096 + pot) * 4096 + stack) * 64 + raises) * 8 + stage
+    uniq, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
+    masks = np.array([game.legal_mask(int(to_call[i]), int(pot[i]), int(stack[i]), int(raises[i]),
+                                      round_index=min(int(stage[i]), game.num_rounds - 1)) for i in first], dtype=bool)
     return masks[inverse.ravel()]
 
 

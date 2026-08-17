@@ -106,6 +106,9 @@ class TabularBlueprint:
         return np.asarray(self.cpp.strategy_for_hands(int(node), np.asarray(hands, dtype=np.int32).reshape(-1, 2), list(map(int, board)), int(seed), current))
 
 
+_PROJ = np.random.default_rng(12345).random(128)  # fixed random projection for the public-state keys
+
+
 class TabularPlayer:
     """Player protocol on top of a :class:`TabularBlueprint` (``player(obs) -> actions``, ``probs``)."""
 
@@ -133,8 +136,12 @@ class TabularPlayer:
 
         obs = np.asarray(obs, dtype=np.float32)
         out = np.zeros((len(obs), self.game.num_actions), dtype=np.float32)
-        # rows sharing the public part (everything but the hand slots) form one query
-        _, first, inverse = np.unique(obs[:, 6:], axis=0, return_index=True, return_inverse=True)
+        # rows sharing the public part (everything but the hand slots) form one query; the rows are
+        # keyed by two random projections (equal rows -> equal keys, distinct rows collide with
+        # negligible probability), which is much cheaper than np.unique over 74-column rows
+        pub = obs[:, 6:].astype(np.float64)
+        keys = np.round(pub @ _PROJ[: pub.shape[1]], 6)
+        _, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
         inverse = inverse.ravel()
         all_hands = np.sort(np.stack([obs[:, 2], obs[:, 5]], axis=1).astype(np.int32) - 1, axis=1)
         for g, ref_i in enumerate(first):
