@@ -41,13 +41,14 @@ class TabularBlueprint:
         self.cpp = native.module().TabularBlueprint()
         self.cpp.build(native.engine_config(game=game), buckets, samples)
         self.params = dict(prune_threshold=-300.0 * game.stack_size * 100, regret_floor=-310.0 * game.stack_size * 100,
-                           prune_after=0, lcfr_iterations=0, discount_interval=0, strategy_interval=10000, prune_prob=0.95)
+                           prune_after=0, lcfr_iterations=0, discount_interval=0, strategy_interval=10000, prune_prob=0.95,
+                           dense_average=True)
         self._apply_params()
 
     def _apply_params(self):
         p = self.params
         self.cpp.set_params(p["prune_threshold"], p["regret_floor"], int(p["prune_after"]), int(p["lcfr_iterations"]),
-                            int(p["discount_interval"]), int(p["strategy_interval"]), p["prune_prob"])
+                            int(p["discount_interval"]), int(p["strategy_interval"]), p["prune_prob"], bool(p.get("dense_average", True)))
 
     def configure(self, **params):
         """Pluribus's schedule in iterations: ``lcfr_iterations`` (discount for that long, every

@@ -2339,7 +2339,12 @@ struct TabularBlueprint {
     return b;
   }
 
-  float traverse(int node, int p, Deal& d) {
+  // `own_reach`: the traverser's reach probability of the node (its own strategy along the path);
+  // with `dense_average` the average strategy is accumulated as own_reach * sigma at every visited
+  // own infoset (the standard external-sampling average) instead of Pluribus's sampled counters
+  bool dense_average = true;
+
+  float traverse(int node, int p, Deal& d, float own_reach = 1.0f) {
     const SubgameNode& nd = tree.nodes[node];
     if (nd.kind == 1) return nd.folder == p ? -float(nd.stake) : float(nd.stake);
     if (nd.kind == 2) return float(nd.stake) * float(d.win[p]);
@@ -2352,11 +2357,15 @@ struct TabularBlueprint {
       bool explored[MAX_ACTIONS] = {};
       float* R = regret.data() + info * n_actions;
       const bool last = round == cfg.num_rounds - 1;
+      if (dense_average && own_reach > 0.0f) {
+        float* S = phi.data() + info * n_actions;
+        for (int a = 0; a < n_actions; ++a) S[a] += own_reach * sigma[a];
+      }
       for (int a = 0; a < n_actions; ++a) {
         if (!nd.legal[a]) continue;
         const bool terminal_child = tree.nodes[nd.child[a]].kind != 0;
         if (d.prune && !last && !terminal_child && R[a] <= prune_threshold) continue;
-        v[a] = traverse(nd.child[a], p, d);
+        v[a] = traverse(nd.child[a], p, d, own_reach * sigma[a]);
         explored[a] = true;
         value += sigma[a] * v[a];
       }
@@ -2373,7 +2382,7 @@ struct TabularBlueprint {
       chosen = a;
       if (x < acc) break;
     }
-    return traverse(nd.child[chosen], p, d);
+    return traverse(nd.child[chosen], p, d, own_reach);
   }
 
   void update_strategy(int node, int p, Deal& d) {  // Pluribus UPDATE-STRATEGY (all rounds here)
@@ -2438,7 +2447,7 @@ struct TabularBlueprint {
           deal(d, rng);
           d.prune = tt > prune_after && prune_after > 0 && u01(rng) < prune_prob;
           traverse(0, p, d);
-          if (strategy_interval > 0 && tt % strategy_interval == 0) {
+          if (!dense_average && strategy_interval > 0 && tt % strategy_interval == 0) {
             deal(d, rng);
             update_strategy(0, p, d);
           }
@@ -2795,12 +2804,13 @@ PYBIND11_MODULE(headsup_cpp, m) {
         b.abs.fit_edges(situations, seed, threads);
       }, py::arg("situations") = 200000, py::arg("seed") = 0, py::arg("threads") = 16)
       .def("set_params", [](TabularBlueprint& b, double prune_threshold, double regret_floor, long long prune_after,
-                            long long lcfr_iterations, long long discount_interval, long long strategy_interval, double prune_prob) {
+                            long long lcfr_iterations, long long discount_interval, long long strategy_interval, double prune_prob,
+                            bool dense_average) {
         b.prune_threshold = prune_threshold; b.regret_floor = regret_floor; b.prune_after = prune_after;
         b.lcfr_iterations = lcfr_iterations; b.discount_interval = discount_interval; b.strategy_interval = strategy_interval;
-        b.prune_prob = prune_prob;
+        b.prune_prob = prune_prob; b.dense_average = dense_average;
       }, py::arg("prune_threshold"), py::arg("regret_floor"), py::arg("prune_after"), py::arg("lcfr_iterations"),
-         py::arg("discount_interval"), py::arg("strategy_interval") = 10000, py::arg("prune_prob") = 0.95)
+         py::arg("discount_interval"), py::arg("strategy_interval") = 10000, py::arg("prune_prob") = 0.95, py::arg("dense_average") = true)
       .def("run", [](TabularBlueprint& b, long long iterations, uint64_t seed, int threads) {
         if (b.abs.edges.empty() && b.cfg.num_rounds > 1) throw std::runtime_error("fit_abstraction first");
         py::gil_scoped_release release;
