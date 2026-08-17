@@ -166,3 +166,54 @@ class ReservoirBuffer:
     def load(self, path):
         self.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
         return self
+
+
+class CircularBuffer:
+    """Fixed-capacity FIFO of (history row, action, scalar target) for the DREAM baselines and the
+    ESCHER value net (their papers keep the most recent 200 000 samples, not a reservoir)."""
+
+    def __init__(self, capacity, device, obs_dim, seed=None):
+        self.capacity = int(capacity)
+        self.device = torch.device(device)
+        self.obs = torch.zeros((self.capacity, int(obs_dim)), dtype=torch.float32, device=self.device)
+        self.action = torch.zeros((self.capacity,), dtype=torch.long, device=self.device)
+        self.target = torch.zeros((self.capacity,), dtype=torch.float32, device=self.device)
+        self.size = 0
+        self.head = 0
+        self.rng = np.random.default_rng(seed)
+
+    def __len__(self):
+        return self.size
+
+    def add(self, obs, action, target):
+        obs = torch.as_tensor(np.asarray(obs, dtype=np.float32))
+        action = torch.as_tensor(np.asarray(action).reshape(-1), dtype=torch.long)
+        target = torch.as_tensor(np.asarray(target, dtype=np.float32).reshape(-1))
+        n = len(action)
+        if n == 0:
+            return
+        if n >= self.capacity:  # keep the newest rows
+            obs, action, target = obs[-self.capacity:], action[-self.capacity:], target[-self.capacity:]
+            n = self.capacity
+        rows = (self.head + torch.arange(n)) % self.capacity
+        rows_dev = rows.to(self.device)
+        self.obs[rows_dev] = obs.to(self.device)
+        self.action[rows_dev] = action.to(self.device)
+        self.target[rows_dev] = target.to(self.device)
+        self.head = int((self.head + n) % self.capacity)
+        self.size = min(self.capacity, self.size + n)
+
+    def sample(self, n):
+        idx = torch.as_tensor(self.rng.integers(0, self.size, size=n), device=self.device)
+        return self.obs[idx], self.action[idx], self.target[idx]
+
+    def state_dict(self):
+        return {"obs": self.obs[: self.size].cpu(), "action": self.action[: self.size].cpu(), "target": self.target[: self.size].cpu(),
+                "head": self.head, "capacity": self.capacity}
+
+    def load_state_dict(self, state):
+        n = len(state["action"])
+        self.obs[:n] = state["obs"].to(self.device)
+        self.action[:n] = state["action"].to(self.device)
+        self.target[:n] = state["target"].to(self.device)
+        self.size, self.head = n, int(state["head"]) % self.capacity

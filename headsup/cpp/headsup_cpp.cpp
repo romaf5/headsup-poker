@@ -744,6 +744,229 @@ py::tuple run_traversals(std::shared_ptr<Model> net0, std::shared_ptr<Model> net
                         to_array(tr.strat.t, ns, 1), to_array(tr.strat.target, ns, nact), tr.nodes);
 }
 
+
+// ------------------------------------------------------------------ DREAM / ESCHER trajectory samplers
+// Outcome-sampling counterparts of the external-sampling traversal above, both driven by history
+// value networks (Model with opp_cards: the observation of seat 0 plus seat 1's hole cards).
+//   DREAM (Steinberger, Lerer & Brown 2020): one trajectory per traversal; the traverser explores
+//   with xi = eps * uniform + (1 - eps) * sigma, the opponent plays sigma; the learned baseline
+//   Q_p(h, a) replaces the unsampled actions' values (eq. 6-7): v~(a) = b(a) except the sampled one
+//   b(a) + (v_child - b(a)) / xi(a); advantage samples (I_p, t / own sample reach, v~ - sigma.v~) and
+//   expected-SARSA baseline targets (h, a, r + sigma(h').Q_p(h', .)).
+//   ESCHER (McAleer et al. 2023): value trajectories under sigma give (h, a, u_0) regression rows for
+//   the history value net; regret trajectories have the update player sample uniformly and the
+//   opponent play sigma, with regrets q(h, .) - sigma.q(h, .) read off the value net (no importance
+//   weights) and (I, t, sigma) rows for the average policy net.
+inline void history_observation(const Engine& e, float* out) {
+  e.observation(0, out);
+  const int a = std::min(e.hands[1][0], e.hands[1][1]), b = std::max(e.hands[1][0], e.hands[1][1]);
+  out[OPP_CARDS_OFFSET + 0] = float(a % 13 + 1); out[OPP_CARDS_OFFSET + 1] = float(a / 13 + 1); out[OPP_CARDS_OFFSET + 2] = float(a + 1);
+  out[OPP_CARDS_OFFSET + 3] = float(b % 13 + 1); out[OPP_CARDS_OFFSET + 4] = float(b / 13 + 1); out[OPP_CARDS_OFFSET + 5] = float(b + 1);
+}
+
+struct TrajectorySampler {
+  const Model* nets[2];
+  const Model* value = nullptr;  // DREAM: baseline Q_traverser(h, a); ESCHER: history value q(h, a) of seat 0
+  int traverser = 0;
+  float t = 1.0f, epsilon = 0.5f;
+  std::mt19937_64 rng;
+  Memory adv, strat, val;  // val: history rows, t = action index, target[a] = regression target
+  long nodes = 0;
+
+  void sigma_at(const Engine& e, float* obs, float* sigma, bool* legal, int* twin) const {
+    float values[MAX_ACTIONS];
+    e.observation(-1, obs);
+    nets[e.current]->forward(obs, values);
+    e.legal_mask(legal, twin);
+    regret_matching(values, sigma, legal, e.num_actions(), nets[e.current]->rm_argmax);
+  }
+
+  // -- DREAM ------------------------------------------------------------------------------
+  float dream(Engine& e, double own_reach) {
+    if (e.done) return float(e.rewards[traverser]);
+    const int p = e.current, n = e.num_actions();
+    float obs[OBS_DIM], sigma[MAX_ACTIONS], xi[MAX_ACTIONS], b[MAX_ACTIONS], hist[OBS_DIM_WITH_OPP];
+    bool legal[MAX_ACTIONS];
+    int twin[MAX_ACTIONS];
+    sigma_at(e, obs, sigma, legal, twin);
+    ++nodes;
+    int n_legal = 0;
+    for (int a = 0; a < n; ++a) n_legal += legal[a];
+    for (int a = 0; a < n; ++a)
+      xi[a] = p == traverser ? (legal[a] ? epsilon / n_legal : 0.0f) + (1.0f - epsilon) * sigma[a] : sigma[a];
+    const int a = sample(xi, n, rng);
+    history_observation(e, hist);
+    value->forward(hist, b);
+    Engine child = e;
+    child.step(a);
+    const float v_child = dream(child, own_reach * (p == traverser ? xi[a] : 1.0));
+    float va[MAX_ACTIONS];
+    for (int k = 0; k < n; ++k) va[k] = legal[k] ? b[k] : 0.0f;
+    va[a] = b[a] + (v_child - b[a]) / std::max(xi[a], 1e-12f);
+    float v = 0.0f;
+    for (int k = 0; k < n; ++k) v += sigma[k] * va[k];
+    if (p == traverser) {
+      float target[MAX_ACTIONS];
+      for (int k = 0; k < n; ++k) target[k] = legal[k] ? va[k] - v : 0.0f;
+      adv.add(obs, float(t / std::max(own_reach, 1e-12)), target);
+    }
+    // expected-SARSA target for Q_traverser(h, a)
+    float q_target;
+    if (child.done) {
+      q_target = float(child.rewards[traverser]);
+    } else {
+      float cobs[OBS_DIM], csig[MAX_ACTIONS], cb[MAX_ACTIONS], chist[OBS_DIM_WITH_OPP];
+      bool clegal[MAX_ACTIONS];
+      int ctwin[MAX_ACTIONS];
+      sigma_at(child, cobs, csig, clegal, ctwin);
+      history_observation(child, chist);
+      value->forward(chist, cb);
+      q_target = 0.0f;
+      for (int k = 0; k < child.num_actions(); ++k) q_target += clegal[k] ? csig[k] * cb[k] : 0.0f;
+    }
+    float row[MAX_ACTIONS] = {};
+    row[a] = q_target;
+    val.add(hist, float(a), row);
+    return v;
+  }
+
+  // -- ESCHER -----------------------------------------------------------------------------
+  void escher_values(Engine& e) {  // one self-play trajectory under sigma: (h, a, u_0) rows
+    std::vector<std::array<float, OBS_DIM_WITH_OPP>> hists;
+    std::vector<int> acts;
+    while (!e.done) {
+      float obs[OBS_DIM], sigma[MAX_ACTIONS];
+      bool legal[MAX_ACTIONS];
+      int twin[MAX_ACTIONS];
+      sigma_at(e, obs, sigma, legal, twin);
+      ++nodes;
+      std::array<float, OBS_DIM_WITH_OPP> h;
+      history_observation(e, h.data());
+      const int a = sample(sigma, e.num_actions(), rng);
+      hists.push_back(h);
+      acts.push_back(a);
+      e.step(a);
+    }
+    const float u0 = float(e.rewards[0]);
+    for (size_t i = 0; i < hists.size(); ++i) {
+      float row[MAX_ACTIONS] = {};
+      row[acts[i]] = u0;
+      val.add(hists[i].data(), float(acts[i]), row);
+    }
+  }
+
+  void escher_regrets(Engine& e) {  // update player = traverser samples uniformly, the opponent plays sigma
+    while (!e.done) {
+      const int p = e.current, n = e.num_actions();
+      float obs[OBS_DIM], sigma[MAX_ACTIONS];
+      bool legal[MAX_ACTIONS];
+      int twin[MAX_ACTIONS];
+      sigma_at(e, obs, sigma, legal, twin);
+      ++nodes;
+      int a;
+      if (p == traverser) {
+        float hist[OBS_DIM_WITH_OPP], q[MAX_ACTIONS], target[MAX_ACTIONS];
+        history_observation(e, hist);
+        value->forward(hist, q);
+        const float sign = p == 0 ? 1.0f : -1.0f;
+        float v = 0.0f;
+        for (int k = 0; k < n; ++k) v += legal[k] ? sigma[k] * sign * q[k] : 0.0f;
+        for (int k = 0; k < n; ++k) target[k] = legal[k] ? sign * q[k] - v : 0.0f;
+        adv.add(obs, t, target);
+        strat.add(obs, t, sigma);
+        float row[MAX_ACTIONS] = {};
+        row[0] = v;
+        val.add(hist, -1.0f, row);  // the histories seen by the update player (tests / diagnostics)
+        int cnt = 0;
+        for (int k = 0; k < n; ++k) cnt += legal[k];
+        std::uniform_int_distribution<int> d(0, cnt - 1);
+        int pick = d(rng);
+        a = 0;
+        for (int k = 0; k < n; ++k)
+          if (legal[k] && pick-- == 0) { a = k; break; }
+      } else {
+        a = sample(sigma, n, rng);
+      }
+      e.step(a);
+    }
+  }
+};
+
+py::tuple run_dream(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, std::shared_ptr<Model> baseline, int traverser,
+                    int n_traversals, float t, float epsilon, uint64_t seed, EngineConfig cfg, py::object decks_obj) {
+  if (!baseline->opp_cards) throw std::runtime_error("the DREAM baseline must be an opp_cards (history-input) network");
+  TrajectorySampler ts;
+  ts.nets[0] = net0.get(); ts.nets[1] = net1.get(); ts.value = baseline.get();
+  ts.traverser = traverser; ts.t = t; ts.epsilon = epsilon;
+  ts.rng.seed(seed);
+  ts.adv.obs_dim = ts.strat.obs_dim = net0->obs_dim;
+  ts.val.obs_dim = OBS_DIM_WITH_OPP;
+  ts.adv.num_actions = ts.strat.num_actions = ts.val.num_actions = cfg.num_actions();
+  std::vector<int> decks;  // optional fixed deals (n_traversals, >= 9)
+  int stride = 0;
+  if (!decks_obj.is_none()) {
+    auto arr = py::array_t<int, py::array::c_style | py::array::forcecast>::ensure(decks_obj);
+    if (!arr || arr.ndim() != 2 || arr.shape(0) != n_traversals || arr.shape(1) < 9)
+      throw std::runtime_error("decks must be an int array of shape (n_traversals, >=9)");
+    decks.assign(arr.data(), arr.data() + arr.size());
+    stride = int(arr.shape(1));
+  }
+  {
+    py::gil_scoped_release release;
+    Engine e(cfg);
+    for (int i = 0; i < n_traversals; ++i) {
+      if (decks.empty()) e.reset_random(ts.rng);
+      else e.reset(decks.data() + size_t(i) * stride);
+      ts.dream(e, 1.0);
+    }
+  }
+  const ssize_t na = ssize_t(ts.adv.size()), nv = ssize_t(ts.val.size()), nact = cfg.num_actions();
+  return py::make_tuple(to_array(ts.adv.obs, na, ts.adv.obs_dim), to_array(ts.adv.t, na, 1), to_array(ts.adv.target, na, nact),
+                        to_array(ts.val.obs, nv, OBS_DIM_WITH_OPP), to_array(ts.val.t, nv, 1), to_array(ts.val.target, nv, nact), ts.nodes);
+}
+
+py::tuple run_escher_values(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, int n_trajectories, uint64_t seed, EngineConfig cfg) {
+  TrajectorySampler ts;
+  ts.nets[0] = net0.get(); ts.nets[1] = net1.get();
+  ts.rng.seed(seed);
+  ts.val.obs_dim = OBS_DIM_WITH_OPP;
+  ts.val.num_actions = cfg.num_actions();
+  {
+    py::gil_scoped_release release;
+    Engine e(cfg);
+    for (int i = 0; i < n_trajectories; ++i) {
+      e.reset_random(ts.rng);
+      ts.escher_values(e);
+    }
+  }
+  const ssize_t nv = ssize_t(ts.val.size()), nact = cfg.num_actions();
+  return py::make_tuple(to_array(ts.val.obs, nv, OBS_DIM_WITH_OPP), to_array(ts.val.t, nv, 1), to_array(ts.val.target, nv, nact), ts.nodes);
+}
+
+py::tuple run_escher_regrets(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, std::shared_ptr<Model> vnet, int traverser,
+                             int n_trajectories, float t, uint64_t seed, EngineConfig cfg) {
+  if (!vnet->opp_cards) throw std::runtime_error("the ESCHER value net must be an opp_cards (history-input) network");
+  TrajectorySampler ts;
+  ts.nets[0] = net0.get(); ts.nets[1] = net1.get(); ts.value = vnet.get();
+  ts.traverser = traverser; ts.t = t;
+  ts.rng.seed(seed);
+  ts.adv.obs_dim = ts.strat.obs_dim = net0->obs_dim;
+  ts.val.obs_dim = OBS_DIM_WITH_OPP;
+  ts.adv.num_actions = ts.strat.num_actions = ts.val.num_actions = cfg.num_actions();
+  {
+    py::gil_scoped_release release;
+    Engine e(cfg);
+    for (int i = 0; i < n_trajectories; ++i) {
+      e.reset_random(ts.rng);
+      ts.escher_regrets(e);
+    }
+  }
+  const ssize_t na = ssize_t(ts.adv.size()), ns = ssize_t(ts.strat.size()), nv = ssize_t(ts.val.size()), nact = cfg.num_actions();
+  return py::make_tuple(to_array(ts.adv.obs, na, ts.adv.obs_dim), to_array(ts.adv.t, na, 1), to_array(ts.adv.target, na, nact),
+                        to_array(ts.strat.obs, ns, ts.strat.obs_dim), to_array(ts.strat.t, ns, 1), to_array(ts.strat.target, ns, nact),
+                        to_array(ts.val.obs, nv, OBS_DIM_WITH_OPP), to_array(ts.val.t, nv, 1), to_array(ts.val.target, nv, nact), ts.nodes);
+}
+
 // ------------------------------------------------------------------ vectorised env
 struct VecEnv {
   enum OpponentKind { RANDOM = 0, CALL = 1, ALLIN = 2, RAISE_ = 3, MODEL = 4 };
@@ -2667,6 +2890,14 @@ PYBIND11_MODULE(headsup_cpp, m) {
       .def_property_readonly("buckets", [](const TabularBlueprint& b) { return b.abs.buckets; })
       .def_property_readonly("samples", [](const TabularBlueprint& b) { return b.abs.samples; });
 
+  m.def("run_dream", &run_dream, py::arg("net0"), py::arg("net1"), py::arg("baseline"), py::arg("traverser"), py::arg("n_traversals"),
+        py::arg("t"), py::arg("epsilon"), py::arg("seed"), py::arg("cfg") = EngineConfig(), py::arg("decks") = py::none(),
+        "DREAM outcome-sampling traversals: (adv obs, adv weight, adv target, history obs, action, Q target, nodes)");
+  m.def("run_escher_values", &run_escher_values, py::arg("net0"), py::arg("net1"), py::arg("n_trajectories"), py::arg("seed"),
+        py::arg("cfg") = EngineConfig(), "ESCHER value trajectories: (history obs, action, u_0 target, nodes)");
+  m.def("run_escher_regrets", &run_escher_regrets, py::arg("net0"), py::arg("net1"), py::arg("vnet"), py::arg("traverser"),
+        py::arg("n_trajectories"), py::arg("t"), py::arg("seed"), py::arg("cfg") = EngineConfig(),
+        "ESCHER regret trajectories: (adv obs, t, target, strat obs, t, sigma, history obs, -1, value, nodes)");
   m.def("run_traversals", &run_traversals, py::arg("net0"), py::arg("net1"), py::arg("traverser"), py::arg("n_traversals"),
         py::arg("t"), py::arg("seed"), py::arg("cfg") = EngineConfig(), py::arg("decks") = py::none(),
         "External-sampling MCCFR traversals; returns (adv_obs, adv_t, adv_target, strat_obs, strat_t, strat_target, nodes)");

@@ -155,3 +155,70 @@ def test_train_advantage_and_policy_smoke():
     sbuf.add(strat.obs, strat.t, strat.target)
     policy = train_policy_net(sbuf, "cpu", epochs=1, batch_size=64, compile=False, progress=False)
     assert isinstance(policy, BaseModel)
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_cpp_dream_sampler_matches_python_reference():
+    """DREAM outcome sampling with eps = 0 and one-hot strategies is deterministic given the deal:
+    the C++ sampler and the Python reference produce the same advantage / baseline samples."""
+    from headsup.deepcfr.traverse import run_dream_python
+    from headsup.model import OBS_DIM_WITH_OPP
+
+    cpp = native.module()
+    rng = np.random.default_rng(1)
+    n = 80
+    decks = np.stack([rng.permutation(52)[:9] for _ in range(n)]).astype(np.int32)
+    w0, w1 = _peaked([0, 5, 0, 0], features="history"), _peaked([0, 0, 5, 0], features="history")
+    torch.manual_seed(0)
+    baseline = BaseModel(features="history", opp_cards=True)
+    with torch.no_grad():
+        torch.nn.init.normal_(baseline.action_head.weight, std=0.5)
+    bw = baseline.numpy_weights()
+    for traverser in (0, 1):
+        pa, pv, pn = run_dream_python([w0, w1], bw, traverser, n, 3.0, 0.0, 1, None, decks)
+        out = cpp.run_dream(native.make_model(w0), native.make_model(w1), native.make_model(bw), traverser, n, 3.0, 0.0, 1,
+                            native.engine_config(), decks)
+        assert pn == out[6] and len(pa) == len(out[1]) > 0 and len(pv) == len(out[4]) > 0
+        assert out[3].shape[1] == OBS_DIM_WITH_OPP
+        np.testing.assert_array_equal(pa.obs, out[0])
+        np.testing.assert_allclose(pa.t, np.ravel(out[1]), rtol=1e-5)  # t / own sample reach (= t: xi one-hot along the path)
+        np.testing.assert_allclose(pa.target, out[2], atol=1e-3)
+        np.testing.assert_array_equal(pv.obs, out[3])
+        np.testing.assert_array_equal(pv.t, np.ravel(out[4]))  # the action taken at each history
+        np.testing.assert_allclose(pv.target, out[5], atol=1e-3)
+    # the runner wraps the same call
+    from headsup.deepcfr.traverse import TraversalRunner
+
+    with TraversalRunner(2, backend="cpp") as runner:
+        adv, val, nodes = runner.collect_dream([w0, w1], bw, 0, 40, 2.0, 0.5, seed=3)
+        assert nodes > 0 and len(adv) > 0 and val.obs.shape[1] == OBS_DIM_WITH_OPP
+        assert np.all(adv.t >= 2.0)  # t / own sample reach >= t
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_cpp_escher_samplers():
+    """ESCHER value rows carry player 0's return of the trajectory; regret rows are q - sigma.q
+    of the value net (checked by recomputing them from the returned history rows)."""
+    from headsup.deepcfr.traverse import TraversalRunner
+    from headsup.model import OBS_DIM_WITH_OPP
+    from headsup.numpy_model import NumpyModel
+
+    w0, w1 = _peaked([0, 5, 0, 0], features="history"), _peaked([0, 0, 5, 0], features="history")
+    torch.manual_seed(0)
+    vnet = BaseModel(features="history", opp_cards=True)
+    with torch.no_grad():
+        torch.nn.init.normal_(vnet.action_head.weight, std=0.5)
+    vw = vnet.numpy_weights()
+    with TraversalRunner(2, backend="cpp") as runner:
+        val, nodes = runner.collect_escher_values([w0, w1], 50, seed=0)
+        assert val.obs.shape[1] == OBS_DIM_WITH_OPP and len(val) >= 50 and nodes == len(val)
+        picked = val.target[np.arange(len(val)), val.t.astype(int)]  # u_0 of the trajectory in the taken action's slot
+        assert np.all(np.abs(picked) <= 100.0) and np.all(val.target.sum(1) == picked)
+        adv, strat, hist, nodes = runner.collect_escher_regrets([w0, w1], vw, 1, 30, 4.0, seed=0)
+        assert len(adv) == len(strat) == len(hist) > 0 and np.all(adv.t == 4.0)
+        q = -NumpyModel(vw)(hist.obs)  # player 1's values
+        legal = adv.target != 0  # (illegal / duplicate actions have target 0; so may a legal one, rarely)
+        v = hist.target[:, 0]
+        expected = np.where(legal, q - v[:, None], 0.0)
+        np.testing.assert_allclose(adv.target[legal], expected[legal], atol=1e-3)
+        np.testing.assert_allclose(strat.target.sum(1), 1.0, atol=1e-5)

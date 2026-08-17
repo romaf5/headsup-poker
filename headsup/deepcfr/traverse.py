@@ -123,6 +123,65 @@ def traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats=None):
     return traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats)
 
 
+def history_rows(engine):
+    """History input of the value nets: seat 0's observation + seat 1's hole cards (see headsup.model)."""
+    from headsup.model import history_observation
+
+    return history_observation(engine.observation(0)[None], np.array([engine.hands[1]]))[0]
+
+
+def dream_trajectory(engine, traverser, nets, baseline, t, epsilon, rng, own_reach, adv_mem, val_mem, stats=None):
+    """Python reference of the C++ DREAM sampler (one outcome-sampled trajectory); returns the
+    baseline-corrected value of the state for the traverser (DREAM eq. 6-7)."""
+    if engine.done:
+        return float(engine.rewards[traverser])
+    p = engine.current
+    n = engine.num_actions
+    obs = engine.observation()
+    legal, _ = engine.legal_mask_and_twins()
+    legal = np.asarray(legal, dtype=bool)
+    sigma = np.asarray(regret_matching(nets[p](obs), legal=legal, fallback=nets[p].rm_fallback), dtype=np.float64)
+    if stats is not None:
+        stats["nodes"] += 1
+    xi = (epsilon * legal / legal.sum() + (1.0 - epsilon) * sigma) if p == traverser else sigma
+    a = min(int(np.searchsorted(np.cumsum(xi), rng.random(), side="right")), n - 1)
+    hist = history_rows(engine)
+    b = baseline(hist)
+    child = engine.clone()
+    child.step(a)
+    v_child = dream_trajectory(child, traverser, nets, baseline, t, epsilon, rng, own_reach * (xi[a] if p == traverser else 1.0),
+                               adv_mem, val_mem, stats)
+    va = np.where(legal, b, 0.0)
+    va[a] = b[a] + (v_child - b[a]) / max(xi[a], 1e-12)
+    v = float(np.dot(sigma, va))
+    if p == traverser:
+        adv_mem.add(obs, t / max(own_reach, 1e-12), np.where(legal, va - v, 0.0))
+    if child.done:
+        q_target = float(child.rewards[traverser])
+    else:
+        clegal = np.asarray(child.legal_mask_and_twins()[0], dtype=bool)
+        csig = regret_matching(nets[child.current](child.observation()), legal=clegal, fallback=nets[child.current].rm_fallback)
+        q_target = float(np.dot(csig, np.where(clegal, baseline(history_rows(child)), 0.0)))
+    row = np.zeros(n, np.float32)
+    row[a] = q_target
+    val_mem.add(hist, float(a), row)
+    return v
+
+
+def run_dream_python(weights, baseline_weights, traverser, n_traversals, t, epsilon, seed, engine_kwargs=None, decks=None):
+    rng = np.random.default_rng(seed)
+    nets = [NumpyModel(weights[0]), NumpyModel(weights[1])]
+    baseline = NumpyModel(baseline_weights)
+    engine = HeadsUpPoker(rng=rng, game=nets[0].game.with_(**(engine_kwargs or {})))
+    from headsup.model import OBS_DIM_WITH_OPP
+
+    adv, val, stats = _Memory(nets[0].obs_dim, engine.num_actions), _Memory(OBS_DIM_WITH_OPP, engine.num_actions), {"nodes": 0}
+    for i in range(n_traversals):
+        engine.reset(None if decks is None else decks[i])
+        dream_trajectory(engine, traverser, nets, baseline, t, epsilon, rng, 1.0, adv, val, stats)
+    return adv.to_samples(), val.to_samples(), stats["nodes"]
+
+
 def run_traversals_python(weights, traverser, n_traversals, t, seed, engine_kwargs=None, decks=None):
     """Worker entry point (picklable): returns (adv Samples, strat Samples, nodes)."""
     rng = np.random.default_rng(seed)
@@ -210,3 +269,44 @@ class TraversalRunner:
             strat = Samples.concat([o[1] for o in outs])
             nodes = sum(o[2] for o in outs)
         return adv, strat, nodes
+
+    # -- DREAM / ESCHER (C++ trajectory samplers) ----------------------------------------------
+    def _cpp_models(self, *weight_dicts):
+        from headsup import native
+
+        return [native.make_model(w) for w in weight_dicts]
+
+    def _fan_out(self, fn, n, seed, *args):
+        chunks = self._split(n)
+        seeds = np.random.SeedSequence(seed).generate_state(len(chunks), dtype=np.uint64)
+        futs = [self._pool.submit(fn, k, int(s), *args) for k, s in zip(chunks, seeds)]
+        return [f.result() for f in futs]
+
+    def collect_dream(self, weights, baseline_weights, traverser, n_traversals, t, epsilon, seed):
+        """DREAM outcome-sampling traversals; returns (adv Samples, value Samples (history rows,
+        t = action index, target[a] = expected-SARSA target), nodes)."""
+        if self.backend != "cpp":
+            raise NotImplementedError("DREAM / ESCHER traversals need the C++ extension")
+        nets = self._cpp_models(weights[0], weights[1], baseline_weights)
+        outs = self._fan_out(lambda k, s: self._cpp.run_dream(nets[0], nets[1], nets[2], traverser, k, float(t), float(epsilon), s, self._cfg),
+                             n_traversals, seed)
+        return (Samples.concat([Samples(o[0], o[1], o[2]) for o in outs]), Samples.concat([Samples(o[3], o[4], o[5]) for o in outs]),
+                sum(o[6] for o in outs))
+
+    def collect_escher_values(self, weights, n_trajectories, seed):
+        """ESCHER value trajectories under the current strategies: (value Samples, nodes)."""
+        if self.backend != "cpp":
+            raise NotImplementedError("DREAM / ESCHER traversals need the C++ extension")
+        nets = self._cpp_models(weights[0], weights[1])
+        outs = self._fan_out(lambda k, s: self._cpp.run_escher_values(nets[0], nets[1], k, s, self._cfg), n_trajectories, seed)
+        return Samples.concat([Samples(o[0], o[1], o[2]) for o in outs]), sum(o[3] for o in outs)
+
+    def collect_escher_regrets(self, weights, value_weights, traverser, n_trajectories, t, seed):
+        """ESCHER regret trajectories: (adv Samples, strat Samples, history Samples, nodes)."""
+        if self.backend != "cpp":
+            raise NotImplementedError("DREAM / ESCHER traversals need the C++ extension")
+        nets = self._cpp_models(weights[0], weights[1], value_weights)
+        outs = self._fan_out(lambda k, s: self._cpp.run_escher_regrets(nets[0], nets[1], nets[2], traverser, k, float(t), s, self._cfg),
+                             n_trajectories, seed)
+        return (Samples.concat([Samples(o[0], o[1], o[2]) for o in outs]), Samples.concat([Samples(o[3], o[4], o[5]) for o in outs]),
+                Samples.concat([Samples(o[6], o[7], o[8]) for o in outs]), sum(o[9] for o in outs))
