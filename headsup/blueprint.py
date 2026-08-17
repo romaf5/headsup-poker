@@ -36,10 +36,14 @@ from headsup.public import board_cards, hero_cards, replay_from_obs
 class TabularBlueprint:
     """The C++ trainer/policy plus its parameters; ``save`` / ``load`` round-trip everything."""
 
-    def __init__(self, game=DEFAULT_GAME, buckets=200, samples=500):
+    def __init__(self, game=DEFAULT_GAME, buckets=200, samples=500, mode="mc", completions=300):
+        """``mode``: ``mc`` = per-hand Monte-Carlo EHS into equal-mass buckets; ``table`` = exact
+        per-board equity features (mean, std over the completions) with k-means buckets, cached per
+        board (potential-aware, no sampling noise; slower to warm up)."""
         self.game = game
+        self.mode, self.completions = mode, completions
         self.cpp = native.module().TabularBlueprint()
-        self.cpp.build(native.engine_config(game=game), buckets, samples)
+        self.cpp.build(native.engine_config(game=game), buckets, samples, mode, completions)
         self.params = dict(prune_threshold=-300.0 * game.stack_size * 100, regret_floor=-310.0 * game.stack_size * 100,
                            prune_after=0, lcfr_iterations=0, discount_interval=0, strategy_interval=10000, prune_prob=0.95,
                            dense_average=True)
@@ -74,8 +78,11 @@ class TabularBlueprint:
         import torch
 
         torch.save({"kind": "tabular_blueprint", "game": self.game.to_dict(), "buckets": self.cpp.buckets, "samples": self.cpp.samples,
-                    "edges": [np.asarray(e, dtype=np.float32) for e in self.cpp.edges], "regret": np.asarray(self.cpp.regret),
-                    "phi": np.asarray(self.cpp.phi), "iterations": self.iterations, "params": self.params}, path)
+                    "mode": self.mode, "completions": self.completions,
+                    "edges": [np.asarray(e, dtype=np.float32) for e in self.cpp.edges],
+                    "centroids": [np.asarray(c, dtype=np.float32) for c in self.cpp.centroids],
+                    "regret": np.asarray(self.cpp.regret), "phi": np.asarray(self.cpp.phi), "iterations": self.iterations,
+                    "params": self.params}, path)
 
     @classmethod
     def load(cls, path):
@@ -84,10 +91,12 @@ class TabularBlueprint:
         data = torch.load(path, map_location="cpu", weights_only=False)
         if data.get("kind") != "tabular_blueprint":
             raise ValueError(f"{path} is not a tabular blueprint")
-        bp = cls(GameConfig.from_dict(data["game"]), data["buckets"], data["samples"])
+        bp = cls(GameConfig.from_dict(data["game"]), data["buckets"], data["samples"], data.get("mode", "mc"), data.get("completions", 300))
         bp.params.update(data["params"])
         bp._apply_params()
         bp.cpp.edges = [list(map(float, e)) for e in data["edges"]]
+        if data.get("centroids"):
+            bp.cpp.centroids = [list(map(float, c)) for c in data["centroids"]]
         bp.cpp.regret = np.asarray(data["regret"], dtype=np.float32)
         bp.cpp.phi = np.asarray(data["phi"], dtype=np.float32)
         bp.cpp.iterations = int(data["iterations"])
@@ -114,13 +123,16 @@ class TabularPlayer:
 
     wants_ids = False
 
-    def __init__(self, blueprint, current=False, seed=None):
+    def __init__(self, blueprint, current=False, seed=None, workers=16):
+        from concurrent.futures import ThreadPoolExecutor
+
         self.bp = blueprint if isinstance(blueprint, TabularBlueprint) else TabularBlueprint.load(blueprint)
         self.game = self.bp.game
         self.current = current
         self.rng = np.random.default_rng(seed)
         self.last_probs = None
         self._nodes = {}  # public-history key -> node
+        self._pool = ThreadPoolExecutor(workers)
 
     def _node(self, row):
         key = row[21:].tobytes()  # stage, position, pot features, history: identifies the public state
@@ -144,6 +156,7 @@ class TabularPlayer:
         _, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
         inverse = inverse.ravel()
         all_hands = np.sort(np.stack([obs[:, 2], obs[:, 5]], axis=1).astype(np.int32) - 1, axis=1)
+        jobs = []  # (row indices, node, hands, board, seed): the C++ queries, run in parallel below (they release the GIL)
         for g, ref_i in enumerate(first):
             idx = np.flatnonzero(inverse == g)
             row = obs[ref_i]
@@ -160,7 +173,15 @@ class TabularPlayer:
             if self.bp.cpp.node_player(node) < 0:
                 out[idx, 1] = 1.0
                 continue
-            out[idx] = self.bp.strategy_for_hands(node, hands, board, int(self.rng.integers(2**31)), self.current)
+            jobs.append((idx, node, hands, board, int(self.rng.integers(2**31))))
+        if len(jobs) <= 1:
+            for idx, node, hands, board, seed in jobs:
+                out[idx] = self.bp.strategy_for_hands(node, hands, board, seed, self.current)
+        else:
+            futs = [(idx, self._pool.submit(self.bp.strategy_for_hands, node, hands, board, seed, self.current))
+                    for idx, node, hands, board, seed in jobs]
+            for idx, f in futs:
+                out[idx] = f.result()
         legal = legal_mask_from_obs(obs, self.game)
         out[~legal] = 0.0
         s = out.sum(axis=1, keepdims=True)
@@ -189,8 +210,12 @@ def main(argv=None):
     p.add_argument("--iterations", type=int, default=10_000_000, help="MCCFR iterations (each = one traversal per seat)")
     p.add_argument("--threads", type=int, default=32)
     p.add_argument("--buckets", type=int, default=200)
-    p.add_argument("--samples", type=int, default=500, help="Monte-Carlo runouts per EHS evaluation (flop / turn)")
-    p.add_argument("--situations", type=int, default=200_000, help="random situations per round to fit the bucket edges")
+    p.add_argument("--samples", type=int, default=500, help="mc: Monte-Carlo runouts per EHS evaluation (flop / turn)")
+    p.add_argument("--abstraction", default="mc", choices=["mc", "table"],
+                   help="mc: per-hand Monte-Carlo EHS, equal-mass buckets; table: exact per-board (mean, std) equity features, "
+                        "k-means buckets, cached per board (potential-aware, no noise)")
+    p.add_argument("--completions", type=int, default=300, help="table: sampled completions per flop board (turn: all rivers)")
+    p.add_argument("--situations", type=int, default=200_000, help="random situations per round to fit the buckets (table: / 1326 boards)")
     p.add_argument("--lcfr", type=float, default=0.4, help="fraction of the iterations with linear discounting (Pluribus: 400 of 800+ minutes)")
     p.add_argument("--discount-every", type=float, default=0.01, help="discount interval as a fraction of the iterations (Pluribus: 10 of 400 minutes)")
     p.add_argument("--prune-after", type=float, default=0.2, help="start pruning after this fraction of the iterations (Pluribus: 200 minutes)")
@@ -206,7 +231,7 @@ def main(argv=None):
     from headsup.game import parse_bet_sizes
 
     game = make_holdem(args.game, **({"bet_sizes": parse_bet_sizes(args.bet_sizes)} if args.bet_sizes else {}))
-    bp = TabularBlueprint(game, args.buckets, args.samples)
+    bp = TabularBlueprint(game, args.buckets, args.samples, args.abstraction, args.completions)
     bp.configure(lcfr_iterations=int(args.lcfr * args.iterations), discount_interval=max(1, int(args.discount_every * args.iterations)),
                  prune_after=0 if args.no_prune else int(args.prune_after * args.iterations),
                  strategy_interval=args.strategy_every or max(1, args.iterations // 1_000_000))

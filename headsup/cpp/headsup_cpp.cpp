@@ -2151,6 +2151,160 @@ struct Abstraction {
   int samples = 500;   // Monte-Carlo runouts (flop / turn); the river is exact
   int rounds = 4, showdown = 5;
   std::vector<std::vector<float>> edges;  // per round: buckets-1 quantile edges of the EHS (round 0 unused)
+  // "table" mode (potential-aware, Pluribus / Johanson style): per board the exact equity of every hand
+  // against a uniform hand on the completed board is computed once (BoardTable per completion), the
+  // features (mean, std over the completions; the last round: exact equity) are k-means clustered
+  // per round, and the buckets of all hands are cached per board (thread-safe; the flop's 22 100
+  // boards are ~60 MB, the turn's up to ~2.8 GB when every board has been seen).
+  bool table_mode = false;
+  int completions = 300;                                    // completions per flop board (turn: all rivers)
+  std::vector<std::vector<float>> centroids;                // per round: buckets x 2 (mean, std)
+  mutable std::vector<std::unordered_map<int, std::vector<uint16_t>>> cache;  // per round: board code -> bucket per hand
+  mutable std::vector<std::mutex> cache_mutex;
+
+  Abstraction() : cache(5), cache_mutex(5) {}
+  Abstraction(const Abstraction& o) : buckets(o.buckets), samples(o.samples), rounds(o.rounds), showdown(o.showdown), edges(o.edges),
+      table_mode(o.table_mode), completions(o.completions), centroids(o.centroids), cache(o.cache), cache_mutex(5) {}
+
+  static int board_code(const int* board, int n) {  // order-free: the features do not depend on the deal order
+    int tmp[5];
+    for (int i = 0; i < n; ++i) tmp[i] = board[i];
+    std::sort(tmp, tmp + n);
+    int c = 0;
+    for (int i = 0; i < n; ++i) c = c * NUM_CARDS + tmp[i];
+    return c;
+  }
+
+  // per-hand (mean, std) of the equity vs a uniform hand over the completions of `board` (n cards);
+  // hands overlapping the board get (-1, 0)
+  template <class RNG>
+  void features_all(const int* board, int n, RNG& rng, std::vector<float>& mean, std::vector<float>& sd) const {
+    mean.assign(NUM_COMBOS, -1.0f);
+    sd.assign(NUM_COMBOS, 0.0f);
+    const int missing = showdown - n;
+    BoardTable t;
+    if (missing == 0) {
+      t.build(board, showdown);
+      mean = t.equity;
+      for (int h = 0; h < NUM_COMBOS; ++h) if (mean[h] < 0) sd[h] = 0.0f;
+      return;
+    }
+    bool used[NUM_CARDS] = {};
+    for (int i = 0; i < n; ++i) used[board[i]] = true;
+    int deck[NUM_CARDS], nd = 0;
+    for (int c = 0; c < NUM_CARDS; ++c)
+      if (!used[c]) deck[nd++] = c;
+    std::vector<double> acc(NUM_COMBOS, 0.0), acc2(NUM_COMBOS, 0.0), cnt(NUM_COMBOS, 0.0);
+    int full[5];
+    for (int i = 0; i < n; ++i) full[i] = board[i];
+    auto take = [&](const int* extra) {
+      for (int i = 0; i < missing; ++i) full[n + i] = extra[i];
+      t.build(full, showdown);
+      for (int h : t.order) { const double e = t.equity[h]; acc[h] += e; acc2[h] += e * e; cnt[h] += 1.0; }
+    };
+    if (missing == 1) {  // every river
+      for (int i = 0; i < nd; ++i) take(&deck[i]);
+    } else {  // sampled completions (without replacement per completion)
+      for (int r = 0; r < completions; ++r) {
+        for (int i = 0; i < missing; ++i) {
+          std::uniform_int_distribution<int> d(i, nd - 1);
+          std::swap(deck[i], deck[d(rng)]);
+        }
+        take(deck);
+      }
+    }
+    for (int h = 0; h < NUM_COMBOS; ++h)
+      if (cnt[h] > 0) {
+        const double m = acc[h] / cnt[h];
+        mean[h] = float(m);
+        sd[h] = float(std::sqrt(std::max(0.0, acc2[h] / cnt[h] - m * m)));
+      }
+  }
+
+  int nearest_centroid(int round, float m, float s) const {
+    const std::vector<float>& c = centroids[round];
+    int best = 0;
+    float bd = 1e30f;
+    for (int k = 0; k < buckets; ++k) {
+      const float dm = c[2 * k] - m, ds = c[2 * k + 1] - s, d = dm * dm + ds * ds;
+      if (d < bd) { bd = d; best = k; }
+    }
+    return best;
+  }
+
+  // buckets of every hand for the board of `round` (table mode; cached per board)
+  template <class RNG>
+  const std::vector<uint16_t>& table_buckets(int round, const int* board, RNG& rng) const {
+    const int n = BOARD_CARDS_BY_STAGE[round];
+    const int code = board_code(board, n);
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex[round]);
+      auto it = cache[round].find(code);
+      if (it != cache[round].end()) return it->second;
+    }
+    std::vector<float> mean, sd;
+    features_all(board, n, rng, mean, sd);
+    std::vector<uint16_t> b(NUM_COMBOS, 0);
+    for (int h = 0; h < NUM_COMBOS; ++h)
+      if (mean[h] >= 0) b[h] = uint16_t(nearest_centroid(round, mean[h], sd[h]));
+    std::lock_guard<std::mutex> lock(cache_mutex[round]);
+    return cache[round].emplace(code, std::move(b)).first->second;
+  }
+
+  // k-means (Lloyd, deterministic seeds along the mean axis) of the (mean, std) features of random
+  // boards' hands, per post-flop round
+  void fit_centroids(int boards_per_round, uint64_t seed, int threads) {
+    centroids.assign(rounds, {});
+    for (int r = 1; r < rounds; ++r) {
+      const int nb = BOARD_CARDS_BY_STAGE[r];
+      std::vector<std::vector<float>> pts(threads);
+      auto work = [&](int t, uint64_t s) {
+        std::mt19937_64 rng(s);
+        std::vector<float> mean, sd;
+        for (int k = t; k < boards_per_round; k += threads) {
+          int deck[NUM_CARDS];
+          for (int i = 0; i < NUM_CARDS; ++i) deck[i] = i;
+          for (int i = 0; i < nb; ++i) {
+            std::uniform_int_distribution<int> d(i, NUM_CARDS - 1);
+            std::swap(deck[i], deck[d(rng)]);
+          }
+          features_all(deck, nb, rng, mean, sd);
+          for (int h = 0; h < NUM_COMBOS; ++h)
+            if (mean[h] >= 0) { pts[t].push_back(mean[h]); pts[t].push_back(sd[h]); }
+        }
+      };
+      std::vector<std::thread> pool;
+      for (int t = 0; t < threads; ++t) pool.emplace_back(work, t, seed * 7919ULL + uint64_t(r) * 104729ULL + uint64_t(t));
+      for (auto& th : pool) th.join();
+      std::vector<float> all;
+      for (auto& v : pts) all.insert(all.end(), v.begin(), v.end());
+      const size_t n = all.size() / 2;
+      // init: quantiles of the mean axis (spread), std = the mean std of the points near that quantile
+      std::vector<size_t> order(n);
+      for (size_t i = 0; i < n; ++i) order[i] = i;
+      std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return all[2 * a] < all[2 * b]; });
+      std::vector<float> c(size_t(buckets) * 2);
+      for (int k = 0; k < buckets; ++k) {
+        const size_t lo = n * k / buckets, hi = std::max(lo + 1, n * (k + 1) / buckets);
+        double sm = 0.0, ss = 0.0;
+        for (size_t i = lo; i < hi; ++i) { sm += all[2 * order[i]]; ss += all[2 * order[i] + 1]; }
+        c[2 * k] = float(sm / double(hi - lo));
+        c[2 * k + 1] = float(ss / double(hi - lo));
+      }
+      centroids[r] = c;
+      std::vector<double> sm(buckets), ss(buckets), cnt(buckets);
+      for (int it = 0; it < 25; ++it) {
+        std::fill(sm.begin(), sm.end(), 0.0); std::fill(ss.begin(), ss.end(), 0.0); std::fill(cnt.begin(), cnt.end(), 0.0);
+        for (size_t i = 0; i < n; ++i) {
+          const int k = nearest_centroid(r, all[2 * i], all[2 * i + 1]);
+          sm[k] += all[2 * i]; ss[k] += all[2 * i + 1]; cnt[k] += 1.0;
+        }
+        for (int k = 0; k < buckets; ++k)
+          if (cnt[k] > 0) { centroids[r][2 * k] = float(sm[k] / cnt[k]); centroids[r][2 * k + 1] = float(ss[k] / cnt[k]); }
+      }
+      cache[r].clear();
+    }
+  }
 
   static int preflop_index(int a, int b) {  // 169 classes: 13 pairs, 78 suited, 78 offsuit
     const int ra = a % 13, rb = b % 13, sa = a / 13, sb = b / 13;
@@ -2242,6 +2396,7 @@ struct Abstraction {
   template <class RNG>
   int bucket(int round, int c0, int c1, const int* board, RNG& rng) const {
     if (round == 0) return preflop_index(c0, c1);
+    if (table_mode) return table_buckets(round, board, rng)[combo_index(std::min(c0, c1), std::max(c0, c1))];
     return bucket_of(round, ehs(c0, c1, board, BOARD_CARDS_BY_STAGE[round], rng));
   }
 
@@ -2795,14 +2950,42 @@ PYBIND11_MODULE(headsup_cpp, m) {
 
   py::class_<TabularBlueprint>(m, "TabularBlueprint")
       .def(py::init<>())
-      .def("build", [](TabularBlueprint& b, const EngineConfig& cfg, int buckets, int samples) {
-        if (buckets < 1 || buckets > 65535 || samples < 1) throw std::runtime_error("bad buckets / samples");
+      .def("build", [](TabularBlueprint& b, const EngineConfig& cfg, int buckets, int samples, const std::string& mode, int completions) {
+        if (buckets < 1 || buckets > 65535 || samples < 1 || completions < 1) throw std::runtime_error("bad buckets / samples / completions");
+        if (mode != "mc" && mode != "table") throw std::runtime_error("abstraction mode must be 'mc' or 'table'");
         b.build(cfg, buckets, samples);
-      }, py::arg("cfg"), py::arg("buckets") = 200, py::arg("samples") = 500)
+        b.abs.table_mode = mode == "table";
+        b.abs.completions = completions;
+      }, py::arg("cfg"), py::arg("buckets") = 200, py::arg("samples") = 500, py::arg("mode") = "mc", py::arg("completions") = 300)
       .def("fit_abstraction", [](TabularBlueprint& b, int situations, uint64_t seed, int threads) {
         py::gil_scoped_release release;
-        b.abs.fit_edges(situations, seed, threads);
-      }, py::arg("situations") = 200000, py::arg("seed") = 0, py::arg("threads") = 16)
+        if (b.abs.table_mode) b.abs.fit_centroids(std::max(1, situations / NUM_COMBOS), seed, std::max(1, threads));
+        else b.abs.fit_edges(situations, seed, threads);
+      }, py::arg("situations") = 200000, py::arg("seed") = 0, py::arg("threads") = 16,
+         "mc: quantile edges from `situations` random (hand, board) pairs; table: k-means centroids from situations / 1326 random boards")
+      .def_property("centroids", [](const TabularBlueprint& b) { return b.abs.centroids; },
+                    [](TabularBlueprint& b, const std::vector<std::vector<float>>& c) {
+                      if (int(c.size()) != b.abs.rounds) throw std::runtime_error("centroids: one list per round");
+                      b.abs.centroids = c;
+                      for (auto& m : b.abs.cache) m.clear();
+                    })
+      .def_property_readonly("table_mode", [](const TabularBlueprint& b) { return b.abs.table_mode; })
+      .def_property_readonly("cache_sizes", [](const TabularBlueprint& b) {
+        std::vector<int> out;
+        for (auto& m : b.abs.cache) out.push_back(int(m.size()));
+        return out;
+      })
+      .def("features", [](const TabularBlueprint& b, int round, const std::vector<int>& board, uint64_t seed) {
+        std::mt19937_64 rng(seed);
+        int bd[5] = {0, 0, 0, 0, 0};
+        for (size_t i = 0; i < board.size() && i < 5; ++i) bd[i] = board[i];
+        std::vector<float> mean, sd;
+        b.abs.features_all(bd, BOARD_CARDS_BY_STAGE[round], rng, mean, sd);
+        py::array_t<float> out({ssize_t(NUM_COMBOS), ssize_t(2)});
+        auto o = out.mutable_unchecked<2>();
+        for (int h = 0; h < NUM_COMBOS; ++h) { o(h, 0) = mean[h]; o(h, 1) = sd[h]; }
+        return out;
+      }, py::arg("round"), py::arg("board"), py::arg("seed") = 0, "(1326, 2) (mean, std) equity features of every hand on the board")
       .def("set_params", [](TabularBlueprint& b, double prune_threshold, double regret_floor, long long prune_after,
                             long long lcfr_iterations, long long discount_interval, long long strategy_interval, double prune_prob,
                             bool dense_average) {
@@ -2812,7 +2995,7 @@ PYBIND11_MODULE(headsup_cpp, m) {
       }, py::arg("prune_threshold"), py::arg("regret_floor"), py::arg("prune_after"), py::arg("lcfr_iterations"),
          py::arg("discount_interval"), py::arg("strategy_interval") = 10000, py::arg("prune_prob") = 0.95, py::arg("dense_average") = true)
       .def("run", [](TabularBlueprint& b, long long iterations, uint64_t seed, int threads) {
-        if (b.abs.edges.empty() && b.cfg.num_rounds > 1) throw std::runtime_error("fit_abstraction first");
+        if (b.cfg.num_rounds > 1 && (b.abs.table_mode ? b.abs.centroids.empty() : b.abs.edges.empty())) throw std::runtime_error("fit_abstraction first");
         py::gil_scoped_release release;
         b.run(iterations, seed, threads);
       }, py::arg("iterations"), py::arg("seed") = 0, py::arg("threads") = 16)
@@ -2856,7 +3039,7 @@ PYBIND11_MODULE(headsup_cpp, m) {
         std::mt19937_64 rng(seed);
         std::vector<float> row(b.n_actions), all;
         const int nb = BOARD_CARDS_BY_STAGE[round];
-        const bool vector_path = round > 0 && n >= 64;  // many hands of one state: shared runouts for all combos
+        const bool vector_path = round > 0 && n >= 64 && !b.abs.table_mode;  // many hands of one state: shared runouts for all combos
         if (vector_path) b.abs.ehs_all(bd, nb, std::max(20, b.abs.samples / 12), rng, all);  // ~40 runouts x all opponents: noise ~ the per-hand MC of training
         for (int i = 0; i < n; ++i) {
           bool blocked = h(i, 0) == h(i, 1);
