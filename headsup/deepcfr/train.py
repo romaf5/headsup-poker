@@ -181,9 +181,14 @@ class DeepCFRTrainer:
         self.algo = args.algo
         self.use_deepcfr = self.algo in ("deepcfr", "both")
         self.use_sdcfr = self.algo in ("sdcfr", "both")
-        bet_sizes = parse_bet_sizes(args.bet_sizes)
-        mask = args.mask_redundant == "on" or (args.mask_redundant == "auto" and bet_sizes != ("min",))
-        self.game = GameConfig(raise_cap=args.raise_cap, bet_sizes=bet_sizes, mask_redundant=mask)
+        if args.game and args.game not in ("nlhe", "holdem"):  # limit presets (FHP / HULH)
+            from headsup.games.holdem import make_holdem
+
+            self.game = make_holdem(args.game)
+        else:
+            bet_sizes = parse_bet_sizes(args.bet_sizes)
+            mask = args.mask_redundant == "on" or (args.mask_redundant == "auto" and bet_sizes != ("min",))
+            self.game = GameConfig(raise_cap=args.raise_cap, bet_sizes=bet_sizes, mask_redundant=mask)
         self.model_config = normalize_config(
             dict(features=args.features, arch=args.net, cards=args.cards, dim=args.dim, rm_fallback=args.rm_fallback, game=self.game)
         )
@@ -211,7 +216,8 @@ class DeepCFRTrainer:
             f"network: features={cfg['features']} arch={cfg['arch']} cards={cfg['cards']} dim={cfg['dim']} "
             f"rm_fallback={cfg['rm_fallback']}  ({count_parameters(self.nets[0]):,} parameters, obs[{obs_dim}])"
         )
-        print(f"game: bet sizes {self.game.bet_sizes} ({num_actions} actions), raise cap {self.game.raise_cap}, "
+        print(f"game: {args.game} bet sizes {self.game.bet_sizes} ({num_actions} actions), raise cap(s) "
+              f"{self.game.raise_caps or self.game.raise_cap}, rounds {self.game.num_rounds}, all-in {self.game.all_in}, "
               f"mask redundant raises {self.game.mask_redundant}")
 
     # -- logging ---------------------------------------------------------------------
@@ -551,6 +557,8 @@ def build_parser():
     p.add_argument("--rm-fallback", default="uniform", choices=RM_FALLBACKS,
                    help="regret matching when no advantage is positive: uniform | argmax (DeepCFR paper)")
     # game (action tree; stored in the model config)
+    p.add_argument("--game", default="nlhe", choices=["nlhe", "fhp", "hulh"],
+                   help="nlhe: the no-limit abstraction below; fhp / hulh: the DeepCFR paper's limit games (blinds 50/100)")
     p.add_argument("--bet-sizes", default="min",
                    help="raise sizes between check/call and all-in: 'min' (call + 1 BB, the original game) and/or pot "
                         "fractions, e.g. '0.5,1,2' or 'min,1' (at most 5)")
@@ -601,6 +609,7 @@ def main(argv=None):
         game = GameConfig.from_dict(cfg["game"])
         args.bet_sizes, args.raise_cap = ",".join(str(s) for s in game.bet_sizes), game.raise_cap
         args.mask_redundant = "on" if game.mask_redundant else "off"
+        args.game = "fhp" if game.limit and game.num_rounds == 2 else "hulh" if game.limit else "nlhe"
     trainer = DeepCFRTrainer(args)
     if args.policy_only:
         trainer.load_checkpoint(args.policy_only)

@@ -10,8 +10,35 @@ from headsup.enums import Action
 from headsup.game import DEFAULT_GAME, GameConfig, action_label, parse_bet_sizes
 from headsup.model import BaseModel
 
+from headsup.game import FHP, HULH
+
 POT_GAME = GameConfig(bet_sizes=(0.5, 1.0, 2.0), mask_redundant=True)
 MIXED_GAME = GameConfig(bet_sizes=("min", 1.0), raise_cap=4, mask_redundant=True)
+
+
+def test_limit_games_fhp_hulh():
+    assert FHP.num_actions == 3 and FHP.all_in_action is None and FHP.num_rounds == 2 and FHP.cap(1) == 3
+    assert HULH.num_actions == 3 and HULH.limit == (100, 100, 200, 200) and HULH.cap(3) == 4
+    e = HeadsUpPoker(rng=np.random.default_rng(0), game=FHP)
+    e.reset()
+    assert e.bets == [50, 100] and e.raise_amount(2) == 150
+    for k in range(3):  # three raises are allowed per round ...
+        assert e.legal_mask()[2]
+        e.step(2)
+    assert not e.legal_mask()[2] and e.consecutive_raises == 3  # ... the fourth is not
+    e.step(1)
+    assert int(e.stage) == 1 and e.pot == 800 and len(e.visible_board) == 3
+    e.step(1)
+    e.step(1)  # check / check on the flop -> showdown on 5 cards
+    assert e.done and int(e.stage) == 4 and abs(e.rewards[0]) in (0, 400)
+    rng = np.random.default_rng(1)
+    for game in (FHP, HULH):
+        e = HeadsUpPoker(rng=rng, game=game)
+        for _ in range(300):
+            e.reset()
+            while not e.done:
+                e.step(int(rng.choice(np.flatnonzero(e.legal_mask()))))
+            assert sum(e.rewards) == 0 and e.folded >= 0 or abs(e.rewards[0]) <= 2 * sum(game.limit) * max(game.raise_caps) + game.big_blind
 
 
 def test_game_config_basics():
@@ -20,7 +47,7 @@ def test_game_config_basics():
     with pytest.raises(ValueError):
         parse_bet_sizes("0.25,0.5,0.75,1,2,3")
     g = POT_GAME
-    assert g.num_actions == 6 and g.all_in == 5 and g.is_raise(2) and g.is_raise(4) and not g.is_raise(5)
+    assert g.num_actions == 6 and g.all_in_action == 5 and g.is_raise(2) and g.is_raise(4) and not g.is_raise(5)
     assert DEFAULT_GAME.num_actions == 4 and DEFAULT_GAME.tree_dict() == {"bet_sizes": ["min"], "raise_cap": 3, "mask_redundant": False}
     assert GameConfig.from_dict(g.tree_dict()) == g and g.with_(stack_size=200).stack_size == 200
     # SB opens: pot 3, 1 to call: half pot = 1 + 2, pot = 1 + 4, 2x pot = 1 + 8; never below a min-raise
@@ -66,7 +93,7 @@ def test_engine_multi_size_invariants_and_masks_from_obs(game):
 
 
 @pytest.mark.skipif(not native.available(), reason="C++ extension not built")
-@pytest.mark.parametrize("game", [POT_GAME, MIXED_GAME])
+@pytest.mark.parametrize("game", [POT_GAME, MIXED_GAME, FHP, HULH])
 def test_cpp_engine_matches_python_engine_multi_size(game):
     cpp = native.module()
     rng = np.random.default_rng(5)
@@ -80,7 +107,7 @@ def test_cpp_engine_matches_python_engine_multi_size(game):
             assert py.current == ce.current
             np.testing.assert_array_equal(o_py, ce.observation())
             assert list(ce.legal_mask()) == py.legal_mask()
-            for a in range(2, game.all_in):
+            for a in range(2, 2 + game.num_raises):
                 assert ce.raise_amount(a) == py.raise_amount(a)
             a = int(rng.integers(game.num_actions))  # illegal actions are executed as their duplicates by both
             o_py, r_py, d_py, _ = py.step(a)

@@ -80,7 +80,8 @@ class HeadsUpPoker:
         self.big_blind = self.game.big_blind
         self.raise_cap = self.game.raise_cap
         self.num_actions = self.game.num_actions
-        self.all_in = self.game.all_in
+        self.all_in = self.game.all_in_action  # index of the all-in action, or None (limit games)
+        self.num_rounds = self.game.num_rounds
         self.rng = rng if rng is not None else np.random.default_rng()
         self.dealer = 0
         self.hands_played = 0
@@ -157,16 +158,16 @@ class HeadsUpPoker:
         return self.to_call > 0
 
     def raise_amount(self, action):
-        """Chips the current player puts in for raise ``action`` (2 .. all_in-1), capped by the stack."""
-        return self.game.raise_amount(action, self.to_call, self.pot, self.stacks[self.current])
+        """Chips the current player puts in for raise ``action`` (2 .. 2+K-1), capped by the stack."""
+        return self.game.raise_amount(action, self.to_call, self.pot, self.stacks[self.current], int(self.stage))
 
     def legal_mask(self):
         """bool per action (see :meth:`GameConfig.legal_mask`)."""
-        return self.game.legal_mask(self.to_call, self.pot, self.stacks[self.current], self.consecutive_raises)
+        return self.game.legal_mask(self.to_call, self.pot, self.stacks[self.current], self.consecutive_raises, round_index=int(self.stage))
 
     def legal_mask_and_twins(self):
         """(mask, twins): ``twins[a]`` is the action a redundant ``a`` duplicates (else ``a``)."""
-        return self.game.legal_mask(self.to_call, self.pot, self.stacks[self.current], self.consecutive_raises, with_twins=True)
+        return self.game.legal_mask(self.to_call, self.pot, self.stacks[self.current], self.consecutive_raises, with_twins=True, round_index=int(self.stage))
 
     def legal_actions(self):
         return [a for a, ok in enumerate(self.legal_mask()) if ok]
@@ -236,8 +237,12 @@ class HeadsUpPoker:
         if self.game.is_raise(action):
             raise_amount = self.raise_amount(action)
             self.consecutive_raises += 1
-            if self.consecutive_raises >= self.raise_cap:
-                action = self.all_in
+            cap = self.game.cap(int(self.stage))
+            if self.all_in is not None and self.consecutive_raises >= cap:
+                action = self.all_in  # no-limit: the cap-th raise in a row becomes an all-in
+            elif self.all_in is None and self.consecutive_raises > cap:
+                self.consecutive_raises -= 1  # limit: no raise past the cap - executed as a call
+                action = Action.CHECK_CALL
         else:
             self.consecutive_raises = 0
 
@@ -251,7 +256,7 @@ class HeadsUpPoker:
 
         if action == Action.CHECK_CALL:
             amount = min(self.stage_bets[o] - self.stage_bets[p], self.stacks[p])
-        elif action == self.all_in:
+        elif self.all_in is not None and action == self.all_in:
             amount = self.stacks[p]
         else:  # RAISE_k
             amount = raise_amount
@@ -265,7 +270,7 @@ class HeadsUpPoker:
         self.current = o
 
         if self._street_finished():
-            if self.stage == Stage.RIVER or min(self.stacks) == 0:
+            if int(self.stage) == self.num_rounds - 1 or min(self.stacks) == 0:
                 self._showdown()
                 return self.observation(p), self.rewards, True, {}
             self._next_street()
@@ -296,9 +301,11 @@ class HeadsUpPoker:
         self.current = 1 - self.dealer  # big blind acts first post-flop
 
     def _showdown(self):
+        # showdown on the board of the game's last betting round (all-ins run the board out; FHP: 3 cards)
+        board = self.board[: BOARD_CARDS_BY_STAGE[self.num_rounds - 1]]
         self.stage = Stage.END
-        s0 = hand_strength(self.hands[0], self.board)
-        s1 = hand_strength(self.hands[1], self.board)
+        s0 = hand_strength(self.hands[0], board)
+        s1 = hand_strength(self.hands[1], board)
         won = min(self.bets)  # excess of an uncalled all-in is returned
         if s0 == s1:
             self.rewards = [0, 0]
@@ -331,7 +338,7 @@ def play_interactive():
     while True:
         print(engine.describe())
         try:
-            action = int(input(f"action (0 fold, 1 check/call, 2.. raise sizes {engine.game.bet_sizes}, {engine.all_in} all-in, q quit): "))
+            action = int(input(f"action (0 fold, 1 check/call, 2.. raise sizes {engine.game.bet_sizes}, all-in {engine.all_in}, q quit): "))
         except ValueError:
             break
         _, rewards, done, _ = engine.step(action)

@@ -55,8 +55,12 @@ def engine_config(stack_size=100, small_blind=1, big_blind=2, raise_cap=3, bet_s
     cfg.small_blind = game.small_blind
     cfg.big_blind = game.big_blind
     cfg.raise_cap = game.raise_cap
-    cfg.bet_sizes = [-1.0 if s == "min" else float(s) for s in game.bet_sizes]
+    cfg.bet_sizes = [-1.0 if s == "min" else -2.0 if s == "limit" else float(s) for s in game.bet_sizes]
     cfg.mask_redundant = bool(game.mask_redundant)
+    cfg.limit = list(game.limit) if game.limit else []
+    cfg.raise_caps = list(game.raise_caps) if game.raise_caps else []
+    cfg.num_rounds = int(game.num_rounds)
+    cfg.has_all_in = bool(game.all_in)
     return cfg
 
 

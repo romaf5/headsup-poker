@@ -9,7 +9,7 @@ _REGISTRY = {"leduc": Leduc, "kuhn": Kuhn}
 def make_game(name, **kwargs):
     if name in _REGISTRY:
         return _REGISTRY[name](**kwargs)
-    if name in ("holdem", "nlhe", "fhp", "hulh"):
+    if name in ("holdem", "nlhe", "fhp", "hulh"):  # GameConfig presets for the hold'em engine
         from headsup.games.holdem import make_holdem
 
         return make_holdem(name, **kwargs)

@@ -83,17 +83,41 @@ int eval7(const int* cards7) {
   return best;
 }
 
+// best 5-card hand of n = 5..7 cards (treys-compatible), for games that show down on fewer board cards
+int eval_best(const int* cards, int n) {
+  if (n == 7) return eval7(cards);
+  uint32_t c[7];
+  for (int i = 0; i < n; ++i) c[i] = treys_card(cards[i]);
+  if (n == 5) return eval5(c[0], c[1], c[2], c[3], c[4]);
+  int best = 7462;  // n == 6: leave one out
+  for (int skip = 0; skip < 6; ++skip) {
+    uint32_t h[5];
+    int k = 0;
+    for (int i = 0; i < 6; ++i)
+      if (i != skip) h[k++] = c[i];
+    best = std::min(best, eval5(h[0], h[1], h[2], h[3], h[4]));
+  }
+  return best;
+}
+
 // ------------------------------------------------------------------ engine
 struct EngineConfig {
   int stack_size = 100;
   int small_blind = 1;
   int big_blind = 2;
   int raise_cap = 3;
-  std::vector<double> bet_sizes = {-1.0};  // -1 = "min" (call + big blind), else fraction of the pot after calling
+  std::vector<double> bet_sizes = {-1.0};  // -1 = "min" (call + big blind), -2 = limit increment, else pot fraction
   bool mask_redundant = false;             // hide raises that duplicate another action (see headsup/game.py)
-  int num_actions() const { return int(bet_sizes.size()) + 3; }
-  int all_in() const { return num_actions() - 1; }
-  bool is_raise(int a) const { return a >= 2 && a < all_in(); }
+  std::vector<int> limit;                  // limit poker: fixed raise increment per round (empty = no-limit sizes)
+  std::vector<int> raise_caps;             // per-round raise caps (empty: raise_cap for every round)
+  int num_rounds = 4;                      // betting rounds; the showdown uses the board of the last one
+  bool has_all_in = true;                  // whether the ALL_IN action exists (limit games: no)
+  int num_raises() const { return int(bet_sizes.size()); }
+  int num_actions() const { return 2 + num_raises() + (has_all_in ? 1 : 0); }
+  int all_in() const { return has_all_in ? 2 + num_raises() : -1; }
+  bool is_raise(int a) const { return a >= 2 && a < 2 + num_raises(); }
+  int cap(int round) const { return raise_caps.empty() ? raise_cap : raise_caps[round]; }
+  int showdown_cards() const { return BOARD_CARDS_BY_STAGE[num_rounds - 1]; }
 };
 
 struct Engine {
@@ -206,9 +230,10 @@ struct Engine {
 
   void showdown() {
     stage = END;
+    const int nb = cfg.showdown_cards();
     int c0[7] = {hands[0][0], hands[0][1], board[0], board[1], board[2], board[3], board[4]};
     int c1[7] = {hands[1][0], hands[1][1], board[0], board[1], board[2], board[3], board[4]};
-    const int s0 = eval7(c0), s1 = eval7(c1);
+    const int s0 = eval_best(c0, 2 + nb), s1 = eval_best(c1, 2 + nb);
     const int won = std::min(bets[0], bets[1]);
     if (s0 == s1) {
       rewards[0] = rewards[1] = 0;
@@ -227,10 +252,11 @@ struct Engine {
   int to_call() const { return stage_bets[1 - current] - stage_bets[current]; }
   int num_actions() const { return cfg.num_actions(); }
 
-  // chips the current player puts in for raise action a (2 .. all_in-1), capped by the stack
+  // chips the current player puts in for raise action a (2 .. 2+K-1), capped by the stack
   int raise_amount(int a) const {
     const int call = to_call(), stack = stacks[current];
     const double size = cfg.bet_sizes[a - 2];
+    if (size == -2.0) return std::min(call + cfg.limit[stage], stack);  // limit: fixed increment per round
     const int min_raise = call + cfg.big_blind;
     int amount = min_raise;
     if (size >= 0) amount = std::max(min_raise, call + int(std::lround(size * double(pot + call))));
@@ -239,25 +265,28 @@ struct Engine {
 
   // mask[a] = the action is meaningful here; twin[a] = the action a redundant one duplicates (else a)
   void legal_mask(bool* mask, int* twin = nullptr) const {
-    const int n = num_actions(), ai = cfg.all_in();
+    const int n = num_actions(), ai = cfg.all_in(), nr = 2 + cfg.num_raises();
     for (int a = 0; a < n; ++a) {
       mask[a] = a != FOLD || fold_allowed();
       if (twin) twin[a] = a;
     }
     if (twin && !fold_allowed()) twin[FOLD] = CHECK_CALL;
-    if (!cfg.mask_redundant) return;
-    const int stack = stacks[current];
+    if (!cfg.mask_redundant && cfg.has_all_in) return;
+    const int stack = stacks[current], call = to_call();
+    // no-limit: the cap-th raise in a row is executed as an all-in; limit: no raise past the cap
+    const bool capped = cfg.has_all_in ? consecutive_raises + 1 >= cfg.cap(stage) : consecutive_raises >= cfg.cap(stage);
+    const int collapse = cfg.has_all_in ? ai : CHECK_CALL;
     int amounts[MAX_ACTIONS];
-    for (int a = 2; a < ai; ++a) {
+    for (int a = 2; a < nr; ++a) {
       const int amount = raise_amount(a);
       amounts[a] = amount;
       int dup = -1;
       for (int b = 2; b < a; ++b)
         if (amounts[b] == amount) { dup = b; break; }
-      if (amount >= stack || consecutive_raises + 1 >= cfg.raise_cap) {
+      if (capped || (amount >= stack && cfg.has_all_in) || stack <= call) {
         mask[a] = false;
-        if (twin) twin[a] = ai;
-      } else if (dup >= 0) {
+        if (twin) twin[a] = collapse;
+      } else if (cfg.mask_redundant && dup >= 0) {
         mask[a] = false;
         if (twin) twin[a] = twin[dup];
       }
@@ -271,7 +300,14 @@ struct Engine {
     int amount = 0;
     if (cfg.is_raise(action)) {
       amount = raise_amount(action);
-      if (++consecutive_raises >= cfg.raise_cap) action = ai;
+      ++consecutive_raises;
+      const int cap = cfg.cap(stage);
+      if (cfg.has_all_in && consecutive_raises >= cap) {
+        action = ai;  // no-limit: the cap-th raise in a row becomes an all-in
+      } else if (!cfg.has_all_in && consecutive_raises > cap) {
+        --consecutive_raises;  // limit: no raise past the cap - executed as a call
+        action = CHECK_CALL;
+      }
     } else {
       consecutive_raises = 0;
     }
@@ -285,7 +321,7 @@ struct Engine {
     }
     if (action == CHECK_CALL)
       amount = std::min(stage_bets[o] - stage_bets[p], stacks[p]);
-    else if (action == ai)
+    else if (cfg.has_all_in && action == ai)
       amount = stacks[p];
     record(amount);
     bets[p] += amount;
@@ -295,7 +331,7 @@ struct Engine {
     acted |= 1 << p;
     current = o;
     if (street_finished()) {
-      if (stage == RIVER || std::min(stacks[0], stacks[1]) == 0) {
+      if (stage == cfg.num_rounds - 1 || std::min(stacks[0], stacks[1]) == 0) {
         showdown();
         return true;
       }
@@ -497,7 +533,8 @@ std::shared_ptr<Model> model_from_dict(const py::dict& d) {
   m->num_actions = 4;
   if (cfg.contains("game")) {
     py::dict game = cfg["game"].cast<py::dict>();
-    m->num_actions = int(py::len(game["bet_sizes"])) + 3;
+    const bool all_in = !game.contains("all_in") || game["all_in"].is_none() || game["all_in"].cast<bool>();
+    m->num_actions = int(py::len(game["bet_sizes"])) + 2 + (all_in ? 1 : 0);
   }
   if (m->num_actions < 3 || m->num_actions > MAX_ACTIONS) throw std::runtime_error("unsupported number of actions");
   m->obs_dim = m->features == AGGREGATED ? OBS_DIM_AGGREGATED : OBS_DIM_HISTORY;
@@ -733,7 +770,7 @@ struct VecEnv {
       case CALL:
         return CHECK_CALL;
       case ALLIN:
-        return e.cfg.all_in();
+        return e.cfg.has_all_in ? e.cfg.all_in() : e.cfg.num_actions() - 1;
       case RAISE_:
         return RAISE;
       case MODEL: {
@@ -1146,10 +1183,11 @@ struct SubgameSolver {
 
   float terminal_value(const SubgameNode& nd) {
     if (nd.kind == 1) return nd.folder == traverser ? -float(nd.stake) : float(nd.stake);
-    // showdown on the (sampled) full board
+    // showdown on the (sampled) board of the game's last round
     int c0[7] = {hand[0][0], hand[0][1], board[0], board[1], board[2], board[3], board[4]};
     int c1[7] = {hand[1][0], hand[1][1], board[0], board[1], board[2], board[3], board[4]};
-    const int s0 = eval7(c0), s1 = eval7(c1);
+    const int nb = nodes[0].state.cfg.showdown_cards();
+    const int s0 = eval_best(c0, 2 + nb), s1 = eval_best(c1, 2 + nb);
     if (s0 == s1) return 0.0f;
     const int winner = s0 < s1 ? 0 : 1;
     return winner == traverser ? float(nd.stake) : -float(nd.stake);
@@ -1217,7 +1255,7 @@ struct SubgameSolver {
         for (int s = 0; s < 2; ++s) { used[hand[s][0]] = true; used[hand[s][1]] = true; }
         const Engine& root = nodes[0].state;
         for (int i = 0; i < known_board; ++i) { board[i] = root.board[i]; used[board[i]] = true; }
-        for (int i = known_board; i < 5; ++i) {
+        for (int i = known_board; i < 5; ++i) {  // deal the rest (only the last round's cards matter)
           std::uniform_int_distribution<int> d(0, NUM_CARDS - 1);
           int c;
           do { c = d(rng); } while (used[c]);
@@ -1298,13 +1336,14 @@ struct RiverSolver {
   std::vector<double> mass_buf, sd_buf;
 
   void build(const Engine& root) {
-    if (root.stage != RIVER) throw std::runtime_error("RiverSolver needs a river state");
+    if (root.stage != root.cfg.num_rounds - 1) throw std::runtime_error("RiverSolver needs a state in the game's last betting round");
     tree.build(root);
     n_actions = tree.n_actions;
-    // strengths on the (complete) board
+    // strengths on the (complete) board of the last round
+    const int nb = root.cfg.showdown_cards();
     strength.assign(NUM_COMBOS, INT32_MAX);
     bool onboard[NUM_CARDS] = {};
-    for (int i = 0; i < 5; ++i) onboard[root.board[i]] = true;
+    for (int i = 0; i < nb; ++i) onboard[root.board[i]] = true;
     order.clear();
     card_order.assign(NUM_CARDS, {});
     for (int a = 0; a < NUM_CARDS; ++a)
@@ -1312,7 +1351,7 @@ struct RiverSolver {
         if (onboard[a] || onboard[b]) continue;
         int c7[7] = {a, b, root.board[0], root.board[1], root.board[2], root.board[3], root.board[4]};
         const int h = combo_index(a, b);
-        strength[h] = eval7(c7);
+        strength[h] = eval_best(c7, 2 + nb);
         order.push_back(h);
         card_order[a].push_back(h);
         card_order[b].push_back(h);
@@ -1572,8 +1611,8 @@ PYBIND11_MODULE(headsup_cpp, m) {
   m.def("bench_eval7", &bench_eval7);
   m.def("bench_forward", [](const Model& mm, int n) { return bench_forward(mm, n); });
   m.def("eval7", [](std::vector<int> cards) {
-    if (cards.size() != 7) throw std::runtime_error("need 7 cards");
-    return eval7(cards.data());
+    if (cards.size() < 5 || cards.size() > 7) throw std::runtime_error("need 5..7 cards");
+    return eval_best(cards.data(), int(cards.size()));
   });
 
   py::class_<EngineConfig>(m, "EngineConfig")
@@ -1584,6 +1623,10 @@ PYBIND11_MODULE(headsup_cpp, m) {
       .def_readwrite("raise_cap", &EngineConfig::raise_cap)
       .def_readwrite("bet_sizes", &EngineConfig::bet_sizes)
       .def_readwrite("mask_redundant", &EngineConfig::mask_redundant)
+      .def_readwrite("limit", &EngineConfig::limit)
+      .def_readwrite("raise_caps", &EngineConfig::raise_caps)
+      .def_readwrite("num_rounds", &EngineConfig::num_rounds)
+      .def_readwrite("has_all_in", &EngineConfig::has_all_in)
       .def_property_readonly("num_actions", &EngineConfig::num_actions);
 
   py::class_<Engine>(m, "Engine")

@@ -41,10 +41,10 @@ def actions_for_amount(engine, amount):
         return [int(Action.FOLD)]
     out = []
     capped = engine.consecutive_raises + 1 >= engine.raise_cap
-    for a in range(2, engine.all_in):
-        if engine.raise_amount(a) == amount or (capped and amount == stack):
+    for a in range(2, 2 + engine.game.num_raises):
+        if engine.raise_amount(a) == amount or (capped and amount == stack and engine.all_in is not None):
             out.append(a)
-    if amount == stack:
+    if amount == stack and engine.all_in is not None:
         out.append(engine.all_in)
     return out
 

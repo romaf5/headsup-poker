@@ -57,9 +57,11 @@ class AlwaysCallPlayer(_FixedActionPlayer):
 
 
 class AlwaysAllInPlayer(_FixedActionPlayer):
+    """All-in when the game has one, else the (last) raise."""
+
     @staticmethod
     def _action(game):
-        return game.all_in
+        return game.all_in_action if game.all_in else game.num_actions - 1
 
 
 class AlwaysRaisePlayer(_FixedActionPlayer):

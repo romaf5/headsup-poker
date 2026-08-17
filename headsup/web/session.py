@@ -53,7 +53,11 @@ def parse_action(value, game=DEFAULT_GAME):
     if key not in ACTION_ALIASES:
         raise ValueError(f"unknown action {value!r}")
     a = ACTION_ALIASES[key]
-    return game.all_in if a == "allin" else a
+    if a == "allin":
+        if game.all_in_action is None:
+            raise ValueError("this game has no all-in action")
+        return game.all_in_action
+    return a
 
 
 def size_label(size):
