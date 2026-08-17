@@ -865,6 +865,15 @@ inline int combo_index(int a, int b) {  // a < b
   return a * NUM_CARDS - a * (a + 1) / 2 + (b - a - 1);
 }
 
+struct ComboCards {  // inverse of combo_index
+  uint8_t a[NUM_COMBOS], b[NUM_COMBOS];
+  ComboCards() {
+    for (int x = 0; x < NUM_CARDS; ++x)
+      for (int y = x + 1; y < NUM_CARDS; ++y) { a[combo_index(x, y)] = uint8_t(x); b[combo_index(x, y)] = uint8_t(y); }
+  }
+};
+static const ComboCards COMBO_CARDS;
+
 // equity[h] = P(win) + P(tie)/2 of hole cards (c0, c1) against opponent combo h on `board`
 // (0..5 known cards, the rest dealt uniformly: every runout when there are at most `max_exact`
 // of them, otherwise `samples` Monte-Carlo runouts).  Combos that overlap the hero's cards or
@@ -1109,16 +1118,8 @@ struct SubgameSolver {
   }
 
   static void combo_cards(int h, int& a, int& b) {  // inverse of combo_index (a < b), tabulated
-    struct Table {
-      uint8_t ca[NUM_COMBOS], cb[NUM_COMBOS];
-      Table() {
-        for (int x = 0; x < NUM_CARDS; ++x)
-          for (int y = x + 1; y < NUM_CARDS; ++y) { ca[combo_index(x, y)] = uint8_t(x); cb[combo_index(x, y)] = uint8_t(y); }
-      }
-    };
-    static const Table t;
-    a = t.ca[h];
-    b = t.cb[h];
+    a = COMBO_CARDS.a[h];
+    b = COMBO_CARDS.b[h];
   }
 
   // -- one traversal ----------------------------------------------------------------
@@ -1399,7 +1400,9 @@ struct BoardTable {  // strengths and strength-sorted combo orders of one comple
   void showdown_values(const std::vector<double>& reach, std::vector<double>& out) const {
     for (int h = 0; h < NUM_COMBOS; ++h) out[h] = 0.0;
     const size_t n = order.size();
-    std::vector<double> stronger(NUM_COMBOS, 0.0), weaker(NUM_COMBOS, 0.0);
+    thread_local std::vector<double> stronger, weaker;
+    stronger.assign(NUM_COMBOS, 0.0);
+    weaker.assign(NUM_COMBOS, 0.0);
     double total = 0.0;
     for (int h : order) total += reach[h];
     double cum = 0.0;
@@ -1679,6 +1682,12 @@ struct VectorSolver {
   void values(int node, int p, const std::vector<double>& reach_p, const std::vector<double>& reach_q,
               std::vector<double>& out, bool update, Pass& ps, size_t depth) {
     const SubgameNode& nd = nodes[node];
+    bool any = false;  // nobody gets here: nothing to evaluate or accumulate (exact pruning; skipping on the
+    for (int h = 0; h < NUM_COMBOS && !any; ++h) any = reach_q[h] != 0.0 || reach_p[h] != 0.0;  // opponent's reach
+    if (!any) {                                                                                  // alone would bias the averages)
+      for (int h = 0; h < NUM_COMBOS; ++h) out[h] = 0.0;
+      return;
+    }
     if (nd.kind == 1) {
       BoardTable::opponent_mass(reach_q, out);
       const double sign = nd.folder == p ? -1.0 : 1.0;
@@ -2159,6 +2168,14 @@ PYBIND11_MODULE(headsup_cpp, m) {
         return std::vector<int>(b.begin(), b.end());
       }, py::arg("round"), py::arg("drawn"))
       .def("child", &VectorSolver::child)
+      .def("node_player", [](const VectorSolver& sv, int node) {
+        if (node < 0 || node >= int(sv.nodes.size())) throw std::runtime_error("bad node");
+        return sv.nodes[node].kind == 0 ? sv.nodes[node].player : -1;
+      })
+      .def("node_round", [](const VectorSolver& sv, int node) {
+        if (node < 0 || node >= int(sv.nodes.size())) throw std::runtime_error("bad node");
+        return sv.node_round[node];
+      })
       .def("tree", [](const VectorSolver& sv) {
         py::list out;
         for (size_t i = 0; i < sv.nodes.size(); ++i) {

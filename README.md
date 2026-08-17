@@ -186,9 +186,9 @@ weaker, so the bound stays valid; T = 300 iterates cost ~4 ms per iterate per 64
 The trainer logs `lbr/current_strategy`, `lbr/sdcfr` (and, at the end, `lbr_final/*` incl. the
 policy net) — LBR's chips/hand, lower is better.
 
-## Real-time search (depth-limited subgame solving)
+## Real-time search (subgame solving)
 
-`headsup/search.py` + `headsup_cpp.SubgameSolver` / `RiverSolver` implement search at play time
+`headsup/search.py` + `headsup_cpp.SubgameSolver` / `VectorSolver` implement search at play time
 the way Libratus / Modicum / Pluribus do it: at every decision the game from the current public
 state is re-solved with CFR ("unsafe subgame solving", Brown & Sandholm 2017), the root dealing
 both players' hands from their ranges — the opponent's reach under the blueprint, the hero's under
@@ -219,6 +219,33 @@ iterations. Player spec:
 The public state (bet history) is rebuilt from the observation (`headsup/public.py`), so the
 search player works everywhere a player does (envs, UI, LBR, PPO exploiters). A decision costs
 ~1–2 s pre-river at 20k iterations (tables are solved in parallel threads) and ~0.5 s on the river.
+
+### Pluribus mode (`@pluribus`)
+
+`search:<blueprint>@pluribus[@it<N>][@b<buckets>][@th<threads>][@avg][@pfsearch]` reproduces the
+heads-up case of Pluribus's search (Brown & Sandholm 2019, supplementary material): the
+blueprint plays the first betting round; from the flop on every decision re-solves the **whole
+remaining game** from the **start of the current betting round** ("nested unsafe search": the
+opponent may have changed strategy anywhere in the round, the hero's own actions already taken
+in the round are frozen for its real hand only), plays the **final iterate's** strategy (`@avg`
+for the average) and, when the round ends, updates both players' ranges by Bayes' rule with the
+solve's average strategy. The solver (`headsup_cpp.VectorSolver`) is Pluribus's "vector-based
+Linear CFR sampling one set of board cards per thread": all 1326 hands of both players at every
+public node, one sampled board per iteration and thread (public chance sampling — hands blocked
+by a newly dealt card leave the reach vectors at that street, only hands compatible with the
+sampled board are updated, an unbiased estimate), lossless (per-hand) infosets in the current
+round and `buckets` (500) equity buckets per later round, threads sharing the tables. On the
+river it is the exact full-width solver of the depth-limited mode. Verified by exact best
+responses on turn subgames (all 48 rivers enumerated) and sampled-board best responses on flop
+subgames (`tests/test_vector_solver.py`, `headsup/algos/holdem_br.py`): the solved flop
+subgame is ~10× less exploitable than uniform play after 300 iterations, ~2 s with 16 threads
+(1 675 public nodes); turn / river solves take well under a second. Deviations from Pluribus:
+our buckets are equal-width bins of the hand's equity against a uniform range (Pluribus:
+k-means over equity distributions), the blueprint is a neural DeepCFR / SD-CFR strategy
+rather than a tabular MCCFR one, no action translation (the abstraction is played as is), and
+depth-limited search with the four biased continuation strategies is only relevant pre-flop
+(heads-up Pluribus solves to the end of the game from the flop), where we play the blueprint
+(`@pfsearch` uses the depth-limited solver instead).
 
 **About the old "500 mbb/g".** The original `poker_env.py` (used for the exploiter) had no
 raise cap while the DeepCFR training env converted the 3rd consecutive raise into an all-in,
@@ -255,8 +282,11 @@ headsup/deepcfr/         memory.py (reservoir), traverse.py, train.py, evaluate.
 headsup/sdcfr.py         Single Deep CFR: iterate bank + average-strategy player (exact / trajectory sampling)
 headsup/compare.py       head-to-head comparison CLI;  headsup/exploit.py: multi-seed PPO exploitability CLI
 headsup/lbr.py           Local Best Response (range tracking, equity vs range, one-street lookahead) CLI
-headsup/search.py        real-time search player (subgame re-solving; C++ SubgameSolver / RiverSolver), exploitability check
+headsup/search.py        real-time search player (depth-limited MCCFR / Pluribus-style full-game vector solves), exploitability check
 headsup/public.py        rebuild the public state (engine replay) from an observation
+headsup/games/           game interface for the generic algorithms: Kuhn, Leduc (leduc.py), hold'em presets (holdem.py: nlhe / fhp / hulh)
+headsup/algos/           tabular CFR / CFR+ / DCFR / PCFR+ / LCFR / MCCFR (tabular.py), exact best response (best_response.py),
+                         DeepCFR / SD-CFR / DREAM / ESCHER on small games (deep.py), hold'em exploitability estimator (holdem_br.py)
 headsup/web/             browser table: server.py (http.server), session.py (game logic), static/ (HTML/CSS/JS)
 headsup/rl/              rl_games registration (env.py), exploiter CLI (exploitability.py), ONNX export (onnx.py)
 models/                  deepcfr_policy.pth, rl_games_exploiter.onnx
@@ -286,6 +316,14 @@ with highest counterfactual regret with probability 1", ~50 % lower exploitabili
 in their Fig. 4), and its hyperparameters (K = 10 000 traversals, batch 10 000, 4 000 SGD
 steps, 40 M memories; SD-CFR: average-strategy net 20 000 updates × 20 480, cards as
 concatenated one-hot vectors, 300 000 traversals per iteration for 5-FHP).
+
+**Pluribus** (Brown & Sandholm 2019, heads-up case): nested unsafe search from the start of
+the betting round with the hero's actions frozen for its real hand, full remaining-game solves
+from the flop on with vector-form Linear CFR sampling one board per thread and iteration,
+lossless current-round / bucketed later-round infosets, final-iterate play, Bayes updates
+with the average strategy at round ends (`@pluribus`, see the search section); the blueprint's
+Linear MCCFR with negative-regret pruning is in `headsup/algos/tabular.py`
+(`MCCFR(..., prune_threshold=...)`) for the small games — the hold'em blueprint here is DeepCFR / SD-CFR.
 
 **Deviations** (design choices for this game): the default bet features are 8 aggregated
 numbers (a mild imperfect-recall abstraction; the paper-faithful history is one flag away);

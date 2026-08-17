@@ -22,8 +22,18 @@ exploitability in well under a second.  Both solvers are C++ (``headsup_cpp.Subg
 ``VectorSolver``); ``exploitability`` computes the exact best response of both players against
 the solved strategies on river subgames - the correctness check.
 
+Pluribus mode (``@pluribus``; Brown & Sandholm 2019, *Superhuman AI for multiplayer poker*,
+supplementary material): the blueprint plays the first betting round; from the flop on every
+decision re-solves the *whole remaining game* from the start of the current betting round
+(``VectorSolver``: vector-form Linear CFR with public chance sampling, lossless hands in the
+current round, ``buckets`` equity buckets on later rounds), the hero's actions already taken
+in the round frozen for its real hand only, playing the final iterate's strategy; the ranges
+at the start of a round come from Bayes' rule with the previous round's solve (its average
+strategy, for both players - "nested unsafe search"), preflop with the blueprint.
+
 Player spec: ``search:<blueprint spec>[@it<N>][@rit<N>][@rv<variant>][@focus<f>][@cont<policy|iterate|bank>][@thin<K>]``,
-e.g. ``search:cfr:runs/x/policy.pth@it20000@rit200``.
+e.g. ``search:cfr:runs/x/policy.pth@it20000@rit200``; Pluribus mode
+``search:<blueprint>@pluribus[@it<N>][@b<buckets>][@th<threads>][@avg][@pfsearch]``.
 """
 
 import time
@@ -186,14 +196,22 @@ class SearchPlayer:
 
     wants_ids = True
 
-    def __init__(self, blueprint, iterations=20_000, focus=0.5, continuation=None, thin=8, device=None, seed=0,
-                 workers=None, game=None, river_iterations=200, river_variant="dcfr", warm_start=5000):
+    def __init__(self, blueprint, iterations=None, focus=0.5, continuation=None, thin=8, device=None, seed=0,
+                 workers=None, game=None, river_iterations=200, river_variant="dcfr", warm_start=5000,
+                 mode="depth", buckets=500, threads=4, play="final", preflop="blueprint"):
         from headsup import native
         from headsup.lbr import _model_for
         from headsup.players import make_player
 
+        if mode not in ("depth", "pluribus"):
+            raise ValueError("mode must be 'depth' or 'pluribus'")
         self.spec = blueprint
-        self.iterations, self.focus = int(iterations), float(focus)
+        self.mode = mode
+        self.buckets, self.threads, self.play, self.preflop = int(buckets), int(threads), play, preflop
+        # depth mode: sampled MCCFR iterations (20k, ~0.2 s); Pluribus mode: vector iterations of the
+        # whole remaining game (500: ~2-3 s on the flop with 16 threads, well under a second later)
+        self.iterations = int(iterations) if iterations is not None else (20_000 if mode == "depth" else 500)
+        self.focus = float(focus)
         self.river_iterations, self.river_variant = int(river_iterations), river_variant
         self.warm_start = int(warm_start)  # equivalent iterations of the previous solve's regrets to start from (0 = off)
         self.model = _model_for(blueprint, device, seed + 1, model_iterates=thin, game=game)  # models the opponent
@@ -201,7 +219,7 @@ class SearchPlayer:
         self.game = getattr(self.model, "game", None) or make_player(blueprint, device=device, seed=seed).game
         kind = continuation or ("policy" if blueprint.split(":")[0] in ("cfr", "policy", "torch") else "iterate")
         self.continuation = kind
-        self.conts = _continuations(blueprint, device, kind, thin)
+        self.conts = _continuations(blueprint, device, kind, thin) if (mode == "depth" or preflop == "search") else None
         self._cpp = native.module()
         self._cfg = native.engine_config(game=self.game)
         self.rng = np.random.default_rng(seed)
@@ -209,6 +227,7 @@ class SearchPlayer:
         self.state = {}  # table id -> dict(villain, hero, processed, last_root)
         self.last_probs = None
         self.solve_time = 0.0
+        self.solves = 0
 
     # ------------------------------------------------------------------ per-table bookkeeping
     def _fresh(self, obs):
@@ -218,7 +237,7 @@ class SearchPlayer:
         villain = valid_combos(mine).astype(np.float64)
         hero = np.ones(NUM_COMBOS)
         return {"villain": villain, "hero": hero, "processed": 0, "last_root": None, "last_action": None, "cards": tuple(mine),
-                "solver": None, "solver_actions": None}
+                "solver": None, "solver_actions": None, "solver_round": -1}
 
     @staticmethod
     def _n_actions(obs):
@@ -237,29 +256,67 @@ class SearchPlayer:
         actions, pending, hero_pending = [], [], []
         counter = [0]
 
+        rounds = []
+
         def on_action(engine, seat, action):
             i = counter[0]
             counter[0] += 1
             actions.append(action)
+            rounds.append(int(engine.stage))
             if i < st["processed"]:
                 return
             if seat != int(obs_row[22]):  # villain decision: needs the blueprint's strategy for every hand
-                pending.append((engine.observation(seat), engine.clone(), action))
+                pending.append((engine.observation(seat), engine.clone(), action, i))
             else:  # hero decision taken by us (or by someone else: fall back to the blueprint)
-                hero_pending.append((engine.observation(seat), engine.clone(), action))
+                hero_pending.append((engine.observation(seat), engine.clone(), action, i))
 
         engine, hero = replay_from_obs(obs_row, self.game, on_action=on_action)
+        st["rounds"] = rounds
         return engine, hero, actions, pending, hero_pending, st
 
+    def _solved_strategy(self, st, index, actions):
+        """The average strategy of the round's stored solve at the node of action ``index`` (all
+        hands, root-round node), or None when no solve covers it."""
+        sv, prefix = st.get("solver"), st.get("solver_actions")
+        if sv is None or prefix is None or st.get("solver_round") != st["rounds"][index] or actions[: len(prefix)] != prefix:
+            return None
+        node = 0
+        for a in actions[len(prefix): index]:
+            node = sv.child(node, int(a))
+            if node <= 0:
+                return None
+        if sv.node_player(node) < 0 or sv.node_round(node) != sv.root_round:
+            return None
+        return sv.node_strategy(node).astype(np.float64)
+
     def _update_ranges(self, jobs):
-        """Apply the pending villain (blueprint) and hero (own solved / blueprint) range updates."""
+        """Apply the pending villain (blueprint) and hero (own solved / blueprint) range updates.
+
+        Pluribus mode: only actions of *earlier* betting rounds are applied (the current round's
+        actions are inside the solved tree, whose root is the round start), using the average
+        strategy of that round's solve for both players when there was one (nested unsafe
+        search), the blueprint otherwise (the first betting round).
+        """
         from headsup.lbr import transition_likelihood
 
         queries = []  # (table id, kind, obs, engine, action)
         for tid, (engine, hero, actions, pending, hero_pending, st) in jobs.items():
-            for obs_v, eng, a in pending:
+            if self.mode == "pluribus":
+                current = int(engine.stage)
+                keep = [x for x in pending + hero_pending if st["rounds"][x[3]] < current or engine.done]
+                keep.sort(key=lambda x: x[3])
+                for obs_x, eng, a, i in keep:
+                    kind = "villain" if int(obs_x[22]) != hero else "hero"
+                    sig = self._solved_strategy(st, i, actions)
+                    if sig is not None:
+                        st[kind] *= transition_likelihood(eng, a, sig)
+                    else:
+                        queries.append((tid, kind, obs_x, eng, a))
+                st["processed_target"] = max([x[3] + 1 for x in keep], default=st["processed"])
+                continue
+            for obs_v, eng, a, _ in pending:
                 queries.append((tid, "villain", obs_v, eng, a))
-            for obs_h, eng, a in hero_pending:
+            for obs_h, eng, a, _ in hero_pending:
                 if st["last_root"] is not None and st["last_action"] == a and st["last_root"].shape[0] == NUM_COMBOS:
                     st["hero"] *= transition_likelihood(eng, a, st["last_root"])
                     st["last_root"] = None
@@ -274,7 +331,7 @@ class SearchPlayer:
             for (tid, kind, _, eng, a), sig in zip(queries, probs):
                 jobs[tid][5][kind] *= transition_likelihood(eng, a, sig)
         for tid, (engine, hero, actions, pending, hero_pending, st) in jobs.items():
-            st["processed"] = len(actions)
+            st["processed"] = st.pop("processed_target", len(actions)) if self.mode == "pluribus" else len(actions)
             board = list(engine.visible_board)
             if board:
                 ok = valid_combos(board)
@@ -287,8 +344,43 @@ class SearchPlayer:
                     total = st[key].sum()
                 st[key] /= total
 
+    def _solve_round(self, engine, hero, actions, st, seed):
+        """Pluribus mode: solve the remaining game from the start of the current betting round
+        (the hero's actions taken in the round frozen for its real hand) and return the strategy
+        at the hero's node (final iterate or average) plus the hero's combo index."""
+        cpp = self._cpp
+        current = int(engine.stage)
+        n_root = next((i for i, r in enumerate(st["rounds"]) if r == current), len(actions))
+        e = cpp.Engine(self._cfg)
+        e.reset(list(engine.hands[0]) + list(engine.hands[1]) + list(engine.board))
+        for a in actions[:n_root]:
+            e.step(int(a))
+        ranges = [st["hero"], st["villain"]] if hero == 0 else [st["villain"], st["hero"]]
+        a, b = sorted(st["cards"])
+        hh = cpp.combo_index(int(a), int(b))
+        sv = cpp.VectorSolver()
+        sv.build(e, self.buckets)
+        sv.set_ranges(ranges[0].astype(np.float32), ranges[1].astype(np.float32))
+        node = 0
+        for act in actions[n_root:]:
+            if sv.node_player(node) == hero:
+                sv.freeze(node, hh, int(act))
+            node = sv.child(node, int(act))
+        sv.run(self.iterations, int(seed) & 0xFFFFFFFF, self.threads)
+        self.solves += 1
+        st["solver"], st["solver_actions"], st["solver_round"] = sv, list(actions[:n_root]), current
+        return sv.node_strategy(node, self.play == "final"), hh
+
     def _solve(self, engine, hero, actions, st, seed):
         cpp = self._cpp
+        if self.mode == "pluribus" and (int(engine.stage) > 0 or self.preflop == "blueprint"):
+            if int(engine.stage) == 0:  # the blueprint plays the first round
+                rows = substitute_hands(engine.observation(hero))
+                a, b = sorted(st["cards"])
+                hh = cpp.combo_index(int(a), int(b))
+                st["blueprint_rows"] = rows
+                return None, hh
+            return self._solve_round(engine, hero, actions, st, seed)
         e = cpp.Engine(self._cfg)
         e.reset(list(engine.hands[0]) + list(engine.hands[1]) + list(engine.board))
         for a in actions:
@@ -336,13 +428,24 @@ class SearchPlayer:
         futs = {int(t): self._pool.submit(self._solve, *jobs[int(t)][:3], jobs[int(t)][5], sd)
                 for t, sd in zip(ids, seeds) if not jobs[int(t)][0].done}
         out = np.zeros((len(obs), self.game.num_actions), dtype=np.float32)
+        blueprint = []  # (row index, table id, hh): preflop decisions the blueprint plays (Pluribus mode)
         for i, t in enumerate(ids):
             if int(t) not in futs:
                 out[i, 1] = 1.0
                 continue
             root, hh = futs[int(t)].result()
+            if root is None:
+                blueprint.append((i, int(t), hh))
+                continue
             jobs[int(t)][5]["last_root"] = root.astype(np.float64)
             out[i] = root[hh]
+        if blueprint:
+            rows = np.concatenate([jobs[t][5].pop("blueprint_rows") for _, t, _ in blueprint])
+            bids = np.concatenate([t * NUM_COMBOS + np.arange(NUM_COMBOS) for _, t, _ in blueprint])
+            probs = np.asarray(self.model.probs(rows, bids), dtype=np.float32).reshape(len(blueprint), NUM_COMBOS, -1)
+            for (i, t, hh), sig in zip(blueprint, probs):
+                out[i] = sig[hh]
+                jobs[t][5]["last_root"] = None
         self.solve_time += time.perf_counter() - t0
         legal = legal_mask_from_obs(obs, self.game)
         out[~legal] = 0.0
@@ -362,7 +465,8 @@ class SearchPlayer:
 
 
 def parse_search_spec(arg):
-    """``<blueprint spec>[@it<N>][@rit<N>][@rv<variant>][@focus<f>][@cont<policy|iterate|bank>][@thin<K>]`` -> kwargs."""
+    """``<blueprint spec>[@it<N>][@rit<N>][@rv<variant>][@focus<f>][@cont<policy|iterate|bank>][@thin<K>]``
+    ``[@pluribus][@b<buckets>][@th<threads>][@avg][@pfsearch]`` -> kwargs."""
     parts = arg.split("@")
     # the blueprint spec itself may contain '@' options (sdcfr:...@g2): the search options are the
     # trailing ones that parse as ours
@@ -383,6 +487,16 @@ def parse_search_spec(arg):
             kw["continuation"] = o[4:]
         elif o.startswith("thin") and o[4:].isdigit():
             kw["thin"] = int(o[4:])
+        elif o == "pluribus":
+            kw["mode"] = "pluribus"
+        elif o.startswith("b") and o[1:].isdigit():
+            kw["buckets"] = int(o[1:])
+        elif o.startswith("th") and o[2:].isdigit():
+            kw["threads"] = int(o[2:])
+        elif o == "avg":
+            kw["play"] = "average"
+        elif o == "pfsearch":
+            kw["preflop"] = "search"
         else:
             break
         parts.pop()

@@ -203,3 +203,37 @@ def test_search_spec_and_player_bookkeeping(tmp_path):
     for st in p.state.values():
         assert st["villain"].sum() == pytest.approx(1.0) and st["hero"].sum() == pytest.approx(1.0)
         assert np.all(st["villain"][valid_combos(list(st["cards"])) == 0] == 0)  # the villain cannot hold our cards
+
+
+def test_pluribus_mode_player(tmp_path):
+    """Pluribus mode: the blueprint plays preflop, later streets re-solve the remaining game from
+    the round start (frozen own actions), ranges are updated at round boundaries."""
+    from headsup.env import make_vec_env, play_hands
+    from headsup.model import BaseModel
+    from headsup.players import TorchPolicyPlayer, make_player
+
+    torch.manual_seed(0)
+    m = BaseModel()
+    with torch.no_grad():
+        torch.nn.init.normal_(m.action_head.weight, std=0.3)
+    m.save(tmp_path / "bp.pth")
+    spec = f"search:cfr:{tmp_path / 'bp.pth'}@pluribus@it40@b50@th2"
+    assert parse_search_spec(spec)[1] == {"mode": "pluribus", "iterations": 40, "buckets": 50, "threads": 2}
+    p = make_player(spec, device="cpu", seed=0)
+    assert p.mode == "pluribus" and p.iterations == 40 and p.play == "final" and p.preflop == "blueprint"
+    # preflop: exactly the blueprint's distribution
+    from headsup.engine import HeadsUpPoker
+
+    e = HeadsUpPoker(rng=np.random.default_rng(1))
+    e.reset()
+    obs = e.observation(0)[None]
+    bp = TorchPolicyPlayer(m, device="cpu")
+    np.testing.assert_allclose(p.probs(obs, np.array([7])), bp.probs(obs), atol=1e-6)
+    env = make_vec_env(4, "call", seed=0, game=p.game)
+    r = play_hands(env, p, 16)
+    assert len(r) == 16 and p.solves > 0
+    for st in p.state.values():
+        assert st["villain"].sum() == pytest.approx(1.0) and st["hero"].sum() == pytest.approx(1.0)
+        assert np.all(st["villain"][valid_combos(list(st["cards"])) == 0] == 0)
+        if st["solver"] is not None:  # a full-game vector solve rooted at the round it was made in
+            assert st["solver"].root_round == st["solver_round"] >= 1 and st["solver"].iterations >= 40
