@@ -40,6 +40,7 @@ class IterateBank:
         self.set_weight_power(weight_power)
         self.config = normalize_config(config)
         self._base = BaseModel(config=self.config).to(self.device).eval()
+        self.dim = self._base.dim
         self.obs_dim = self._base.obs_dim
         self.rm_fallback = self._base.rm_fallback
         self.game = self._base.game
@@ -108,16 +109,25 @@ class IterateBank:
         data = torch.load(path, map_location="cpu", weights_only=True)
         return IterateBank({int(s): d for s, d in data["seats"].items()}, device, data["config"], weight_power)
 
+    # rows per vmapped forward: keeps the (T, rows, dim) activations at ~1 GB so big LBR queries
+    # (100k+ rows x many iterates) do not run the GPU allocator against its limit
+    ACTIVATION_BUDGET = 1 << 30
+
     @torch.no_grad()
     def strategies(self, seat, obs):
-        """Regret-matched strategies of every iterate: (T, B, 4); FOLD masked where nothing is to call."""
+        """Regret-matched strategies of every iterate: (T, B, A); illegal actions masked."""
         obs = np.asarray(obs, dtype=np.float32)
         x = torch.as_tensor(obs[:, : self.obs_dim]).to(self.device)
-        try:
-            adv = self._vmapped(self.params[seat], x)
-        except Exception:  # vmap unsupported op on this backend: fall back to a loop
-            adv = torch.stack([self._fn({k: v[t] for k, v in self.params[seat].items()}, x) for t in range(self.T)])
-        return regret_matching_torch(adv, legal_mask_from_obs(obs, self.game), self.rm_fallback)
+        chunk = max(256, self.ACTIVATION_BUDGET // (self.T * self.dim * 4 * 12))
+        outs = []
+        for i in range(0, len(x), chunk):
+            xi = x[i : i + chunk]
+            try:
+                adv = self._vmapped(self.params[seat], xi)
+            except Exception:  # vmap unsupported op on this backend: fall back to a loop
+                adv = torch.stack([self._fn({k: v[t] for k, v in self.params[seat].items()}, xi) for t in range(self.T)])
+            outs.append(regret_matching_torch(adv, legal_mask_from_obs(obs[i : i + chunk], self.game), self.rm_fallback))
+        return torch.cat(outs, dim=1) if len(outs) > 1 else outs[0]
 
 
 class SDCFRPlayer:

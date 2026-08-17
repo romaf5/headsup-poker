@@ -83,7 +83,10 @@ players' masks (illegal sizes), rl_games env. Retrain; expect much bigger trees 
   reduction — attacks the sampled-regret noise floor (`advantage/*/mse_unweighted`).
 - ESCHER (McAleer et al. 2022): DREAM without importance weights; unbiased/low variance.
 - Real-time search: depth-limited subgame re-solving on the current street with the blueprint
-  (DeepCFR/SD-CFR) values at the leaves — the biggest strength gain for actual play.
+  (DeepCFR/SD-CFR) values at the leaves — the biggest strength gain for actual play. Must follow a
+  paper (Brown & Sandholm 2018 "Depth-Limited Solving for Imperfect-Information Games" / Libratus
+  nested subgame solving; DeepStack continual re-solving) as a proper CFR tree search over the
+  subgame, verified against tabular CFR on small subgames — not an ad-hoc river solver.
 
 ## Step 5 — engineering nice-to-haves
 

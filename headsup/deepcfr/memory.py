@@ -22,6 +22,7 @@ from headsup.engine import OBS_DIM
 from headsup.enums import NUM_ACTIONS
 
 OBS_INT_DIM = 23  # 7 x (rank+1, suit+1, card+1), stage, first_to_act: all < 256
+OBS_INT_MAX = torch.tensor([13, 4, 52] * 7 + [3, 1], dtype=torch.uint8)  # valid upper bounds per column
 
 
 class ReservoirBuffer:
@@ -146,7 +147,12 @@ class ReservoirBuffer:
             raise ValueError(f"buffer capacity {self.capacity} < saved size {size}")
         if int(state["obs_dim"]) != self.obs_dim:
             raise ValueError(f"saved observations have {state['obs_dim']} features, the buffer stores {self.obs_dim}")
-        self.obs_int[:size] = state["obs_int"].to(self.device)
+        obs_int = state["obs_int"]
+        bad = (obs_int > OBS_INT_MAX).any(dim=1)
+        if bad.any():  # corrupted rows (seen once: a flipped bit on a non-ECC GPU) - clamp so they cannot crash a fit
+            print(f"warning: {int(bad.sum())} of {size:,} saved observations have out-of-range card/stage features; clamped")
+            obs_int = torch.minimum(obs_int, OBS_INT_MAX)
+        self.obs_int[:size] = obs_int.to(self.device)
         self.obs_float[:size] = state["obs_float"].to(self.device)
         self.t[:size] = state["t"].to(self.device)
         self.target[:size] = state["target"].to(self.device)

@@ -192,6 +192,10 @@ class BaseModel(nn.Module):
         d = self.dim
         idx = bet_feature_indices(self.features, self.arch)
         self.register_buffer("bet_index", torch.tensor(idx, dtype=torch.long), persistent=False)
+        # upper bounds of the integer features (rank+1, suit+1, card+1 per card slot); indices are
+        # clamped in forward() so that a corrupted sample in a 20M-row GPU memory (seen once: a
+        # single flipped bit on a non-ECC card) cannot trigger a device-side assert and kill a run
+        self.register_buffer("card_max", torch.tensor([RANKS, SUITS, RANKS * SUITS], dtype=torch.long), persistent=False)
 
         self.card_model = CardModel(d, self.cards_mode, per_group=self.arch == "paper")
         if self.arch == "current":
@@ -216,11 +220,11 @@ class BaseModel(nn.Module):
             if obs.shape[1] < self.obs_dim:
                 raise ValueError(f"observation has {obs.shape[1]} features, this network needs {self.obs_dim}")
             obs = obs[:, : self.obs_dim]
-        cards = obs[:, :21].long().view(-1, 7, 3)
+        cards = torch.minimum(obs[:, :21].long().view(-1, 7, 3), self.card_max).clamp_(min=0)
         bets = obs.index_select(1, self.bet_index)
         parts = [self.card_model(cards)]
         if self.arch == "current":
-            parts.append(self.stage_and_order_model(obs[:, 21].long(), obs[:, 22].long()))
+            parts.append(self.stage_and_order_model(obs[:, 21].long().clamp(0, NUM_STAGES - 1), obs[:, 22].long().clamp(0, 1)))
         parts.append(self.bets_model(bets))
         z = torch.cat(parts, dim=1)
         z = self.act(self.comb1(z))
