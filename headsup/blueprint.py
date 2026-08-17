@@ -198,10 +198,10 @@ def main(argv=None):
     bp.configure(lcfr_iterations=int(args.lcfr * args.iterations), discount_interval=max(1, int(args.discount_every * args.iterations)),
                  prune_after=0 if args.no_prune else int(args.prune_after * args.iterations),
                  strategy_interval=args.strategy_every or max(1, args.iterations // 100_000))
-    print(f"{args.game}: {bp.cpp.num_nodes} public nodes, {bp.cpp.num_infosets:,} infosets; params {bp.params}")
+    print(f"{args.game}: {bp.cpp.num_nodes} public nodes, {bp.cpp.num_infosets:,} infosets; params {bp.params}", flush=True)
     t0 = time.perf_counter()
     bp.fit_abstraction(args.situations, args.seed, args.threads)
-    print(f"abstraction fitted in {time.perf_counter() - t0:.1f}s")
+    print(f"abstraction fitted in {time.perf_counter() - t0:.1f}s", flush=True)
     log = []
     per_chunk = args.iterations // args.chunks
     for c in range(args.chunks):

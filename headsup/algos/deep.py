@@ -483,7 +483,7 @@ def main(argv=None):
         if it % args.eval_every == 0 or it == args.iterations:
             ev = solver.evaluate()
             curve.append({"iteration": it, **ev, "seconds": time.perf_counter() - t0})
-            print(f"{args.game} {args.algo} it {it}: exploitability current {ev['current']:.4f} average {ev['average']:.4f}  ({time.perf_counter() - t0:.0f}s)")
+            print(f"{args.game} {args.algo} it {it}: exploitability current {ev['current']:.4f} average {ev['average']:.4f}  ({time.perf_counter() - t0:.0f}s)", flush=True)
     if args.json:
         with open(args.json, "w") as f:
             json.dump({"game": args.game, "algo": args.algo, "args": vars(args), "curve": curve}, f, indent=2)
