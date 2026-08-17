@@ -73,6 +73,10 @@ class State:
         """Hashable id of the public state (betting sequence + public cards); default: none."""
         return None
 
+    def history_key(self):
+        """Hashable id of the full history (all players' information); default: both info keys."""
+        return (self.info_key(0), self.info_key(1))
+
 
 class Game:
     name = "game"

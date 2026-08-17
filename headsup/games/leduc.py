@@ -204,10 +204,10 @@ class Leduc(Game):
     def action_names(self):
         return ["fold", "call", "raise"]
 
-    def make_model(self, hidden=64, layers=3):
+    def make_model(self, hidden=64, layers=3, in_dim=None):
         import torch.nn as nn
 
-        mods, d = [], self.obs_dim
+        mods, d = [], (in_dim or self.obs_dim)
         for _ in range(layers):
             mods += [nn.Linear(d, hidden), nn.ReLU()]
             d = hidden

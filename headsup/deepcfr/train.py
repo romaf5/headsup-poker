@@ -64,7 +64,7 @@ def _run_step(fwd, model, opt, obs, t, target, loss_fn, grad_clip):
     opt.zero_grad(set_to_none=True)
     loss.backward()
     if grad_clip:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip, foreach=False)  # the foreach path is ~1000x slower on CPU in torch 2.13
     opt.step()
     return loss
 

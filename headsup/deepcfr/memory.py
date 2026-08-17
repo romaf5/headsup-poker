@@ -26,13 +26,14 @@ OBS_INT_MAX = torch.tensor([13, 4, 52] * 7 + [3, 1], dtype=torch.uint8)  # valid
 
 
 class ReservoirBuffer:
-    def __init__(self, capacity, device, obs_dim=OBS_DIM, target_dim=NUM_ACTIONS, seed=None, sample_device=None):
+    def __init__(self, capacity, device, obs_dim=OBS_DIM, target_dim=NUM_ACTIONS, seed=None, sample_device=None, int_dim=OBS_INT_DIM):
         self.capacity = int(capacity)
         self.device = torch.device(device)
         self.sample_device = torch.device(sample_device) if sample_device is not None else self.device
         self.obs_dim = int(obs_dim)
-        self.obs_int = torch.zeros((self.capacity, OBS_INT_DIM), dtype=torch.uint8, device=self.device)
-        self.obs_float = torch.zeros((self.capacity, self.obs_dim - OBS_INT_DIM), dtype=torch.float32, device=self.device)
+        self.int_dim = int(int_dim)  # leading observation entries stored as uint8 (0 for games without integer features)
+        self.obs_int = torch.zeros((self.capacity, self.int_dim), dtype=torch.uint8, device=self.device)
+        self.obs_float = torch.zeros((self.capacity, self.obs_dim - self.int_dim), dtype=torch.float32, device=self.device)
         self.t = torch.zeros((self.capacity,), dtype=torch.float32, device=self.device)
         self.target = torch.zeros((self.capacity, target_dim), dtype=torch.float32, device=self.device)
         self.size = 0
@@ -45,8 +46,8 @@ class ReservoirBuffer:
     def _write(self, rows, obs, t, target):
         rows = torch.as_tensor(rows, dtype=torch.long, device=self.device)
         obs = torch.as_tensor(obs, dtype=torch.float32)
-        self.obs_int[rows] = obs[:, :OBS_INT_DIM].to(torch.uint8).to(self.device)
-        self.obs_float[rows] = obs[:, OBS_INT_DIM:].to(self.device)
+        self.obs_int[rows] = obs[:, : self.int_dim].to(torch.uint8).to(self.device)
+        self.obs_float[rows] = obs[:, self.int_dim :].to(self.device)
         self.t[rows] = torch.as_tensor(t, dtype=torch.float32).to(self.device)
         self.target[rows] = torch.as_tensor(target, dtype=torch.float32).to(self.device)
 
@@ -93,8 +94,8 @@ class ReservoirBuffer:
     def _staging(self, batch_size):
         pin = self.sample_device.type == "cuda"
         return (
-            torch.empty((batch_size, OBS_INT_DIM), dtype=torch.uint8, pin_memory=pin),
-            torch.empty((batch_size, self.obs_dim - OBS_INT_DIM), dtype=torch.float32, pin_memory=pin),
+            torch.empty((batch_size, self.int_dim), dtype=torch.uint8, pin_memory=pin),
+            torch.empty((batch_size, self.obs_dim - self.int_dim), dtype=torch.float32, pin_memory=pin),
             torch.empty((batch_size,), dtype=torch.float32, pin_memory=pin),
             torch.empty((batch_size, self.target.shape[1]), dtype=torch.float32, pin_memory=pin),
         )
@@ -148,7 +149,7 @@ class ReservoirBuffer:
         if int(state["obs_dim"]) != self.obs_dim:
             raise ValueError(f"saved observations have {state['obs_dim']} features, the buffer stores {self.obs_dim}")
         obs_int = state["obs_int"]
-        bad = (obs_int > OBS_INT_MAX).any(dim=1)
+        bad = (obs_int > OBS_INT_MAX).any(dim=1) if self.int_dim == OBS_INT_DIM else torch.zeros(size, dtype=torch.bool)
         if bad.any():  # corrupted rows (seen once: a flipped bit on a non-ECC GPU) - clamp so they cannot crash a fit
             print(f"warning: {int(bad.sum())} of {size:,} saved observations have out-of-range card/stage features; clamped")
             obs_int = torch.minimum(obs_int, OBS_INT_MAX)
