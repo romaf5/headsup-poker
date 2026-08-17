@@ -346,7 +346,11 @@ average by +0.82 ± 0.04, while scoring less against the fixed bots (+1.8 / +2.5
 its SD-CFR average 3.46) — the head-to-head and LBR rank the blueprint ahead, the BR estimate is
 noisy at 12 boards. The table-mode abstraction (exact per-board (mean, std) equity features,
 k-means, cached per board) trains at ~60 000 iterations/s once its caches are warm (20 M in
-15 min); its evaluation is running too.
+15 min). On the **0.5 / 1 / 2-pot action tree** (52 746 public nodes, 3.4 M infosets) a
+table-mode blueprint with 40 M iterations (~30 min) beats the DeepCFR bet-size run
+(`betsize_history_paper`, 300 it. × 40k traversals, ~6 h on a 3090) by **+0.76 ± 0.05**
+chips/hand and its SD-CFR average by +0.70 ± 0.05 (300 000 hands each); its LBR / BR estimates
+are running.
 
 **Real-time search**: LBR against the Pluribus-mode player on the tabular blueprint
 (`search:tab:…@pluribus@it300`, 2 000 duplicate pairs) is **−0.78 ± 0.39** chips/hand — LBR
