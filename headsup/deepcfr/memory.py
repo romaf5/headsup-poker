@@ -92,13 +92,29 @@ class ReservoirBuffer:
         return torch.cat([obs_int.to(torch.float32), obs_float], dim=1), t, target
 
     def _staging(self, batch_size):
-        pin = self.sample_device.type == "cuda"
-        return (
-            torch.empty((batch_size, self.int_dim), dtype=torch.uint8, pin_memory=pin),
-            torch.empty((batch_size, self.obs_dim - self.int_dim), dtype=torch.float32, pin_memory=pin),
-            torch.empty((batch_size,), dtype=torch.float32, pin_memory=pin),
-            torch.empty((batch_size, self.target.shape[1]), dtype=torch.float32, pin_memory=pin),
-        )
+        """Host staging buffers for one batch (pinned when the device is CUDA; pageable if pinning
+        fails - WSL2 / many processes can exhaust pinned memory - which only costs copy speed)."""
+        pin = self.sample_device.type == "cuda" and not getattr(self, "_no_pin", False)
+        shapes = ((batch_size, self.int_dim), (batch_size, self.obs_dim - self.int_dim), (batch_size,), (batch_size, self.target.shape[1]))
+        dtypes = (torch.uint8, torch.float32, torch.float32, torch.float32)
+        try:
+            return tuple(torch.empty(sh, dtype=dt, pin_memory=pin) for sh, dt in zip(shapes, dtypes))
+        except RuntimeError as exc:  # pinned allocation failed
+            if not pin:
+                raise
+            print(f"(pinned staging allocation failed: {type(exc).__name__}; using pageable host buffers)")
+            self._no_pin = True
+            return tuple(torch.empty(sh, dtype=dt) for sh, dt in zip(shapes, dtypes))
+
+    def _staging_set(self, batch_size, n_buf):
+        """The prefetch staging buffers, allocated once per batch size and reused across fits."""
+        cache = getattr(self, "_staging_cache", None)
+        if cache is None:
+            cache = self._staging_cache = {}
+        key = (int(batch_size), int(n_buf))
+        if key not in cache:
+            cache[key] = [self._staging(batch_size) for _ in range(n_buf)]
+        return cache[key]
 
     def prefetch(self, batch_size, steps):
         """Iterate over ``steps`` batches; when the storage is not on the sample device the next
@@ -109,7 +125,7 @@ class ReservoirBuffer:
                 yield self.sample(batch_size)
             return
         n_buf = 3  # a staging buffer is reused only after its device copy has completed (CUDA event)
-        staging = [self._staging(batch_size) for _ in range(n_buf)]
+        staging = self._staging_set(batch_size, n_buf)
         cuda = self.sample_device.type == "cuda"
         events = [torch.cuda.Event() for _ in range(n_buf)] if cuda else [None] * n_buf
         with ThreadPoolExecutor(1) as pool:
