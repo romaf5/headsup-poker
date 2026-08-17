@@ -11,13 +11,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -1105,11 +1108,17 @@ struct SubgameSolver {
     return int(std::lower_bound(cum[seat].begin(), cum[seat].end(), x) - cum[seat].begin());
   }
 
-  static void combo_cards(int h, int& a, int& b) {
-    // inverse of combo_index (a < b)
-    a = 0;
-    while (combo_index(a, NUM_CARDS - 1) < h) ++a;
-    b = h - combo_index(a, a + 1) + a + 1;
+  static void combo_cards(int h, int& a, int& b) {  // inverse of combo_index (a < b), tabulated
+    struct Table {
+      uint8_t ca[NUM_COMBOS], cb[NUM_COMBOS];
+      Table() {
+        for (int x = 0; x < NUM_CARDS; ++x)
+          for (int y = x + 1; y < NUM_CARDS; ++y) { ca[combo_index(x, y)] = uint8_t(x); cb[combo_index(x, y)] = uint8_t(y); }
+      }
+    };
+    static const Table t;
+    a = t.ca[h];
+    b = t.cb[h];
   }
 
   // -- one traversal ----------------------------------------------------------------
@@ -1317,39 +1326,38 @@ struct SubgameSolver {
   }
 };
 
-// ------------------------------------------------------------------ vector-form river solver
-// Full-width CFR over the river subgame (all leaves terminal): every iteration processes all 1326
-// hands of both players at every public node ("vector form": reach vectors in, counterfactual
-// value vectors out), terminal values in O(1326 + 52 * 51) per node via strength-sorted cumulative
-// sums with blocker corrections.  Alternating updates; variants LCFR / DCFR / CFR+ / PCFR+.
-struct RiverSolver {
-  SubgameSolver tree;  // reuses the public-tree construction and the strategy storage layout
-  int n_actions = 4;
-  std::vector<int> strength;                // treys rank per combo, INT_MAX for blocked combos
-  std::vector<int> order;                   // valid combos sorted by strength (strongest first)
-  std::vector<std::vector<int>> card_order; // per card: its combos, sorted by strength (strongest first)
-  std::vector<double> range[2];
-  std::vector<double> regret, strat_sum, last_regret;  // (nodes x NUM_COMBOS x n_actions), doubles
-  int variant = 0;
-  double alpha = 1.5, beta = 0.0, gamma = 2.0;
-  int iteration = 0;
-  std::vector<double> mass_buf, sd_buf;
+// ------------------------------------------------------------------ vector-form public-chance-sampling solver
+// Solves the rest of the hand from the start of a betting round (Pluribus's heads-up search: from
+// the flop on the subgame extends to the end of the game).  Vector form: every iteration processes
+// all 1326 hands of both players at every public node (reach vectors in, counterfactual value
+// vectors out); terminal values in O(1326 + 52 * 51) per node via strength-sorted cumulative sums
+// with blocker corrections.  Chance is *public-chance sampled*: each iteration deals the unknown
+// board cards once; hands blocked by a newly dealt card leave the reach vectors at that street
+// transition and only hands compatible with the whole sampled board are updated, which makes every
+// hand's estimate unbiased (its updates average over the boards it is compatible with).  Infosets
+// of the root round are lossless (per hand); later rounds use `buckets` equity buckets per round
+// (Pluribus: lossless in the current round, 500 lossy buckets on later rounds; ours are equal-width
+// buckets of the hand's equity against a uniform range, not k-means over equity distributions).
+// Linear CFR (Pluribus) by default, DCFR / CFR+ / PCFR+ single-threaded.  Threads share the
+// tables, one sampled board per thread and iteration (racy but benign updates, as in Pluribus).
+// A hand's actions already taken in the round can be frozen (Pluribus's nested unsafe search keeps
+// the searcher's real hand on the actions it has taken; other hands are free).
+struct BoardTable {  // strengths and strength-sorted combo orders of one complete board
+  std::vector<int> strength;                 // per combo, INT32_MAX for combos overlapping the board
+  std::vector<int> order;                    // valid combos, strongest first
+  std::vector<std::vector<int>> card_order;  // per card: its valid combos, strongest first
+  std::vector<float> equity;                 // per combo: P(win) + P(tie) / 2 vs a uniform compatible hand (-1 if blocked)
 
-  void build(const Engine& root) {
-    if (root.stage != root.cfg.num_rounds - 1) throw std::runtime_error("RiverSolver needs a state in the game's last betting round");
-    tree.build(root);
-    n_actions = tree.n_actions;
-    // strengths on the (complete) board of the last round
-    const int nb = root.cfg.showdown_cards();
+  void build(const int* board, int nb) {
     strength.assign(NUM_COMBOS, INT32_MAX);
     bool onboard[NUM_CARDS] = {};
-    for (int i = 0; i < nb; ++i) onboard[root.board[i]] = true;
+    for (int i = 0; i < nb; ++i) onboard[board[i]] = true;
     order.clear();
     card_order.assign(NUM_CARDS, {});
     for (int a = 0; a < NUM_CARDS; ++a)
       for (int b = a + 1; b < NUM_CARDS; ++b) {
         if (onboard[a] || onboard[b]) continue;
-        int c7[7] = {a, b, root.board[0], root.board[1], root.board[2], root.board[3], root.board[4]};
+        int c7[7] = {a, b, board[0], board[1], board[2], board[3], board[4]};
         const int h = combo_index(a, b);
         strength[h] = eval_best(c7, 2 + nb);
         order.push_back(h);
@@ -1359,50 +1367,42 @@ struct RiverSolver {
     auto by_strength = [&](int x, int y) { return strength[x] < strength[y]; };
     std::stable_sort(order.begin(), order.end(), by_strength);
     for (auto& v : card_order) std::stable_sort(v.begin(), v.end(), by_strength);
-    const size_t n = tree.nodes.size() * NUM_COMBOS * n_actions;
-    regret.assign(n, 0.0);
-    strat_sum.assign(n, 0.0);
-    last_regret.assign(n, 0.0);
-    iteration = 0;
-    mass_buf.assign(NUM_COMBOS, 0.0);
-    sd_buf.assign(NUM_COMBOS, 0.0);
+    // equity of every valid combo against the uniform range of compatible combos
+    std::vector<double> ones(NUM_COMBOS, 0.0), mass(NUM_COMBOS), sd(NUM_COMBOS);
+    for (int h : order) ones[h] = 1.0;
+    opponent_mass(ones, mass);
+    showdown_values(ones, sd);
+    equity.assign(NUM_COMBOS, -1.0f);
+    for (int h : order) equity[h] = mass[h] > 0 ? float(0.5 + 0.5 * sd[h] / mass[h]) : 0.5f;
   }
 
-  void set_ranges(const float* r0, const float* r1) {
-    for (int s = 0; s < 2; ++s) {
-      const float* r = s == 0 ? r0 : r1;
-      range[s].assign(NUM_COMBOS, 0.0);
-      for (int h = 0; h < NUM_COMBOS; ++h) range[s][h] = strength[h] == INT32_MAX ? 0.0 : std::max(0.0, double(r[h]));
-    }
-  }
-
-  // M[h] = sum of reach over combos compatible with h
-  void opponent_mass(const std::vector<double>& reach, std::vector<double>& out) const {
+  // M[h] = sum of reach over combos compatible with h (any board: the reach carries the validity)
+  static void opponent_mass(const std::vector<double>& reach, std::vector<double>& out) {
     double total = 0.0, per_card[NUM_CARDS] = {};
-    for (int h : order) {
-      total += reach[h];
+    for (int h = 0; h < NUM_COMBOS; ++h) {
+      const double r = reach[h];
+      if (r == 0.0) continue;
+      total += r;
       int a, b;
       SubgameSolver::combo_cards(h, a, b);
-      per_card[a] += reach[h];
-      per_card[b] += reach[h];
+      per_card[a] += r;
+      per_card[b] += r;
     }
-    for (int h = 0; h < NUM_COMBOS; ++h) out[h] = 0.0;
-    for (int h : order) {
+    for (int h = 0; h < NUM_COMBOS; ++h) {
       int a, b;
       SubgameSolver::combo_cards(h, a, b);
       out[h] = total - per_card[a] - per_card[b] + reach[h];
     }
   }
 
-  // W[h] - L[h]: mass of compatible weaker combos minus stronger ones (ties count 0)
+  // W[h] - L[h]: reach mass of compatible weaker combos minus stronger ones (ties count 0)
   void showdown_values(const std::vector<double>& reach, std::vector<double>& out) const {
     for (int h = 0; h < NUM_COMBOS; ++h) out[h] = 0.0;
-    // over all combos: stronger = cumulative mass of strictly smaller rank; weaker = strictly larger
     const size_t n = order.size();
-    double cum = 0.0;
     std::vector<double> stronger(NUM_COMBOS, 0.0), weaker(NUM_COMBOS, 0.0);
     double total = 0.0;
     for (int h : order) total += reach[h];
+    double cum = 0.0;
     for (size_t i = 0; i < n;) {
       size_t j = i;
       double group = 0.0;
@@ -1414,8 +1414,7 @@ struct RiverSolver {
       cum += group;
       i = j;
     }
-    // subtract combos sharing a card (cannot be held); h itself is a tie in both passes (no effect)
-    for (int c = 0; c < NUM_CARDS; ++c) {
+    for (int c = 0; c < NUM_CARDS; ++c) {  // combos sharing a card cannot be held against h
       const auto& v = card_order[c];
       const size_t m = v.size();
       if (!m) continue;
@@ -1436,6 +1435,199 @@ struct RiverSolver {
     }
     for (int h : order) out[h] = weaker[h] - stronger[h];
   }
+};
+
+struct VectorSolver {
+  std::vector<SubgameNode> nodes;
+  std::vector<int> node_round, info_offset;
+  int root_round = 0, last_round = 0, n_actions = 4, buckets = 500;
+  int known_board = 0, n_unknown = 0, showdown_cards = 5;
+  int root_board[5] = {0, 0, 0, 0, 0};
+  std::vector<int> deck;  // cards not on the known board
+  std::vector<double> range[2];
+  std::vector<double> regret, strat_sum, last_regret;  // per infoset x action
+  size_t n_infosets = 0;
+  int variant = 0;  // 0 LCFR, 1 DCFR, 2 CFR+, 3 PCFR+ (see the river solver)
+  double alpha = 1.5, beta = 0.0, gamma = 2.0;
+  std::atomic<int> iteration{0};
+  int last_seed_threads = 1;
+  // tables over the sampled cards: complete boards (all n_unknown cards, as a set) and, per later
+  // round, the buckets of every hand given the cards dealt so far (ordered tuple codes, base 52)
+  std::unordered_map<int, BoardTable> boards;                                  // code(sorted unknown cards)
+  std::vector<std::unordered_map<int, std::vector<uint16_t>>> round_buckets;  // [round]: code(prefix) -> bucket per hand
+  struct Frozen { int node, hand, action; };
+  std::vector<Frozen> frozen;
+  std::vector<char> node_frozen;
+
+  static int code_of(const int* cards, int n) {
+    int c = 0;
+    for (int i = 0; i < n; ++i) c = c * NUM_CARDS + cards[i];
+    return c;
+  }
+  static int sorted_code(const int* cards, int n) {
+    int tmp[5];
+    for (int i = 0; i < n; ++i) tmp[i] = cards[i];
+    std::sort(tmp, tmp + n);
+    return code_of(tmp, n);
+  }
+  int n_keys(int node) const { return node_round[node] == root_round ? NUM_COMBOS : buckets; }
+
+  void build(const Engine& root) {
+    if (root.done) throw std::runtime_error("VectorSolver: the hand is over");
+    root_round = root.stage;
+    last_round = root.cfg.num_rounds - 1;
+    showdown_cards = root.cfg.showdown_cards();
+    known_board = BOARD_CARDS_BY_STAGE[root_round];
+    n_unknown = showdown_cards - known_board;
+    if (n_unknown > 2) throw std::runtime_error("VectorSolver solves from the flop on (at most two unknown board cards)");
+    n_actions = root.num_actions();
+    for (int i = 0; i < 5; ++i) root_board[i] = root.board[i];
+    // public tree of the whole remaining hand
+    nodes.clear();
+    node_round.clear();
+    SubgameNode rn;
+    rn.state = root;
+    nodes.push_back(rn);
+    node_round.push_back(root_round);
+    for (size_t i = 0; i < nodes.size(); ++i) {
+      if (nodes[i].kind != 0) continue;
+      Engine e = nodes[i].state;
+      nodes[i].player = e.current;
+      bool legal[MAX_ACTIONS];
+      int twin[MAX_ACTIONS];
+      e.legal_mask(legal, twin);
+      for (int a = 0; a < n_actions; ++a) {
+        nodes[i].legal[a] = legal[a];
+        nodes[i].twin[a] = twin[a];
+        nodes[i].child[a] = -1;
+      }
+      for (int a = 0; a < n_actions; ++a) {
+        if (!legal[a]) continue;
+        Engine c = e;
+        c.step(a);
+        SubgameNode ch;
+        ch.state = c;
+        if (c.done) {
+          if (c.folded >= 0) {
+            ch.kind = 1;
+            ch.folder = c.folded;
+            ch.stake = c.bets[c.folded];
+          } else {
+            ch.kind = 2;
+            ch.stake = std::min(c.bets[0], c.bets[1]);
+          }
+        }
+        nodes[i].child[a] = int(nodes.size());
+        nodes.push_back(ch);
+        node_round.push_back(c.stage);
+      }
+    }
+    info_offset.assign(nodes.size(), 0);
+    n_infosets = 0;
+    for (size_t i = 0; i < nodes.size(); ++i) {
+      info_offset[i] = int(n_infosets);
+      if (nodes[i].kind == 0) n_infosets += size_t(n_keys(int(i)));
+    }
+    regret.assign(n_infosets * n_actions, 0.0);
+    strat_sum.assign(n_infosets * n_actions, 0.0);
+    last_regret.assign(n_infosets * n_actions, 0.0);
+    frozen.clear();
+    node_frozen.assign(nodes.size(), 0);
+    iteration = 0;
+    // deck and tables
+    deck.clear();
+    bool onboard[NUM_CARDS] = {};
+    for (int i = 0; i < known_board; ++i) onboard[root_board[i]] = true;
+    for (int c = 0; c < NUM_CARDS; ++c)
+      if (!onboard[c]) deck.push_back(c);
+    build_tables();
+  }
+
+  void build_tables() {
+    boards.clear();
+    round_buckets.assign(last_round + 1, {});
+    // every set of unknown cards -> complete board table (threads over the sets)
+    std::vector<std::vector<int>> sets;
+    if (n_unknown == 0) sets.push_back({});
+    else if (n_unknown == 1)
+      for (int c : deck) sets.push_back({c});
+    else
+      for (size_t i = 0; i < deck.size(); ++i)
+        for (size_t j = i + 1; j < deck.size(); ++j) sets.push_back({deck[i], deck[j]});
+    std::vector<BoardTable> tabs(sets.size());
+    auto work = [&](size_t lo, size_t hi) {
+      for (size_t k = lo; k < hi; ++k) {
+        int board[5];
+        for (int i = 0; i < 5; ++i) board[i] = root_board[i];
+        for (int i = 0; i < n_unknown; ++i) board[known_board + i] = sets[k][i];
+        tabs[k].build(board, showdown_cards);
+      }
+    };
+    const size_t nt = std::min<size_t>(sets.size(), std::max(1u, std::min(16u, std::thread::hardware_concurrency())));
+    std::vector<std::thread> pool;
+    for (size_t t = 0; t < nt; ++t)
+      pool.emplace_back(work, sets.size() * t / nt, sets.size() * (t + 1) / nt);
+    for (auto& th : pool) th.join();
+    for (size_t k = 0; k < sets.size(); ++k) boards[code_of(sets[k].data(), n_unknown)] = std::move(tabs[k]);
+    // buckets: last round = equity on the complete board; the round before (only when two cards
+    // are unknown) = mean equity over the completions compatible with the hand
+    if (n_unknown >= 1) {
+      auto& last = round_buckets[last_round];
+      for (auto& kv : boards) {  // keyed by the sorted code; ordered tuples are mapped in bucket_table()
+        std::vector<uint16_t> b(NUM_COMBOS, 0);
+        for (int h = 0; h < NUM_COMBOS; ++h) {
+          const float e = kv.second.equity[h];
+          b[h] = e < 0 ? 0 : uint16_t(std::min(buckets - 1, int(e * buckets)));
+        }
+        last[kv.first] = std::move(b);
+      }
+    }
+    if (n_unknown == 2) {
+      auto& mid = round_buckets[last_round - 1];
+      for (int c : deck) {
+        std::vector<double> acc(NUM_COMBOS, 0.0), cnt(NUM_COMBOS, 0.0);
+        for (int r : deck) {
+          if (r == c) continue;
+          int pair[2] = {c, r};
+          const BoardTable& bt = boards.at(sorted_code(pair, 2));
+          for (int h : bt.order) { acc[h] += bt.equity[h]; cnt[h] += 1.0; }
+        }
+        std::vector<uint16_t> b(NUM_COMBOS, 0);
+        for (int h = 0; h < NUM_COMBOS; ++h)
+          if (cnt[h] > 0) b[h] = uint16_t(std::min(buckets - 1, int(acc[h] / cnt[h] * buckets)));
+        mid[c] = std::move(b);
+      }
+    }
+  }
+
+  // bucket table of a round given the unknown cards dealt so far (ordered as dealt)
+  const std::vector<uint16_t>& bucket_table(int round, const int* drawn) const {
+    const int n = BOARD_CARDS_BY_STAGE[round] - known_board;  // cards dealt since the root
+    if (round == last_round) return round_buckets[round].at(sorted_code(drawn, n));
+    return round_buckets[round].at(code_of(drawn, n));
+  }
+
+  void set_ranges(const float* r0, const float* r1) {
+    bool onboard[NUM_CARDS] = {};
+    for (int i = 0; i < known_board; ++i) onboard[root_board[i]] = true;
+    for (int s = 0; s < 2; ++s) {
+      const float* r = s == 0 ? r0 : r1;
+      range[s].assign(NUM_COMBOS, 0.0);
+      for (int h = 0; h < NUM_COMBOS; ++h) {
+        int a, b;
+        SubgameSolver::combo_cards(h, a, b);
+        range[s][h] = (onboard[a] || onboard[b]) ? 0.0 : std::max(0.0, double(r[h]));
+      }
+    }
+  }
+
+  void freeze(int node, int hand, int action) {
+    if (node < 0 || node >= int(nodes.size()) || nodes[node].kind != 0) throw std::runtime_error("freeze: not a decision node");
+    if (node_round[node] != root_round) throw std::runtime_error("freeze: only root-round nodes (per-hand infosets)");
+    if (!nodes[node].legal[action]) throw std::runtime_error("freeze: illegal action");
+    frozen.push_back({node, hand, action});
+    node_frozen[node] = 1;
+  }
 
   void sigma_of(size_t info, const bool* legal, double* sigma) const {
     const double* R = regret.data() + info * n_actions;
@@ -1451,70 +1643,129 @@ struct RiverSolver {
     for (int a = 0; a < n_actions; ++a) sigma[a] = total > 1e-12 ? pos[a] / total : (legal[a] ? 1.0 / cnt : 0.0);
   }
 
-  // counterfactual values for player p's hands at `node`; reach_p only feeds the strategy sums
+  // per-thread traversal state
+  struct Pass {
+    int drawn[2] = {-1, -1};
+    int board[5];
+    const BoardTable* table = nullptr;
+    std::vector<char> valid;  // hand compatible with all drawn cards
+    double t = 1.0;
+    struct Level { std::vector<double> next, child, sigma, ua; std::vector<int> key; };
+    std::deque<Level> levels;  // deque: growing it keeps the references held by the callers valid
+    Level& level(size_t d) {
+      while (d >= levels.size()) levels.emplace_back();
+      Level& L = levels[d];
+      if (L.next.empty()) {
+        L.next.assign(NUM_COMBOS, 0.0);
+        L.child.assign(NUM_COMBOS, 0.0);
+        L.sigma.assign(size_t(NUM_COMBOS) * MAX_ACTIONS, 0.0);
+        L.ua.assign(size_t(NUM_COMBOS) * MAX_ACTIONS, 0.0);
+        L.key.assign(NUM_COMBOS, 0);
+      }
+      return L;
+    }
+  };
+
+  void keys_of(int node, const Pass& ps, std::vector<int>& key) const {
+    if (node_round[node] == root_round) {
+      for (int h = 0; h < NUM_COMBOS; ++h) key[h] = h;
+      return;
+    }
+    const std::vector<uint16_t>& b = bucket_table(node_round[node], ps.drawn);
+    for (int h = 0; h < NUM_COMBOS; ++h) key[h] = b[h];
+  }
+
+  // counterfactual values of player p's hands at `node` (per hand, all 1326)
   void values(int node, int p, const std::vector<double>& reach_p, const std::vector<double>& reach_q,
-              std::vector<double>& out, bool update) {
-    const SubgameNode& nd = tree.nodes[node];
+              std::vector<double>& out, bool update, Pass& ps, size_t depth) {
+    const SubgameNode& nd = nodes[node];
     if (nd.kind == 1) {
-      opponent_mass(reach_q, out);
+      BoardTable::opponent_mass(reach_q, out);
       const double sign = nd.folder == p ? -1.0 : 1.0;
       for (int h = 0; h < NUM_COMBOS; ++h) out[h] *= sign * nd.stake;
       return;
     }
     if (nd.kind == 2) {
-      showdown_values(reach_q, out);
+      ps.table->showdown_values(reach_q, out);
       for (int h = 0; h < NUM_COMBOS; ++h) out[h] *= nd.stake;
       return;
     }
-    if (nd.kind != 0) throw std::runtime_error("RiverSolver: non-terminal leaf");
-    std::vector<double> child(NUM_COMBOS), sigma(size_t(NUM_COMBOS) * n_actions);
-    std::vector<double> next(NUM_COMBOS);
-    for (int h = 0; h < NUM_COMBOS; ++h) sigma_of(size_t(node) * NUM_COMBOS + h, nd.legal, sigma.data() + size_t(h) * n_actions);
+    Pass::Level& L = ps.level(depth);
+    keys_of(node, ps, L.key);
+    const int A = n_actions, nk = n_keys(node);
+    const size_t base = size_t(info_offset[node]);
+    double* SK = L.sigma.data();  // strategy per infoset key (nk x A); hands read it through their key
+    for (int k = 0; k < nk; ++k) sigma_of(base + k, nd.legal, SK + size_t(k) * A);
+    if (node_frozen[node])  // root round only: key == hand
+      for (const Frozen& f : frozen)
+        if (f.node == node)
+          for (int a = 0; a < A; ++a) SK[size_t(f.hand) * A + a] = a == f.action ? 1.0 : 0.0;
     for (int h = 0; h < NUM_COMBOS; ++h) out[h] = 0.0;
-    if (nd.player == p) {
-      std::vector<double> ua(size_t(n_actions) * NUM_COMBOS, 0.0);
-      for (int a = 0; a < n_actions; ++a) {
-        if (!nd.legal[a]) continue;
-        for (int h = 0; h < NUM_COMBOS; ++h) next[h] = reach_p[h] * sigma[size_t(h) * n_actions + a];
-        values(nd.child[a], p, next, reach_q, child, update);
+    const int round = node_round[node];
+    const int* key = L.key.data();
+    auto descend = [&](int a, const std::vector<double>& rp, const std::vector<double>& rq, std::vector<double>& res) {
+      const int c = nd.child[a];
+      if (nodes[c].kind == 0 && node_round[c] != round) {
+        // street transition: the newly dealt card(s) block some hands of both players
+        const int lo = BOARD_CARDS_BY_STAGE[round], hi = BOARD_CARDS_BY_STAGE[node_round[c]];
+        std::vector<double> mp(rp), mq(rq);  // masked copies (a handful of transitions per iteration)
         for (int h = 0; h < NUM_COMBOS; ++h) {
-          ua[size_t(a) * NUM_COMBOS + h] = child[h];
-          out[h] += sigma[size_t(h) * n_actions + a] * child[h];
+          int x, y;
+          SubgameSolver::combo_cards(h, x, y);
+          bool blocked = false;
+          for (int i = lo; i < hi; ++i) blocked |= (ps.board[i] == x || ps.board[i] == y);
+          if (blocked) { mp[h] = 0.0; mq[h] = 0.0; }
+        }
+        values(c, p, mp, mq, res, update, ps, depth + 1);
+      } else {
+        values(c, p, rp, rq, res, update, ps, depth + 1);
+      }
+    };
+    if (nd.player == p) {
+      for (int a = 0; a < A; ++a) {
+        if (!nd.legal[a]) continue;
+        for (int h = 0; h < NUM_COMBOS; ++h) L.next[h] = reach_p[h] * SK[size_t(key[h]) * A + a];
+        descend(a, L.next, reach_q, L.child);
+        double* U = L.ua.data() + size_t(a) * NUM_COMBOS;
+        for (int h = 0; h < NUM_COMBOS; ++h) {
+          U[h] = L.child[h];
+          out[h] += SK[size_t(key[h]) * A + a] * L.child[h];
         }
       }
       if (update) {
-        const double t = double(iteration);
+        const double t = ps.t;
         const double sw = variant == 0 ? t : variant == 1 ? 1.0 : variant == 2 ? t : t * t;
         for (int h = 0; h < NUM_COMBOS; ++h) {
-          if (range[p][h] <= 0) continue;
-          const size_t info = size_t(node) * NUM_COMBOS + h;
-          double* R = regret.data() + info * n_actions;
-          double* S = strat_sum.data() + info * n_actions;
-          for (int a = 0; a < n_actions; ++a) {
+          if (!ps.valid[h] || range[p][h] <= 0) continue;
+          const size_t info = base + key[h];
+          double* R = regret.data() + info * A;
+          double* S = strat_sum.data() + info * A;
+          const double* sk = SK + size_t(key[h]) * A;
+          for (int a = 0; a < A; ++a) {
             if (!nd.legal[a]) continue;
-            const double inst = ua[size_t(a) * NUM_COMBOS + h] - out[h];
+            const double inst = L.ua[size_t(a) * NUM_COMBOS + h] - out[h];
             switch (variant) {
               case 0: R[a] += t * inst; break;
               case 1: R[a] += inst; break;
-              default: R[a] = std::max(0.0, R[a] + inst); last_regret[info * n_actions + a] = inst; break;
+              default: R[a] = std::max(0.0, R[a] + inst); last_regret[info * A + a] = inst; break;
             }
-            S[a] += sw * reach_p[h] * sigma[size_t(h) * n_actions + a];
+            S[a] += sw * reach_p[h] * sk[a];
           }
         }
       }
       return;
     }
-    for (int a = 0; a < n_actions; ++a) {
+    for (int a = 0; a < A; ++a) {
       if (!nd.legal[a]) continue;
-      for (int h = 0; h < NUM_COMBOS; ++h) next[h] = reach_q[h] * sigma[size_t(h) * n_actions + a];
-      values(nd.child[a], p, reach_p, next, child, update);
-      for (int h = 0; h < NUM_COMBOS; ++h) out[h] += child[h];
+      for (int h = 0; h < NUM_COMBOS; ++h) L.next[h] = reach_q[h] * SK[size_t(key[h]) * A + a];
+      descend(a, reach_p, L.next, L.child);
+      for (int h = 0; h < NUM_COMBOS; ++h) out[h] += L.child[h];
     }
   }
 
-  void discount() {  // DCFR: after each iteration
+  void discount() {  // DCFR: after each iteration (single-threaded variant)
     if (variant != 1) return;
-    const double t = double(iteration);
+    const double t = double(iteration.load());
     const double ta = std::pow(t, alpha), tb = std::pow(t, beta);
     const double fp = ta / (ta + 1.0), fn = tb / (tb + 1.0), fs = std::pow(t / (t + 1.0), gamma);
     for (size_t i = 0; i < regret.size(); ++i) {
@@ -1523,33 +1774,109 @@ struct RiverSolver {
     }
   }
 
-  void run(int iterations) {
-    std::vector<double> out(NUM_COMBOS);
-    for (int it = 0; it < iterations; ++it) {
-      ++iteration;
-      for (int p = 0; p < 2; ++p) values(0, p, range[p], range[1 - p], out, true);
-      discount();
+  void one_iteration(Pass& ps, std::mt19937_64& rng) {
+    // deal the unknown cards (partial Fisher-Yates over a copy of the deck)
+    std::vector<int> pool(deck);
+    for (int i = 0; i < n_unknown; ++i) {
+      std::uniform_int_distribution<int> d(i, int(pool.size()) - 1);
+      std::swap(pool[i], pool[d(rng)]);
+      ps.drawn[i] = pool[i];
     }
+    for (int i = 0; i < 5; ++i) ps.board[i] = root_board[i];
+    for (int i = 0; i < n_unknown; ++i) ps.board[known_board + i] = ps.drawn[i];
+    ps.table = &boards.at(sorted_code(ps.drawn, n_unknown));
+    ps.valid.assign(NUM_COMBOS, 1);
+    for (int i = 0; i < n_unknown; ++i)
+      for (int c = 0; c < NUM_CARDS; ++c) {
+        if (c == ps.drawn[i]) continue;
+        const int lo = std::min(c, ps.drawn[i]), hi = std::max(c, ps.drawn[i]);
+        ps.valid[combo_index(lo, hi)] = 0;
+      }
+    ps.t = double(++iteration);
+    std::vector<double> out(NUM_COMBOS);
+    for (int p = 0; p < 2; ++p) values(0, p, range[p], range[1 - p], out, true, ps, 0);
+    discount();
   }
 
-  py::array_t<float> node_strategy(int node_id) {
-    if (node_id < 0 || node_id >= int(tree.nodes.size()) || tree.nodes[node_id].kind != 0) throw std::runtime_error("not a decision node");
-    py::array_t<float> out({ssize_t(NUM_COMBOS), ssize_t(n_actions)});
-    auto o = out.mutable_unchecked<2>();
-    const SubgameNode& nd = tree.nodes[node_id];
-    for (int h = 0; h < NUM_COMBOS; ++h) {
-      const size_t info = size_t(node_id) * NUM_COMBOS + h;
-      double total = 0.0;
-      for (int a = 0; a < n_actions; ++a) total += strat_sum[info * n_actions + a];
-      double sigma[MAX_ACTIONS];
-      if (total > 0) {
-        for (int a = 0; a < n_actions; ++a) o(h, a) = float(strat_sum[info * n_actions + a] / total);
+  void run(int iterations, uint64_t seed, int threads) {
+    if (range[0].empty()) throw std::runtime_error("set ranges first");
+    threads = std::max(1, threads);
+    if (variant != 0 && threads > 1) throw std::runtime_error("DCFR / CFR+ / PCFR+ run single-threaded (LCFR is the multi-threaded variant)");
+    if (threads == 1) {
+      Pass ps;
+      std::mt19937_64 rng(seed);
+      for (int it = 0; it < iterations; ++it) one_iteration(ps, rng);
+      return;
+    }
+    std::vector<std::thread> pool;
+    for (int t = 0; t < threads; ++t) {
+      const int n = iterations * (t + 1) / threads - iterations * t / threads;
+      pool.emplace_back([this, n, seed, t]() {
+        Pass ps;
+        std::mt19937_64 rng(seed * 1000003ULL + uint64_t(t) * 7919ULL + 17ULL);
+        for (int it = 0; it < n; ++it) one_iteration(ps, rng);
+      });
+    }
+    for (auto& th : pool) th.join();
+  }
+
+  // -- strategies ---------------------------------------------------------------------------
+  // per infoset key of the node: the average strategy (normalised strategy sums; the current
+  // regret-matching strategy where the sums are empty) or the current (final-iterate) strategy
+  void strategy_rows(int node_id, bool current, std::vector<float>& out) const {
+    const SubgameNode& nd = nodes[node_id];
+    const int nk = n_keys(node_id);
+    out.assign(size_t(nk) * n_actions, 0.0f);
+    for (int k = 0; k < nk; ++k) {
+      const size_t info = size_t(info_offset[node_id]) + k;
+      double sigma[MAX_ACTIONS], total = 0.0;
+      if (!current)
+        for (int a = 0; a < n_actions; ++a) total += strat_sum[info * n_actions + a];
+      if (!current && total > 0) {
+        for (int a = 0; a < n_actions; ++a) out[size_t(k) * n_actions + a] = float(strat_sum[info * n_actions + a] / total);
       } else {
         sigma_of(info, nd.legal, sigma);
-        for (int a = 0; a < n_actions; ++a) o(h, a) = float(sigma[a]);
+        for (int a = 0; a < n_actions; ++a) out[size_t(k) * n_actions + a] = float(sigma[a]);
       }
     }
+    if (node_frozen[node_id])
+      for (const Frozen& f : frozen)
+        if (f.node == node_id)
+          for (int a = 0; a < n_actions; ++a) out[size_t(f.hand) * n_actions + a] = a == f.action ? 1.0f : 0.0f;
+  }
+
+  py::array_t<float> node_strategy(int node_id, bool current) const {
+    if (node_id < 0 || node_id >= int(nodes.size()) || nodes[node_id].kind != 0) throw std::runtime_error("not a decision node");
+    std::vector<float> rows;
+    strategy_rows(node_id, current, rows);
+    py::array_t<float> out({ssize_t(n_keys(node_id)), ssize_t(n_actions)});
+    std::memcpy(out.mutable_data(), rows.data(), rows.size() * sizeof(float));
     return out;
+  }
+
+  // strategy of every hand at a later-round node given the board cards dealt since the root
+  py::array_t<float> strategy_on_board(int node_id, const std::vector<int>& drawn, bool current) const {
+    if (node_id < 0 || node_id >= int(nodes.size()) || nodes[node_id].kind != 0) throw std::runtime_error("not a decision node");
+    std::vector<float> rows;
+    strategy_rows(node_id, current, rows);
+    py::array_t<float> out({ssize_t(NUM_COMBOS), ssize_t(n_actions)});
+    auto o = out.mutable_unchecked<2>();
+    if (node_round[node_id] == root_round) {
+      for (int h = 0; h < NUM_COMBOS; ++h)
+        for (int a = 0; a < n_actions; ++a) o(h, a) = rows[size_t(h) * n_actions + a];
+      return out;
+    }
+    const int need = BOARD_CARDS_BY_STAGE[node_round[node_id]] - known_board;
+    if (int(drawn.size()) < need) throw std::runtime_error("strategy_on_board: not enough board cards for this round");
+    const std::vector<uint16_t>& b = bucket_table(node_round[node_id], drawn.data());
+    for (int h = 0; h < NUM_COMBOS; ++h)
+      for (int a = 0; a < n_actions; ++a) o(h, a) = rows[size_t(b[h]) * n_actions + a];
+    return out;
+  }
+
+  int child(int node, int action) const {
+    if (node < 0 || node >= int(nodes.size()) || action < 0 || action >= n_actions) return -1;
+    return nodes[node].child[action];
   }
 };
 
@@ -1772,15 +2099,44 @@ PYBIND11_MODULE(headsup_cpp, m) {
       })
       .def_property_readonly("iterations", [](const SubgameSolver& sv) { return sv.iteration; });
 
-  py::class_<RiverSolver>(m, "RiverSolver")
+  py::class_<BoardTable>(m, "BoardTable", "strengths / equities of all 1326 combos on a complete board and the vector-form showdown payoffs")
+      .def(py::init([](const std::vector<int>& board, int nb) {
+        if (nb < 3 || nb > 5 || int(board.size()) < nb) throw std::runtime_error("BoardTable needs the 3..5 cards of the complete board");
+        auto t = std::make_unique<BoardTable>();
+        int b[5] = {0, 0, 0, 0, 0};
+        for (int i = 0; i < nb; ++i) b[i] = board[i];
+        t->build(b, nb);
+        return t;
+      }), py::arg("board"), py::arg("num_cards") = 5)
+      .def("showdown_values", [](const BoardTable& t, py::array_t<double, py::array::c_style | py::array::forcecast> reach) {
+        if (reach.size() != NUM_COMBOS) throw std::runtime_error("reach must have 1326 entries");
+        std::vector<double> r(reach.data(), reach.data() + NUM_COMBOS), out(NUM_COMBOS);
+        t.showdown_values(r, out);
+        return py::array_t<double>(NUM_COMBOS, out.data());
+      })
+      .def_static("opponent_mass", [](py::array_t<double, py::array::c_style | py::array::forcecast> reach) {
+        if (reach.size() != NUM_COMBOS) throw std::runtime_error("reach must have 1326 entries");
+        std::vector<double> r(reach.data(), reach.data() + NUM_COMBOS), out(NUM_COMBOS);
+        BoardTable::opponent_mass(r, out);
+        return py::array_t<double>(NUM_COMBOS, out.data());
+      })
+      .def_property_readonly("strength", [](const BoardTable& t) { return py::array_t<int>(NUM_COMBOS, t.strength.data()); })
+      .def_property_readonly("equity", [](const BoardTable& t) { return py::array_t<float>(NUM_COMBOS, t.equity.data()); });
+
+  py::class_<VectorSolver>(m, "VectorSolver")
       .def(py::init<>())
-      .def("build", [](RiverSolver& sv, const Engine& root) { sv.build(root); })
-      .def("set_ranges", [](RiverSolver& sv, py::array_t<float, py::array::c_style | py::array::forcecast> r0,
+      .def("build", [](VectorSolver& sv, const Engine& root, int buckets) {
+        if (buckets < 1 || buckets > 65535) throw std::runtime_error("buckets must be in 1..65535");
+        sv.buckets = buckets;
+        py::gil_scoped_release release;
+        sv.build(root);
+      }, py::arg("root"), py::arg("buckets") = 500)
+      .def("set_ranges", [](VectorSolver& sv, py::array_t<float, py::array::c_style | py::array::forcecast> r0,
                             py::array_t<float, py::array::c_style | py::array::forcecast> r1) {
         if (r0.size() != NUM_COMBOS || r1.size() != NUM_COMBOS) throw std::runtime_error("ranges must have 1326 entries");
         sv.set_ranges(r0.data(), r1.data());
       })
-      .def("set_variant", [](RiverSolver& sv, const std::string& name, double alpha, double beta, double gamma) {
+      .def("set_variant", [](VectorSolver& sv, const std::string& name, double alpha, double beta, double gamma) {
         if (name == "lcfr") sv.variant = 0;
         else if (name == "dcfr") sv.variant = 1;
         else if (name == "cfr+") sv.variant = 2;
@@ -1788,28 +2144,40 @@ PYBIND11_MODULE(headsup_cpp, m) {
         else throw std::runtime_error("variant must be lcfr | dcfr | cfr+ | pcfr+");
         sv.alpha = alpha; sv.beta = beta; sv.gamma = gamma;
       }, py::arg("name"), py::arg("alpha") = 1.5, py::arg("beta") = 0.0, py::arg("gamma") = 2.0)
-      .def("run", [](RiverSolver& sv, int iterations) {
-        if (sv.range[0].empty()) throw std::runtime_error("set ranges first");
+      .def("freeze", &VectorSolver::freeze, py::arg("node"), py::arg("hand"), py::arg("action"))
+      .def("run", [](VectorSolver& sv, int iterations, uint64_t seed, int threads) {
         py::gil_scoped_release release;
-        sv.run(iterations);
-      })
-      .def("root_strategy", [](RiverSolver& sv) { return sv.node_strategy(0); })
-      .def("node_strategy", &RiverSolver::node_strategy)
-      .def("tree", [](const RiverSolver& sv) {
+        sv.run(iterations, seed, threads);
+      }, py::arg("iterations"), py::arg("seed") = 0, py::arg("threads") = 1)
+      .def("root_strategy", [](const VectorSolver& sv, bool current) { return sv.node_strategy(0, current); }, py::arg("current") = false)
+      .def("node_strategy", &VectorSolver::node_strategy, py::arg("node"), py::arg("current") = false)
+      .def("strategy_on_board", &VectorSolver::strategy_on_board, py::arg("node"), py::arg("drawn"), py::arg("current") = false)
+      .def("buckets_of", [](const VectorSolver& sv, int round, const std::vector<int>& drawn) {
+        if (round <= sv.root_round || round > sv.last_round) throw std::runtime_error("buckets exist for the rounds after the root round");
+        if (int(drawn.size()) < BOARD_CARDS_BY_STAGE[round] - sv.known_board) throw std::runtime_error("not enough board cards for this round");
+        const std::vector<uint16_t>& b = sv.bucket_table(round, drawn.data());
+        return std::vector<int>(b.begin(), b.end());
+      }, py::arg("round"), py::arg("drawn"))
+      .def("child", &VectorSolver::child)
+      .def("tree", [](const VectorSolver& sv) {
         py::list out;
-        for (const SubgameNode& nd : sv.tree.nodes) {
+        for (size_t i = 0; i < sv.nodes.size(); ++i) {
+          const SubgameNode& nd = sv.nodes[i];
           py::dict d;
           d["kind"] = nd.kind; d["player"] = nd.player; d["folder"] = nd.folder; d["stake"] = nd.stake;
           d["legal"] = std::vector<bool>(nd.legal, nd.legal + sv.n_actions);
           d["twin"] = std::vector<int>(nd.twin, nd.twin + sv.n_actions);
           d["child"] = std::vector<int>(nd.child, nd.child + sv.n_actions);
           d["stage"] = nd.state.stage;
+          d["round"] = sv.node_round[i];
           out.append(d);
         }
         return out;
       })
-      .def_property_readonly("num_nodes", [](const RiverSolver& sv) { return int(sv.tree.nodes.size()); })
-      .def_property_readonly("iterations", [](const RiverSolver& sv) { return sv.iteration; });
+      .def_property_readonly("num_nodes", [](const VectorSolver& sv) { return int(sv.nodes.size()); })
+      .def_property_readonly("num_infosets", [](const VectorSolver& sv) { return int(sv.n_infosets); })
+      .def_property_readonly("root_round", [](const VectorSolver& sv) { return sv.root_round; })
+      .def_property_readonly("iterations", [](const VectorSolver& sv) { return sv.iteration.load(); });
 
   m.def("run_traversals", &run_traversals, py::arg("net0"), py::arg("net1"), py::arg("traverser"), py::arg("n_traversals"),
         py::arg("t"), py::arg("seed"), py::arg("cfg") = EngineConfig(), py::arg("decks") = py::none(),

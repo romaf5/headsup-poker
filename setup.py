@@ -31,8 +31,12 @@ class BuildExt(build_ext):
 
 
 extra = ["-O3"]
+link = []
 if sys.platform == "darwin":
     extra += ["-mmacosx-version-min=11.0"]
+elif sys.platform.startswith("linux"):
+    extra += ["-pthread"]
+    link += ["-pthread"]
 
 setup(
     name="headsup_cpp",
@@ -43,6 +47,7 @@ setup(
             ["headsup/cpp/headsup_cpp.cpp"],
             cxx_std=17,
             extra_compile_args=extra,
+            extra_link_args=link,
         )
     ],
     cmdclass={"build_ext": BuildExt},

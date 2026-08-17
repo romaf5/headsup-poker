@@ -143,7 +143,7 @@ def test_vector_river_solver_is_near_exact(variant):
     cpp = native.module()
     e = _river_root()
     r = valid_combos(BOARD).astype(np.float32)
-    sv = cpp.RiverSolver()
+    sv = cpp.VectorSolver()
     sv.build(e)
     sv.set_ranges(r, r.copy())
     sv.set_variant(variant)

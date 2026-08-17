@@ -19,7 +19,7 @@ subgame is solved exactly by full-width vector-form CFR over all 1326 hands (def
 DCFR, Brown & Sandholm 2019, alpha 1.5 / beta 0 / gamma 2; CFR+ and PCFR+ (predictive RM+,
 Farina, Kroer & Sandholm 2021) available) - ~200 iterations reach ~0.01 chips per hand pair of
 exploitability in well under a second.  Both solvers are C++ (``headsup_cpp.SubgameSolver`` /
-``RiverSolver``); ``exploitability`` computes the exact best response of both players against
+``VectorSolver``); ``exploitability`` computes the exact best response of both players against
 the solved strategies on river subgames - the correctness check.
 
 Player spec: ``search:<blueprint spec>[@it<N>][@rit<N>][@rv<variant>][@focus<f>][@cont<policy|iterate|bank>][@thin<K>]``,
@@ -297,7 +297,7 @@ class SearchPlayer:
         a, b = sorted(st["cards"])
         hh = cpp.combo_index(int(a), int(b))
         if e.stage == 3:  # river: exact full-width solve
-            sv = cpp.RiverSolver()
+            sv = cpp.VectorSolver()
             sv.build(e)
             sv.set_ranges(ranges[0].astype(np.float32), ranges[1].astype(np.float32))
             sv.set_variant(self.river_variant)

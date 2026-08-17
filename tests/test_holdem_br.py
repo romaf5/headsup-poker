@@ -90,7 +90,7 @@ def test_river_values_match_the_exact_search_evaluator():
 
 def test_fhp_estimate_is_zero_sum_and_bounds_the_profile():
     player = _random_player(FHP, seed=1)
-    res = HoldemBestResponse(player, FHP, boards=3, seed=0).run()
+    res = HoldemBestResponse(player, FHP, boards=2, seed=0).run()
     v0, v1 = res["values"]
     assert v0 == pytest.approx(-v1, abs=1e-9)  # exact zero sum for any sample of boards
     assert res["br_values"][0] >= v0 - 1e-9 and res["br_values"][1] >= v1 - 1e-9

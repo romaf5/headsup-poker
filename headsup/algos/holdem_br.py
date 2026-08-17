@@ -21,6 +21,7 @@ import time
 
 import numpy as np
 
+from headsup import native
 from headsup.cards import NUM_CARDS, hand_strength
 from headsup.engine import BOARD_CARDS_BY_STAGE, HeadsUpPoker
 from headsup.game import FHP, GameConfig
@@ -79,6 +80,22 @@ def chance_factor(revealed_before, revealed_after):
     return f
 
 
+class _NativeShowdown:
+    def __init__(self, board):
+        self.table = native.module().BoardTable(board, len(board))
+
+    def __call__(self, reach):
+        return self.table.showdown_values(reach)
+
+
+class _NumpyShowdown:
+    def __init__(self, strength):
+        self.strength = strength
+
+    def __call__(self, reach):
+        return _showdown_values(reach, self.strength)
+
+
 class HoldemBestResponse:
     def __init__(self, player, game=FHP, boards=200, seed=0, batch=8192):
         self.player, self.game = player, game
@@ -120,7 +137,7 @@ class HoldemBestResponse:
             out = np.zeros(NUM_COMBOS)
             for b, s in zip(boards, strength):
                 ok = valid_combos(b[:n_final])
-                out += nd.stake * _showdown_values(np.where(ok, reach_q, 0.0), s) * ok
+                out += nd.stake * s(np.where(ok, reach_q, 0.0)) * ok
             return out / (len(boards) * chance_factor(revealed, n_final))
         if nd.kind == 3:
             # street end: continue on each sampled board with its next street's cards
@@ -146,18 +163,24 @@ class HoldemBestResponse:
         """Public tree of the next street after ``engine``'s street-end state on ``board``."""
         e = engine.clone()
         e.board = tuple(board)  # the sampled board (the engine's dummy cards are replaced)
+        spare = [c for c in range(NUM_CARDS) if c not in board][:4]  # dummy hands off the board (showdowns evaluate them)
+        e.hands = ((spare[0], spare[1]), (spare[2], spare[3]))
         return build_street_tree(e)
 
     def _strengths(self, boards):
+        """Per board: the showdown-payoff evaluator (the C++ table when the extension is built,
+        otherwise the numpy strength-sorted cumulative sums of headsup.search)."""
         n_final = BOARD_CARDS_BY_STAGE[self.game.num_rounds - 1]
-        strength = []
+        if native.available():
+            return [_NativeShowdown(list(b[:n_final])) for b in boards]
+        out = []
         for b in boards:
             s = np.full(NUM_COMBOS, np.inf)
             final = list(b[:n_final])
             for h in np.flatnonzero(valid_combos(final)):
                 s[h] = hand_strength([int(COMBOS[h, 0]), int(COMBOS[h, 1])], final)
-            strength.append(s)
-        return strength
+            out.append(_NumpyShowdown(s))
+        return out
 
     def evaluate_from(self, engine, ranges, boards):
         """Best responses from a given public state with given ranges over the given full boards
