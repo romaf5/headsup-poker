@@ -283,7 +283,8 @@ def make_player(spec: str, device=None, deterministic=False, seed=None, game=Non
     ``@k64`` = the bank thinned to 64 representative iterates) |
     ``iterate:path/iterates.pt[@t<N>]`` (the current strategy of iteration N - regret matching on that
     iteration's advantage nets; default: the last one) | ``search:<blueprint spec>[@it<N>][@focus<f>]
-    [@cont<policy|iterate|bank>][@thin<K>]`` (real-time subgame search on top of the blueprint)
+    [@cont<policy|iterate|bank>][@thin<K>]`` (real-time subgame search on top of the blueprint) |
+    ``tab:path.pt[@current]`` (tabular MCCFR blueprint over the card abstraction, headsup.blueprint)
     """
     from headsup.paths import DEFAULT_ONNX_PATH, DEFAULT_POLICY_PATH
 
@@ -313,6 +314,11 @@ def make_player(spec: str, device=None, deterministic=False, seed=None, game=Non
 
         blueprint, kw = parse_search_spec(arg)
         return SearchPlayer(blueprint, device=device, seed=seed, game=game, **kw)
+    if kind == "tab":
+        from headsup.blueprint import TabularPlayer, parse_tab_spec
+
+        path, current = parse_tab_spec(arg)
+        return TabularPlayer(path, current=current, seed=seed)
     if kind == "iterate":
         import torch
 

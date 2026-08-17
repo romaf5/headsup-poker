@@ -17,6 +17,7 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -1327,6 +1328,55 @@ struct SubgameSolver {
   }
 };
 
+// ------------------------------------------------------------------ public betting tree of a (sub)game
+struct PublicTree {
+  std::vector<SubgameNode> nodes;
+  std::vector<int> round;
+
+  void build(const Engine& root) {
+    nodes.clear();
+    round.clear();
+    const int n_actions = root.num_actions();
+    SubgameNode rn;
+    rn.state = root;
+    nodes.push_back(rn);
+    round.push_back(root.stage);
+    for (size_t i = 0; i < nodes.size(); ++i) {
+      if (nodes[i].kind != 0) continue;
+      Engine e = nodes[i].state;
+      nodes[i].player = e.current;
+      bool legal[MAX_ACTIONS];
+      int twin[MAX_ACTIONS];
+      e.legal_mask(legal, twin);
+      for (int a = 0; a < n_actions; ++a) {
+        nodes[i].legal[a] = legal[a];
+        nodes[i].twin[a] = twin[a];
+        nodes[i].child[a] = -1;
+      }
+      for (int a = 0; a < n_actions; ++a) {
+        if (!legal[a]) continue;
+        Engine c = e;
+        c.step(a);
+        SubgameNode ch;
+        ch.state = c;
+        if (c.done) {
+          if (c.folded >= 0) {
+            ch.kind = 1;
+            ch.folder = c.folded;
+            ch.stake = c.bets[c.folded];
+          } else {
+            ch.kind = 2;
+            ch.stake = std::min(c.bets[0], c.bets[1]);
+          }
+        }
+        nodes[i].child[a] = int(nodes.size());
+        nodes.push_back(ch);
+        round.push_back(c.stage);
+      }
+    }
+  }
+};
+
 // ------------------------------------------------------------------ vector-form public-chance-sampling solver
 // Solves the rest of the hand from the start of a betting round (Pluribus's heads-up search: from
 // the flop on the subgame extends to the end of the game).  Vector form: every iteration processes
@@ -1486,45 +1536,10 @@ struct VectorSolver {
     n_actions = root.num_actions();
     for (int i = 0; i < 5; ++i) root_board[i] = root.board[i];
     // public tree of the whole remaining hand
-    nodes.clear();
-    node_round.clear();
-    SubgameNode rn;
-    rn.state = root;
-    nodes.push_back(rn);
-    node_round.push_back(root_round);
-    for (size_t i = 0; i < nodes.size(); ++i) {
-      if (nodes[i].kind != 0) continue;
-      Engine e = nodes[i].state;
-      nodes[i].player = e.current;
-      bool legal[MAX_ACTIONS];
-      int twin[MAX_ACTIONS];
-      e.legal_mask(legal, twin);
-      for (int a = 0; a < n_actions; ++a) {
-        nodes[i].legal[a] = legal[a];
-        nodes[i].twin[a] = twin[a];
-        nodes[i].child[a] = -1;
-      }
-      for (int a = 0; a < n_actions; ++a) {
-        if (!legal[a]) continue;
-        Engine c = e;
-        c.step(a);
-        SubgameNode ch;
-        ch.state = c;
-        if (c.done) {
-          if (c.folded >= 0) {
-            ch.kind = 1;
-            ch.folder = c.folded;
-            ch.stake = c.bets[c.folded];
-          } else {
-            ch.kind = 2;
-            ch.stake = std::min(c.bets[0], c.bets[1]);
-          }
-        }
-        nodes[i].child[a] = int(nodes.size());
-        nodes.push_back(ch);
-        node_round.push_back(c.stage);
-      }
-    }
+    PublicTree pt;
+    pt.build(root);
+    nodes = std::move(pt.nodes);
+    node_round = std::move(pt.round);
     info_offset.assign(nodes.size(), 0);
     n_infosets = 0;
     for (size_t i = 0; i < nodes.size(); ++i) {
@@ -1889,6 +1904,313 @@ struct VectorSolver {
   }
 };
 
+// ------------------------------------------------------------------ tabular blueprint (Pluribus's MCCFR-P)
+// The public betting tree of the whole game (every betting sequence of the action abstraction,
+// all rounds; a few thousand nodes for our games) x a card abstraction: lossless 169 hand classes
+// pre-flop, `buckets` equal-mass buckets of the hand's expected hand strength (equity vs a uniform
+// random hand, Monte-Carlo runouts on the flop / turn, exact on the river) on the later rounds.
+// Trained with Pluribus's Algorithm 1 (Brown & Sandholm 2019, supplementary material): external-
+// sampling MCCFR with unweighted regret updates and periodic linear discounting of regrets and
+// strategy counters (Linear MCCFR), negative-regret pruning of the traverser's actions in 95 % of
+// the iterations after a warm-up (never on the last betting round or into terminals), a regret
+// floor, and the average strategy tracked with sampled action counters (UPDATE-STRATEGY) - here
+// on every round, not only the first.  Threads share the tables (benign races, as in Pluribus).
+struct Abstraction {
+  int buckets = 200;   // per post-flop round
+  int samples = 500;   // Monte-Carlo runouts (flop / turn); the river is exact
+  int rounds = 4, showdown = 5;
+  std::vector<std::vector<float>> edges;  // per round: buckets-1 quantile edges of the EHS (round 0 unused)
+
+  static int preflop_index(int a, int b) {  // 169 classes: 13 pairs, 78 suited, 78 offsuit
+    const int ra = a % 13, rb = b % 13, sa = a / 13, sb = b / 13;
+    const int hi = std::max(ra, rb), lo = std::min(ra, rb);
+    if (hi == lo) return hi;
+    const int pair = hi * (hi - 1) / 2 + lo;  // 0..77
+    return sa == sb ? 13 + pair : 91 + pair;
+  }
+  int num_keys(int round) const { return round == 0 ? 169 : buckets; }
+
+  // expected hand strength of (c0, c1) on the first n cards of `board`: P(win) + P(tie)/2 against a
+  // uniform random opponent hand over uniform runouts (exact when the board is complete)
+  template <class RNG>
+  float ehs(int c0, int c1, const int* board, int n, RNG& rng) const {
+    bool used[NUM_CARDS] = {};
+    used[c0] = used[c1] = true;
+    for (int i = 0; i < n; ++i) used[board[i]] = true;
+    int deck[NUM_CARDS], nd = 0;
+    for (int c = 0; c < NUM_CARDS; ++c)
+      if (!used[c]) deck[nd++] = c;
+    const int missing = showdown - n;
+    int full[7] = {c0, c1, 0, 0, 0, 0, 0}, opp[7] = {0, 0, 0, 0, 0, 0, 0};
+    for (int i = 0; i < n; ++i) full[2 + i] = opp[2 + i] = board[i];
+    double win = 0.0, cnt = 0.0;
+    if (missing == 0) {
+      const int mine = eval_best(full, 2 + showdown);
+      for (int i = 0; i < nd; ++i)
+        for (int j = i + 1; j < nd; ++j) {
+          opp[0] = deck[i]; opp[1] = deck[j];
+          const int s = eval_best(opp, 2 + showdown);
+          win += mine < s ? 1.0 : mine == s ? 0.5 : 0.0;
+          cnt += 1.0;
+        }
+      return float(win / cnt);
+    }
+    for (int s_i = 0; s_i < samples; ++s_i) {  // sample runout + opponent hand without replacement
+      for (int i = 0; i < missing + 2; ++i) {
+        std::uniform_int_distribution<int> d(i, nd - 1);
+        std::swap(deck[i], deck[d(rng)]);
+      }
+      for (int i = 0; i < missing; ++i) full[2 + n + i] = opp[2 + n + i] = deck[i];
+      opp[0] = deck[missing]; opp[1] = deck[missing + 1];
+      const int mine = eval_best(full, 2 + showdown), s = eval_best(opp, 2 + showdown);
+      win += mine < s ? 1.0 : mine == s ? 0.5 : 0.0;
+      cnt += 1.0;
+    }
+    return float(win / cnt);
+  }
+
+  int bucket_of(int round, float e) const {
+    const std::vector<float>& ed = edges[round];
+    return int(std::upper_bound(ed.begin(), ed.end(), e) - ed.begin());
+  }
+  template <class RNG>
+  int bucket(int round, int c0, int c1, const int* board, RNG& rng) const {
+    if (round == 0) return preflop_index(c0, c1);
+    return bucket_of(round, ehs(c0, c1, board, BOARD_CARDS_BY_STAGE[round], rng));
+  }
+
+  // equal-mass bucket edges from random situations of every post-flop round
+  void fit_edges(int situations, uint64_t seed, int threads) {
+    edges.assign(rounds, {});
+    for (int r = 1; r < rounds; ++r) {
+      std::vector<float> vals(situations);
+      const int nb = BOARD_CARDS_BY_STAGE[r];
+      auto work = [&](int lo, int hi, uint64_t s) {
+        std::mt19937_64 rng(s);
+        for (int k = lo; k < hi; ++k) {
+          int deck[NUM_CARDS];
+          for (int i = 0; i < NUM_CARDS; ++i) deck[i] = i;
+          for (int i = 0; i < 2 + nb; ++i) {
+            std::uniform_int_distribution<int> d(i, NUM_CARDS - 1);
+            std::swap(deck[i], deck[d(rng)]);
+          }
+          vals[k] = ehs(deck[0], deck[1], deck + 2, nb, rng);
+        }
+      };
+      const int nt = std::max(1, threads);
+      std::vector<std::thread> pool;
+      for (int t = 0; t < nt; ++t)
+        pool.emplace_back(work, situations * t / nt, situations * (t + 1) / nt, seed * 7919ULL + uint64_t(r) * 104729ULL + uint64_t(t));
+      for (auto& th : pool) th.join();
+      std::sort(vals.begin(), vals.end());
+      for (int b = 1; b < buckets; ++b) edges[r].push_back(vals[size_t(situations) * b / buckets]);
+    }
+  }
+};
+
+struct TabularBlueprint {
+  EngineConfig cfg;
+  PublicTree tree;
+  Abstraction abs;
+  int n_actions = 4;
+  std::vector<int> info_offset;
+  size_t n_infosets = 0;
+  std::vector<float> regret, phi;  // per infoset x action; phi = average-strategy counters
+  std::atomic<long long> iteration{0};
+  // Pluribus parameters (iterations instead of minutes)
+  double prune_threshold = -3e6, regret_floor = -3.1e6;
+  long long prune_after = 0, lcfr_iterations = 0, discount_interval = 0, strategy_interval = 10000;
+  double prune_prob = 0.95;
+  std::mutex discount_mutex;
+
+  void build(const EngineConfig& c, int buckets, int samples) {
+    cfg = c;
+    Engine root(cfg);
+    int deck[9] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+    root.reset(deck);
+    n_actions = root.num_actions();
+    tree.build(root);
+    abs.buckets = buckets;
+    abs.samples = samples;
+    abs.rounds = cfg.num_rounds;
+    abs.showdown = cfg.showdown_cards();
+    info_offset.assign(tree.nodes.size(), 0);
+    n_infosets = 0;
+    for (size_t i = 0; i < tree.nodes.size(); ++i) {
+      info_offset[i] = int(n_infosets);
+      if (tree.nodes[i].kind == 0) n_infosets += size_t(abs.num_keys(tree.round[i]));
+    }
+    regret.assign(n_infosets * n_actions, 0.0f);
+    phi.assign(n_infosets * n_actions, 0.0f);
+    iteration = 0;
+  }
+
+  void sigma_of(size_t info, const bool* legal, float* sigma) const {
+    const float* R = regret.data() + info * n_actions;
+    float total = 0.0f;
+    int cnt = 0;
+    for (int a = 0; a < n_actions; ++a) {
+      const float r = (legal[a] && R[a] > 0) ? R[a] : 0.0f;
+      sigma[a] = r;
+      total += r;
+      cnt += legal[a];
+    }
+    for (int a = 0; a < n_actions; ++a) sigma[a] = total > 0 ? sigma[a] / total : (legal[a] ? 1.0f / cnt : 0.0f);
+  }
+
+  // -- one traversal ----------------------------------------------------------------------
+  struct Deal {
+    int hand[2][2], board[5];
+    int win[2];             // +1 / -1 / 0 at showdown for each seat
+    int bucket[2][4];       // per seat and round, -1 = not yet computed
+    bool prune;
+    std::mt19937_64* rng;
+  };
+
+  int key_of(Deal& d, int seat, int round) const {
+    int& b = d.bucket[seat][round];
+    if (b < 0) b = abs.bucket(round, d.hand[seat][0], d.hand[seat][1], d.board, *d.rng);
+    return b;
+  }
+
+  float traverse(int node, int p, Deal& d) {
+    const SubgameNode& nd = tree.nodes[node];
+    if (nd.kind == 1) return nd.folder == p ? -float(nd.stake) : float(nd.stake);
+    if (nd.kind == 2) return float(nd.stake) * float(d.win[p]);
+    const int round = tree.round[node];
+    const size_t info = size_t(info_offset[node]) + key_of(d, nd.player, round);
+    float sigma[MAX_ACTIONS];
+    sigma_of(info, nd.legal, sigma);
+    if (nd.player == p) {
+      float v[MAX_ACTIONS], value = 0.0f;
+      bool explored[MAX_ACTIONS] = {};
+      float* R = regret.data() + info * n_actions;
+      const bool last = round == cfg.num_rounds - 1;
+      for (int a = 0; a < n_actions; ++a) {
+        if (!nd.legal[a]) continue;
+        const bool terminal_child = tree.nodes[nd.child[a]].kind != 0;
+        if (d.prune && !last && !terminal_child && R[a] <= prune_threshold) continue;
+        v[a] = traverse(nd.child[a], p, d);
+        explored[a] = true;
+        value += sigma[a] * v[a];
+      }
+      for (int a = 0; a < n_actions; ++a)
+        if (explored[a]) R[a] = std::max(float(regret_floor), R[a] + v[a] - value);
+      return value;
+    }
+    std::uniform_real_distribution<float> u(0.0f, 1.0f);
+    float x = u(*d.rng), acc = 0.0f;
+    int chosen = -1;
+    for (int a = 0; a < n_actions; ++a) {
+      if (!nd.legal[a]) continue;
+      acc += sigma[a];
+      chosen = a;
+      if (x < acc) break;
+    }
+    return traverse(nd.child[chosen], p, d);
+  }
+
+  void update_strategy(int node, int p, Deal& d) {  // Pluribus UPDATE-STRATEGY (all rounds here)
+    const SubgameNode& nd = tree.nodes[node];
+    if (nd.kind != 0) return;
+    if (nd.player == p) {
+      const size_t info = size_t(info_offset[node]) + key_of(d, p, tree.round[node]);
+      float sigma[MAX_ACTIONS];
+      sigma_of(info, nd.legal, sigma);
+      std::uniform_real_distribution<float> u(0.0f, 1.0f);
+      float x = u(*d.rng), acc = 0.0f;
+      int chosen = -1;
+      for (int a = 0; a < n_actions; ++a) {
+        if (!nd.legal[a]) continue;
+        acc += sigma[a];
+        chosen = a;
+        if (x < acc) break;
+      }
+      phi[info * n_actions + chosen] += 1.0f;
+      update_strategy(nd.child[chosen], p, d);
+      return;
+    }
+    for (int a = 0; a < n_actions; ++a)
+      if (nd.legal[a]) update_strategy(nd.child[a], p, d);
+  }
+
+  void deal(Deal& d, std::mt19937_64& rng) {
+    int deck[NUM_CARDS];
+    for (int i = 0; i < NUM_CARDS; ++i) deck[i] = i;
+    for (int i = 0; i < 9; ++i) {
+      std::uniform_int_distribution<int> u(i, NUM_CARDS - 1);
+      std::swap(deck[i], deck[u(rng)]);
+    }
+    d.hand[0][0] = deck[0]; d.hand[0][1] = deck[1]; d.hand[1][0] = deck[2]; d.hand[1][1] = deck[3];
+    for (int i = 0; i < 5; ++i) d.board[i] = deck[4 + i];
+    const int nb = abs.showdown;
+    int c0[7] = {d.hand[0][0], d.hand[0][1], d.board[0], d.board[1], d.board[2], d.board[3], d.board[4]};
+    int c1[7] = {d.hand[1][0], d.hand[1][1], d.board[0], d.board[1], d.board[2], d.board[3], d.board[4]};
+    const int s0 = eval_best(c0, 2 + nb), s1 = eval_best(c1, 2 + nb);
+    d.win[0] = s0 == s1 ? 0 : (s0 < s1 ? 1 : -1);
+    d.win[1] = -d.win[0];
+    for (int s = 0; s < 2; ++s)
+      for (int r = 0; r < 4; ++r) d.bucket[s][r] = -1;
+    d.rng = &rng;
+  }
+
+  void discount(double f) {
+    for (size_t i = 0; i < regret.size(); ++i) regret[i] = float(regret[i] * f);
+    for (size_t i = 0; i < phi.size(); ++i) phi[i] = float(phi[i] * f);
+  }
+
+  void run(long long iterations, uint64_t seed, int threads) {
+    threads = std::max(1, threads);
+    auto worker = [this, iterations, seed, threads](int t) {
+      const long long n = iterations * (t + 1) / threads - iterations * t / threads;
+      std::mt19937_64 rng(seed * 1000003ULL + uint64_t(t) * 7919ULL + 3ULL);
+      std::uniform_real_distribution<double> u01(0.0, 1.0);
+      Deal d;
+      for (long long it = 0; it < n; ++it) {
+        const long long tt = ++iteration;
+        for (int p = 0; p < 2; ++p) {
+          deal(d, rng);
+          d.prune = tt > prune_after && prune_after > 0 && u01(rng) < prune_prob;
+          traverse(0, p, d);
+          if (strategy_interval > 0 && tt % strategy_interval == 0) {
+            deal(d, rng);
+            update_strategy(0, p, d);
+          }
+        }
+        if (discount_interval > 0 && tt < lcfr_iterations && tt % discount_interval == 0) {
+          const double k = double(tt / discount_interval);
+          std::lock_guard<std::mutex> lock(discount_mutex);
+          discount(k / (k + 1.0));
+        }
+      }
+    };
+    std::vector<std::thread> pool;
+    for (int t = 0; t < threads; ++t) pool.emplace_back(worker, t);
+    for (auto& th : pool) th.join();
+  }
+
+  // -- queries --------------------------------------------------------------------------------
+  int child(int node, int a) const {
+    if (node < 0 || node >= int(tree.nodes.size()) || a < 0 || a >= n_actions) return -1;
+    return tree.nodes[node].child[a];
+  }
+
+  // strategy at a node for one hand: normalised average counters (phi), regret matching where empty
+  void strategy_at(int node, int key, bool current, float* out) const {
+    const SubgameNode& nd = tree.nodes[node];
+    const size_t info = size_t(info_offset[node]) + key;
+    if (!current) {
+      float total = 0.0f;
+      for (int a = 0; a < n_actions; ++a) total += nd.legal[a] ? phi[info * n_actions + a] : 0.0f;
+      if (total > 0) {
+        for (int a = 0; a < n_actions; ++a) out[a] = nd.legal[a] ? phi[info * n_actions + a] / total : 0.0f;
+        return;
+      }
+    }
+    sigma_of(info, nd.legal, out);
+  }
+};
+
 // ------------------------------------------------------------------ micro benchmarks (for profiling)
 double bench_engine(int hands, uint64_t seed) {
   std::mt19937_64 rng(seed);
@@ -2195,6 +2517,97 @@ PYBIND11_MODULE(headsup_cpp, m) {
       .def_property_readonly("num_infosets", [](const VectorSolver& sv) { return int(sv.n_infosets); })
       .def_property_readonly("root_round", [](const VectorSolver& sv) { return sv.root_round; })
       .def_property_readonly("iterations", [](const VectorSolver& sv) { return sv.iteration.load(); });
+
+  py::class_<TabularBlueprint>(m, "TabularBlueprint")
+      .def(py::init<>())
+      .def("build", [](TabularBlueprint& b, const EngineConfig& cfg, int buckets, int samples) {
+        if (buckets < 1 || buckets > 65535 || samples < 1) throw std::runtime_error("bad buckets / samples");
+        b.build(cfg, buckets, samples);
+      }, py::arg("cfg"), py::arg("buckets") = 200, py::arg("samples") = 500)
+      .def("fit_abstraction", [](TabularBlueprint& b, int situations, uint64_t seed, int threads) {
+        py::gil_scoped_release release;
+        b.abs.fit_edges(situations, seed, threads);
+      }, py::arg("situations") = 200000, py::arg("seed") = 0, py::arg("threads") = 16)
+      .def("set_params", [](TabularBlueprint& b, double prune_threshold, double regret_floor, long long prune_after,
+                            long long lcfr_iterations, long long discount_interval, long long strategy_interval, double prune_prob) {
+        b.prune_threshold = prune_threshold; b.regret_floor = regret_floor; b.prune_after = prune_after;
+        b.lcfr_iterations = lcfr_iterations; b.discount_interval = discount_interval; b.strategy_interval = strategy_interval;
+        b.prune_prob = prune_prob;
+      }, py::arg("prune_threshold"), py::arg("regret_floor"), py::arg("prune_after"), py::arg("lcfr_iterations"),
+         py::arg("discount_interval"), py::arg("strategy_interval") = 10000, py::arg("prune_prob") = 0.95)
+      .def("run", [](TabularBlueprint& b, long long iterations, uint64_t seed, int threads) {
+        if (b.abs.edges.empty() && b.cfg.num_rounds > 1) throw std::runtime_error("fit_abstraction first");
+        py::gil_scoped_release release;
+        b.run(iterations, seed, threads);
+      }, py::arg("iterations"), py::arg("seed") = 0, py::arg("threads") = 16)
+      .def("child", &TabularBlueprint::child)
+      .def("node_player", [](const TabularBlueprint& b, int node) { return b.tree.nodes.at(node).kind == 0 ? b.tree.nodes[node].player : -1; })
+      .def("node_round", [](const TabularBlueprint& b, int node) { return b.tree.round.at(node); })
+      .def("node_legal", [](const TabularBlueprint& b, int node) {
+        const SubgameNode& nd = b.tree.nodes.at(node);
+        return std::vector<bool>(nd.legal, nd.legal + b.n_actions);
+      })
+      .def("bucket", [](const TabularBlueprint& b, int round, int c0, int c1, const std::vector<int>& board, uint64_t seed) {
+        std::mt19937_64 rng(seed);
+        int bd[5] = {0, 0, 0, 0, 0};
+        for (size_t i = 0; i < board.size() && i < 5; ++i) bd[i] = board[i];
+        return b.abs.bucket(round, c0, c1, bd, rng);
+      }, py::arg("round"), py::arg("c0"), py::arg("c1"), py::arg("board"), py::arg("seed") = 0)
+      .def("ehs", [](const TabularBlueprint& b, int c0, int c1, const std::vector<int>& board, uint64_t seed) {
+        std::mt19937_64 rng(seed);
+        int bd[5] = {0, 0, 0, 0, 0};
+        for (size_t i = 0; i < board.size() && i < 5; ++i) bd[i] = board[i];
+        return b.abs.ehs(c0, c1, bd, int(std::min<size_t>(board.size(), 5)), rng);
+      }, py::arg("c0"), py::arg("c1"), py::arg("board"), py::arg("seed") = 0)
+      .def("strategy", [](const TabularBlueprint& b, int node, int key, bool current) {
+        if (node < 0 || node >= int(b.tree.nodes.size()) || b.tree.nodes[node].kind != 0) throw std::runtime_error("not a decision node");
+        if (key < 0 || key >= b.abs.num_keys(b.tree.round[node])) throw std::runtime_error("bad key");
+        py::array_t<float> out(b.n_actions);
+        b.strategy_at(node, key, current, out.mutable_data());
+        return out;
+      }, py::arg("node"), py::arg("key"), py::arg("current") = false)
+      .def("strategy_for_hands", [](const TabularBlueprint& b, int node, py::array_t<int, py::array::c_style | py::array::forcecast> hands,
+                                    const std::vector<int>& board, uint64_t seed, bool current) {
+        if (node < 0 || node >= int(b.tree.nodes.size()) || b.tree.nodes[node].kind != 0) throw std::runtime_error("not a decision node");
+        if (hands.ndim() != 2 || hands.shape(1) != 2) throw std::runtime_error("hands must be (N, 2)");
+        const int n = int(hands.shape(0)), round = b.tree.round[node];
+        int bd[5] = {0, 0, 0, 0, 0};
+        for (size_t i = 0; i < board.size() && i < 5; ++i) bd[i] = board[i];
+        py::array_t<float> out({ssize_t(n), ssize_t(b.n_actions)});
+        auto h = hands.unchecked<2>();
+        auto o = out.mutable_unchecked<2>();
+        py::gil_scoped_release release;
+        std::mt19937_64 rng(seed);
+        std::vector<float> row(b.n_actions);
+        for (int i = 0; i < n; ++i) {
+          const int key = b.abs.bucket(round, h(i, 0), h(i, 1), bd, rng);
+          b.strategy_at(node, key, current, row.data());
+          for (int a = 0; a < b.n_actions; ++a) o(i, a) = row[a];
+        }
+        return out;
+      }, py::arg("node"), py::arg("hands"), py::arg("board"), py::arg("seed") = 0, py::arg("current") = false)
+      .def_property("regret", [](const TabularBlueprint& b) { return py::array_t<float>(b.regret.size(), b.regret.data()); },
+                    [](TabularBlueprint& b, py::array_t<float, py::array::c_style | py::array::forcecast> a) {
+                      if (size_t(a.size()) != b.regret.size()) throw std::runtime_error("regret size mismatch");
+                      std::memcpy(b.regret.data(), a.data(), b.regret.size() * sizeof(float));
+                    })
+      .def_property("phi", [](const TabularBlueprint& b) { return py::array_t<float>(b.phi.size(), b.phi.data()); },
+                    [](TabularBlueprint& b, py::array_t<float, py::array::c_style | py::array::forcecast> a) {
+                      if (size_t(a.size()) != b.phi.size()) throw std::runtime_error("phi size mismatch");
+                      std::memcpy(b.phi.data(), a.data(), b.phi.size() * sizeof(float));
+                    })
+      .def_property("edges", [](const TabularBlueprint& b) { return b.abs.edges; },
+                    [](TabularBlueprint& b, const std::vector<std::vector<float>>& e) {
+                      if (int(e.size()) != b.abs.rounds) throw std::runtime_error("edges: one list per round");
+                      b.abs.edges = e;
+                    })
+      .def_property("iterations", [](const TabularBlueprint& b) { return b.iteration.load(); },
+                    [](TabularBlueprint& b, long long v) { b.iteration = v; })
+      .def_property_readonly("num_nodes", [](const TabularBlueprint& b) { return int(b.tree.nodes.size()); })
+      .def_property_readonly("num_infosets", [](const TabularBlueprint& b) { return int(b.n_infosets); })
+      .def_property_readonly("num_actions", [](const TabularBlueprint& b) { return b.n_actions; })
+      .def_property_readonly("buckets", [](const TabularBlueprint& b) { return b.abs.buckets; })
+      .def_property_readonly("samples", [](const TabularBlueprint& b) { return b.abs.samples; });
 
   m.def("run_traversals", &run_traversals, py::arg("net0"), py::arg("net1"), py::arg("traverser"), py::arg("n_traversals"),
         py::arg("t"), py::arg("seed"), py::arg("cfg") = EngineConfig(), py::arg("decks") = py::none(),
