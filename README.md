@@ -186,6 +186,36 @@ weaker, so the bound stays valid; T = 300 iterates cost ~4 ms per iterate per 64
 The trainer logs `lbr/current_strategy`, `lbr/sdcfr` (and, at the end, `lbr_final/*` incl. the
 policy net) — LBR's chips/hand, lower is better.
 
+## Real-time search (depth-limited subgame solving)
+
+`headsup/search.py` + `headsup_cpp.SubgameSolver` / `RiverSolver` implement search at play time
+the way Libratus / Modicum / Pluribus do it: at every decision the game from the current public
+state is re-solved with CFR ("unsafe subgame solving", Brown & Sandholm 2017), the root dealing
+both players' hands from their ranges — the opponent's reach under the blueprint, the hero's under
+the strategies it actually played (nested re-solving) — and depth-limited to the end of the
+current street (Brown, Sandholm & Amos 2018): street-end leaves are rolled out with a
+continuation strategy (the blueprint policy net, the last SD-CFR iterate or a thinned bank of
+iterates, sampled per rollout). Pre-river subgames are solved by external-sampling MCCFR with
+tabular regrets and linear averaging, dealing the hero's real hand on half of its own
+traversals; the river is solved exactly by full-width vector-form CFR over all 1326 hands
+(DCFR by default; LCFR / CFR+ / PCFR+ selectable). `headsup.search.exploitability` computes the
+exact best response of both players in a river subgame, which is how the solvers are verified
+(tests): on a checked-down river with pot 4 / stacks 98 the exploitability of the solved profile
+is 2.7 chips per hand pair for uniform play, 0.27 after 800k sampled LCFR iterations (2.8 s) and
+0.003 after 200 vector-form DCFR iterations (0.45 s); with sampled regrets LCFR beat DCFR / CFR+ /
+PCFR+ (0.27 vs 0.73 / 0.78 / 0.76), with full-width updates DCFR / CFR+ / PCFR+ beat LCFR
+(0.0033 / 0.0080 / 0.0068 vs 0.0123 at 200 iterations).
+
+```bash
+python -m headsup.compare search:runs/x/policy.pth@it20000 cfr:runs/x/policy.pth --hands 2000
+python -m headsup.web --opponent search:runs/x/iterates.pt@contbank@thin8   # search on top of SD-CFR
+```
+
+Player spec: `search:<blueprint>[@it<N>][@rit<N>][@rv<lcfr|dcfr|cfr+|pcfr+>][@focus<f>][@cont<policy|iterate|bank>][@thin<K>]`.
+The public state (bet history) is rebuilt from the observation (`headsup/public.py`), so the
+search player works everywhere a player does (envs, UI, LBR, PPO exploiters). A decision costs
+~1–2 s pre-river at 20k iterations (tables are solved in parallel threads) and ~0.5 s on the river.
+
 **About the old "500 mbb/g".** The original `poker_env.py` (used for the exploiter) had no
 raise cap while the DeepCFR training env converted the 3rd consecutive raise into an all-in,
 so the exploiter partly learned to raise repeatedly into lines the bot had never seen. With
@@ -221,6 +251,8 @@ headsup/deepcfr/         memory.py (reservoir), traverse.py, train.py, evaluate.
 headsup/sdcfr.py         Single Deep CFR: iterate bank + average-strategy player (exact / trajectory sampling)
 headsup/compare.py       head-to-head comparison CLI;  headsup/exploit.py: multi-seed PPO exploitability CLI
 headsup/lbr.py           Local Best Response (range tracking, equity vs range, one-street lookahead) CLI
+headsup/search.py        real-time search player (subgame re-solving; C++ SubgameSolver / RiverSolver), exploitability check
+headsup/public.py        rebuild the public state (engine replay) from an observation
 headsup/web/             browser table: server.py (http.server), session.py (game logic), static/ (HTML/CSS/JS)
 headsup/rl/              rl_games registration (env.py), exploiter CLI (exploitability.py), ONNX export (onnx.py)
 models/                  deepcfr_policy.pth, rl_games_exploiter.onnx
@@ -275,5 +307,13 @@ exploitability is a PPO best-response lower bound, not exact.
 - V. Lisý, M. Bowling. *Equilibrium Approximation Quality of Current No-Limit Poker Bots.*
   AAAI-17 Workshop on Computer Poker and Imperfect Information Games, 2017.
   [arXiv:1612.07547](https://arxiv.org/abs/1612.07547) (Local Best Response)
+- N. Brown, T. Sandholm. *Safe and Nested Subgame Solving for Imperfect-Information Games.*
+  NeurIPS 2017. [arXiv:1705.02955](https://arxiv.org/abs/1705.02955) (subgame solving, nesting)
+- N. Brown, T. Sandholm, B. Amos. *Depth-Limited Solving for Imperfect-Information Games.*
+  NeurIPS 2018. [arXiv:1805.08195](https://arxiv.org/abs/1805.08195) (depth limit + continuation strategies)
+- N. Brown, T. Sandholm. *Solving Imperfect-Information Games via Discounted Regret Minimization.*
+  AAAI 2019. [arXiv:1809.04040](https://arxiv.org/abs/1809.04040) (DCFR, LCFR)
+- G. Farina, C. Kroer, T. Sandholm. *Faster Game Solving via Predictive Blackwell Approachability:
+  Connecting Regret Matching and Mirror Descent.* AAAI 2021. [arXiv:2007.14358](https://arxiv.org/abs/2007.14358) (PCFR+)
 - Tools: [treys](https://github.com/ihendley/treys) (hand evaluator),
   [rl_games](https://github.com/Denys88/rl_games) (PPO), [pybind11](https://github.com/pybind/pybind11)

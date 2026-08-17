@@ -55,6 +55,30 @@ def valid_combos(cards):
     return ok
 
 
+def transition_likelihood(engine, action, sigma):
+    """P(the public transition produced by ``action`` | hand) for every combo, from a strategy
+    ``sigma`` (1326, num_actions) at the engine's current decision: actions that lead to the same
+    public state (e.g. a capped raise and an all-in) are indistinguishable, so their probabilities
+    are summed.  The engine is left untouched."""
+    outcomes = []
+    legal = engine.legal_mask()
+    for cand in range(engine.num_actions):
+        if not legal[cand]:
+            outcomes.append(None)
+            continue
+        c = engine.clone()
+        c.step(cand)
+        outcomes.append((c.done, c.folded, tuple(c.bets), tuple(c.stacks), int(c.stage)))
+    c = engine.clone()
+    c.step(int(action))
+    taken = (c.done, c.folded, tuple(c.bets), tuple(c.stacks), int(c.stage))
+    like = np.zeros(NUM_COMBOS)
+    for cand, out in enumerate(outcomes):
+        if out == taken:
+            like += sigma[:, cand]
+    return like
+
+
 def substitute_hands(obs_row):
     """(1326, OBS_DIM): the observation ``obs_row`` with every possible hand in the hand slots."""
     rows = np.repeat(np.asarray(obs_row, dtype=np.float32)[None], NUM_COMBOS, axis=0)
@@ -166,22 +190,8 @@ class LocalBestResponse:
             self.model.observe(rows, ids, np.repeat(actions, NUM_COMBOS))
         for t, a, sig in zip(tables, actions, sigma):
             e = t.engine
-            # actions that lead to the same public transition are indistinguishable: sum their probability
-            outcomes = []
-            legal = e.legal_mask()
-            for cand in range(self.num_actions):
-                if not legal[cand]:
-                    outcomes.append(None)
-                    continue
-                c = e.clone()
-                c.step(cand)
-                outcomes.append((c.done, c.folded, tuple(c.bets), tuple(c.stacks), int(c.stage)))
+            like = transition_likelihood(e, int(a), sig)
             e.step(int(a))
-            taken = (e.done, e.folded, tuple(e.bets), tuple(e.stacks), int(e.stage))
-            like = np.zeros(NUM_COMBOS)
-            for cand, out in enumerate(outcomes):
-                if out == taken:
-                    like += sig[:, cand]
             t.range *= like
             total = t.range.sum()
             if total <= 1e-12:  # the model gave this line probability ~0: fall back to the prior

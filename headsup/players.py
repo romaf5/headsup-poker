@@ -280,7 +280,8 @@ def make_player(spec: str, device=None, deterministic=False, seed=None, game=Non
     trajectory sampling; ``@g2`` quadratic iterate weights; ``@t100`` = the average after 100 iterations;
     ``@k64`` = the bank thinned to 64 representative iterates) |
     ``iterate:path/iterates.pt[@t<N>]`` (the current strategy of iteration N - regret matching on that
-    iteration's advantage nets; default: the last one)
+    iteration's advantage nets; default: the last one) | ``search:<blueprint spec>[@it<N>][@focus<f>]
+    [@cont<policy|iterate|bank>][@thin<K>]`` (real-time subgame search on top of the blueprint)
     """
     from headsup.paths import DEFAULT_ONNX_PATH, DEFAULT_POLICY_PATH
 
@@ -305,6 +306,11 @@ def make_player(spec: str, device=None, deterministic=False, seed=None, game=Non
         path, mode, gamma, iterations, thin = parse_sdcfr_spec(arg)
         device = get_device(device) if not hasattr(device, "type") else device
         return SDCFRPlayer.load(path, device=device, mode=mode, seed=seed, weight_power=gamma, iterations=iterations, thin=thin)
+    if kind == "search":
+        from headsup.search import SearchPlayer, parse_search_spec
+
+        blueprint, kw = parse_search_spec(arg)
+        return SearchPlayer(blueprint, device=device, seed=seed, game=game, **kw)
     if kind == "iterate":
         import torch
 

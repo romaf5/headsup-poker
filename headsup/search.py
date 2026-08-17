@@ -1,0 +1,369 @@
+"""Real-time search: depth-limited (current-street) subgame re-solving at play time.
+
+Follows the "unsafe subgame solving" of Brown & Sandholm (2017, *Safe and Nested Subgame
+Solving for Imperfect-Information Games*): at a decision the remaining game from the current
+public state is solved with CFR, the root being a chance node that deals both players' hands
+from their *ranges* - the reach probabilities of every hand under the blueprint (for the
+opponent) and under the strategies actually played (for the hero) - and the result is played
+for the hero's real hand ("nested": the process repeats at every later decision with the
+updated ranges).  The subgame is depth-limited to the end of the current betting round as in
+Brown, Sandholm & Amos (2018, *Depth-Limited Solving for Imperfect-Information Games*): at a
+street-end leaf the hand is rolled out with a continuation strategy (the blueprint: the
+DeepCFR policy net, the last SD-CFR iterate or a thinned iterate bank; several can be given
+and are sampled per rollout, which is how Modicum / Pluribus estimate leaf values with a
+handful of continuation strategies).  Before the river the solver is external-sampling MCCFR
+with tabular regrets over (public sequence, hand) infosets and linear averaging (LCFR - with
+sampled regrets it beat DCFR / CFR+ / PCFR+ in our tests), the hero's real hand being dealt on
+half of its own traversals ("targeted" sampling); on the river every leaf is terminal and the
+subgame is solved exactly by full-width vector-form CFR over all 1326 hands (default variant
+DCFR, Brown & Sandholm 2019, alpha 1.5 / beta 0 / gamma 2; CFR+ and PCFR+ (predictive RM+,
+Farina, Kroer & Sandholm 2021) available) - ~200 iterations reach ~0.01 chips per hand pair of
+exploitability in well under a second.  Both solvers are C++ (``headsup_cpp.SubgameSolver`` /
+``RiverSolver``); ``exploitability`` computes the exact best response of both players against
+the solved strategies on river subgames - the correctness check.
+
+Player spec: ``search:<blueprint spec>[@it<N>][@rit<N>][@rv<variant>][@focus<f>][@cont<policy|iterate|bank>][@thin<K>]``,
+e.g. ``search:cfr:runs/x/policy.pth@it20000@rit200``.
+"""
+
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+
+from headsup.cards import NUM_CARDS, hand_strength
+from headsup.game import DEFAULT_GAME
+from headsup.lbr import COMBOS, NUM_COMBOS, substitute_hands, valid_combos
+
+_CARD_COMBOS = [np.flatnonzero((COMBOS == c).any(axis=1)) for c in range(NUM_CARDS)]
+
+
+# ----------------------------------------------------------------------------- evaluation
+def _opponent_mass(reach, blockers=True):
+    """M[h] = sum of ``reach`` over combos compatible with combo h (no shared card)."""
+    total = reach.sum()
+    per_card = np.array([reach[_CARD_COMBOS[c]].sum() for c in range(NUM_CARDS)])
+    return total - per_card[COMBOS[:, 0]] - per_card[COMBOS[:, 1]] + reach
+
+
+def _showdown_values(reach, strength):
+    """u[h] = sum over compatible h' of reach[h'] * (+1 if h beats h', -1 if h' beats h) with
+    ``strength`` = treys rank per combo (lower is stronger; +inf for combos blocked by the board)."""
+    order = np.argsort(strength, kind="stable")
+    s_sorted = strength[order]
+    r_sorted = reach[order]
+    # for each combo: mass of strictly weaker (larger rank) and strictly stronger combos
+    cum = np.cumsum(r_sorted)
+    total = cum[-1]
+    # position of the first / last combo with the same strength
+    first = np.searchsorted(s_sorted, s_sorted, side="left")
+    last = np.searchsorted(s_sorted, s_sorted, side="right")
+    stronger_sorted = np.where(first > 0, cum[np.maximum(first - 1, 0)], 0.0)
+    weaker_sorted = total - cum[last - 1]
+    stronger = np.empty(NUM_COMBOS)
+    weaker = np.empty(NUM_COMBOS)
+    stronger[order] = stronger_sorted
+    weaker[order] = weaker_sorted
+    # remove combos sharing a card with h (they cannot be held): per card, the same cumulative trick
+    for c in range(NUM_CARDS):
+        idx = _CARD_COMBOS[c]
+        sub = strength[idx]
+        o = np.argsort(sub, kind="stable")
+        ss, rr = sub[o], reach[idx][o]
+        cs = np.cumsum(rr)
+        f = np.searchsorted(ss, ss, side="left")
+        l = np.searchsorted(ss, ss, side="right")
+        st = np.where(f > 0, cs[np.maximum(f - 1, 0)], 0.0)
+        wk = cs[-1] - cs[l - 1]
+        stronger[idx[o]] -= st
+        weaker[idx[o]] -= wk
+    # h itself was subtracted twice (once per card): it is neither weaker nor stronger, nothing to add back
+    return weaker - stronger
+
+
+def exploitability(tree, strategies, ranges, board, game=DEFAULT_GAME):
+    """Exact best-response values in a river subgame (all leaves terminal).
+
+    ``tree``: ``SubgameSolver.tree()``; ``strategies[node]``: (1326, A) average strategy at every
+    decision node; ``ranges``: (2, 1326) reach weights; ``board``: the 5 board cards.  Returns
+    ``(exploitability, br_values, values)``: mean best-response gain (chips per hand pair, i.e. how
+    much each player could gain on average by best-responding), the two best-response values and
+    the two values of the profile itself.
+    """
+    strength = np.full(NUM_COMBOS, np.inf)
+    ok = valid_combos(board)
+    for h in np.flatnonzero(ok):
+        strength[h] = hand_strength([int(COMBOS[h, 0]), int(COMBOS[h, 1])], board)
+    r = [np.where(ok, ranges[0], 0.0).astype(np.float64), np.where(ok, ranges[1], 0.0).astype(np.float64)]
+
+    def values(node, p, reach_q, best_response):
+        """counterfactual values of player p's hands at ``node`` given opponent reach ``reach_q``."""
+        nd = tree[node]
+        if nd["kind"] == 1:
+            sign = 1.0 if nd["folder"] != p else -1.0
+            return sign * nd["stake"] * _opponent_mass(reach_q)
+        if nd["kind"] == 2:
+            return nd["stake"] * _showdown_values(reach_q, strength)
+        if nd["kind"] != 0:
+            raise ValueError("exploitability needs a subgame whose leaves are all terminal (river)")
+        acts = [a for a in range(len(nd["legal"])) if nd["legal"][a]]
+        if nd["player"] == p:
+            child_values = np.stack([values(nd["child"][a], p, reach_q, best_response) for a in acts])
+            if best_response:
+                return child_values.max(axis=0)
+            sig = strategies[node][:, acts].T  # (n_acts, 1326)
+            return (sig * child_values).sum(axis=0)
+        sig = strategies[node]
+        return sum(values(nd["child"][a], p, reach_q * sig[:, a], best_response) for a in acts)
+
+    joint = float(_opponent_mass(r[1]) @ r[0])  # sum over compatible hand pairs of r0 * r1
+    out_br, out_v = [], []
+    for p in (0, 1):
+        q = 1 - p
+        br = float(r[p] @ values(0, p, r[q], True)) / joint
+        v = float(r[p] @ values(0, p, r[q], False)) / joint
+        out_br.append(br)
+        out_v.append(v)
+    return 0.5 * (out_br[0] + out_br[1]), out_br, out_v
+
+
+# ----------------------------------------------------------------------------- the player
+def _continuations(spec, device, kind, thin):
+    """C++ continuation strategies for the rollouts beyond the depth limit: lists (nets0, nets1, rm, weights).
+
+    ``kind``: ``policy`` (the DeepCFR average-strategy net; softmax), ``iterate`` (the last SD-CFR
+    iterate's advantage nets; regret matching) or ``bank`` (``thin`` representative iterates of the
+    bank with their averaging weights - several continuation strategies, sampled per rollout).
+    """
+    import torch
+
+    from headsup import native
+    from headsup.model import BaseModel, load_model
+    from headsup.players import parse_sdcfr_spec
+
+    k, _, arg = spec.partition(":")
+    k = k.lower()
+    if k in ("cfr", "policy", "torch"):
+        if kind != "policy":
+            raise ValueError("a policy-net blueprint only offers the 'policy' continuation")
+        from headsup.paths import DEFAULT_POLICY_PATH
+
+        m = native.make_model(load_model(arg or DEFAULT_POLICY_PATH).numpy_weights())
+        return [m], [m], [False], [1.0]
+    if k in ("sdcfr", "iterate"):
+        path, _, gamma, iterations, _ = parse_sdcfr_spec(arg)
+        data = torch.load(path, map_location="cpu", weights_only=True)
+        T = data["T"] if iterations is None else min(iterations, data["T"])
+        weights = np.arange(1, T + 1, dtype=np.float64) ** gamma
+        if kind in ("policy", "iterate"):
+            picks, w = [T - 1], [1.0]
+        else:  # bank: representative iterates of equal-weight bins (see IterateBank.thin)
+            n = max(1, min(thin, T))
+            cum = np.cumsum(weights) / weights.sum()
+            edges = np.arange(1, n + 1) / n
+            picks = sorted(set(int(np.searchsorted(cum, e_)) for e_ in edges))
+            picks = [min(p_, T - 1) for p_ in picks]
+            bounds = [-1] + picks
+            w = [float(weights[bounds[i] + 1 : bounds[i + 1] + 1].sum()) for i in range(len(picks))]
+        nets = [[], []]
+        for t in picks:
+            for seat in (0, 1):
+                m = BaseModel(config=data["config"])
+                m.load_state_dict({key: v[t] for key, v in data["seats"][seat].items()})
+                nets[seat].append(native.make_model(m.numpy_weights()))
+        return nets[0], nets[1], [True] * len(picks), list(w)
+    raise ValueError(f"no continuation strategy for blueprint spec {spec!r}")
+
+
+class SearchPlayer:
+    """Plays a blueprint improved by real-time subgame search (see the module docstring).
+
+    ``blueprint``: player spec of the strategy that (a) models the opponent for the range updates,
+    (b) plays beyond the depth limit (``continuation``: policy | iterate | bank).  Batched and
+    stateful (``ids``): per table it keeps both ranges and the number of history actions already
+    accounted for; the public state is rebuilt from the observation at every decision.
+    """
+
+    wants_ids = True
+
+    def __init__(self, blueprint, iterations=20_000, focus=0.5, continuation=None, thin=8, device=None, seed=0,
+                 workers=None, game=None, river_iterations=200, river_variant="dcfr"):
+        from headsup import native
+        from headsup.lbr import _model_for
+        from headsup.players import make_player
+
+        self.spec = blueprint
+        self.iterations, self.focus = int(iterations), float(focus)
+        self.river_iterations, self.river_variant = int(river_iterations), river_variant
+        self.model = _model_for(blueprint, device, seed + 1, model_iterates=thin, game=game)  # models the opponent
+        self.model_observes = hasattr(self.model, "observe")
+        self.game = getattr(self.model, "game", None) or make_player(blueprint, device=device, seed=seed).game
+        kind = continuation or ("policy" if blueprint.split(":")[0] in ("cfr", "policy", "torch") else "iterate")
+        self.continuation = kind
+        self.conts = _continuations(blueprint, device, kind, thin)
+        self._cpp = native.module()
+        self._cfg = native.engine_config(game=self.game)
+        self.rng = np.random.default_rng(seed)
+        self._pool = ThreadPoolExecutor(workers or 8)
+        self.state = {}  # table id -> dict(villain, hero, processed, last_root)
+        self.last_probs = None
+        self.solve_time = 0.0
+
+    # ------------------------------------------------------------------ per-table bookkeeping
+    def _fresh(self, obs):
+        from headsup.public import hero_cards
+
+        mine = hero_cards(obs)
+        villain = valid_combos(mine).astype(np.float64)
+        hero = np.ones(NUM_COMBOS)
+        return {"villain": villain, "hero": hero, "processed": 0, "last_root": None, "last_action": None, "cards": tuple(mine)}
+
+    @staticmethod
+    def _n_actions(obs):
+        from headsup.engine import HISTORY_ROUNDS, HISTORY_SLOTS, history_slot
+
+        return int(sum(obs[history_slot(r, k) + 1] > 0 for r in range(HISTORY_ROUNDS) for k in range(HISTORY_SLOTS)))
+
+    def _prepare(self, obs_row, tid):
+        """Rebuild the public state; return (engine, hero_seat, actions, pending villain decisions)."""
+        from headsup.public import hero_cards, replay_from_obs
+
+        st = self.state.get(tid)
+        n_now = self._n_actions(obs_row)
+        if st is None or n_now < st["processed"] or st["cards"] != tuple(hero_cards(obs_row)):
+            st = self.state[tid] = self._fresh(obs_row)
+        actions, pending, hero_pending = [], [], []
+        counter = [0]
+
+        def on_action(engine, seat, action):
+            i = counter[0]
+            counter[0] += 1
+            actions.append(action)
+            if i < st["processed"]:
+                return
+            if seat != int(obs_row[22]):  # villain decision: needs the blueprint's strategy for every hand
+                pending.append((engine.observation(seat), engine.clone(), action))
+            else:  # hero decision taken by us (or by someone else: fall back to the blueprint)
+                hero_pending.append((engine.observation(seat), engine.clone(), action))
+
+        engine, hero = replay_from_obs(obs_row, self.game, on_action=on_action)
+        return engine, hero, actions, pending, hero_pending, st
+
+    def _update_ranges(self, jobs):
+        """Apply the pending villain (blueprint) and hero (own solved / blueprint) range updates."""
+        from headsup.lbr import transition_likelihood
+
+        queries = []  # (table id, kind, obs, engine, action)
+        for tid, (engine, hero, actions, pending, hero_pending, st) in jobs.items():
+            for obs_v, eng, a in pending:
+                queries.append((tid, "villain", obs_v, eng, a))
+            for obs_h, eng, a in hero_pending:
+                if st["last_root"] is not None and st["last_action"] == a and st["last_root"].shape[0] == NUM_COMBOS:
+                    st["hero"] *= transition_likelihood(eng, a, st["last_root"])
+                    st["last_root"] = None
+                else:
+                    queries.append((tid, "hero", obs_h, eng, a))
+        if queries:
+            rows = np.concatenate([substitute_hands(q[2]) for q in queries])
+            ids = np.concatenate([q[0] * NUM_COMBOS + np.arange(NUM_COMBOS) for q in queries])
+            probs = np.asarray(self.model.probs(rows, ids), dtype=np.float64).reshape(len(queries), NUM_COMBOS, -1)
+            if self.model_observes:
+                self.model.observe(rows, ids, np.repeat([q[4] for q in queries], NUM_COMBOS))
+            for (tid, kind, _, eng, a), sig in zip(queries, probs):
+                jobs[tid][5][kind] *= transition_likelihood(eng, a, sig)
+        for tid, (engine, hero, actions, pending, hero_pending, st) in jobs.items():
+            st["processed"] = len(actions)
+            board = list(engine.visible_board)
+            if board:
+                ok = valid_combos(board)
+                st["villain"] *= ok
+                st["hero"] *= ok
+            for key in ("villain", "hero"):
+                total = st[key].sum()
+                if total <= 1e-12:  # the model gave the observed line probability 0: fall back to uniform
+                    st[key] = valid_combos(board + (list(st["cards"]) if key == "villain" else [])).astype(np.float64)
+                    total = st[key].sum()
+                st[key] /= total
+
+    def _solve(self, engine, hero, actions, st, seed):
+        cpp = self._cpp
+        e = cpp.Engine(self._cfg)
+        e.reset(list(engine.hands[0]) + list(engine.hands[1]) + list(engine.board))
+        for a in actions:
+            e.step(int(a))
+        ranges = [st["hero"], st["villain"]] if hero == 0 else [st["villain"], st["hero"]]
+        a, b = sorted(st["cards"])
+        hh = cpp.combo_index(int(a), int(b))
+        if e.stage == 3:  # river: exact full-width solve
+            sv = cpp.RiverSolver()
+            sv.build(e)
+            sv.set_ranges(ranges[0].astype(np.float32), ranges[1].astype(np.float32))
+            sv.set_variant(self.river_variant)
+            sv.run(self.river_iterations)
+            return sv.root_strategy(), hh
+        sv = cpp.SubgameSolver()
+        sv.build(e)
+        sv.set_ranges(ranges[0].astype(np.float32), ranges[1].astype(np.float32))
+        n0, n1, rm, w = self.conts
+        sv.set_continuations(n0, n1, rm, w)
+        sv.run(self.iterations, int(seed), hero, hh, self.focus)
+        return sv.root_strategy(), hh
+
+    # ------------------------------------------------------------------ player protocol
+    def probs(self, obs, ids=None):
+        from headsup.engine import legal_mask_from_obs
+
+        obs = np.asarray(obs, dtype=np.float32)
+        ids = np.arange(len(obs)) if ids is None else np.asarray(ids)
+        jobs = {int(t): self._prepare(o, int(t)) for o, t in zip(obs, ids)}
+        self._update_ranges(jobs)
+        t0 = time.perf_counter()
+        seeds = self.rng.integers(2**63, size=len(ids))
+        futs = {int(t): self._pool.submit(self._solve, *jobs[int(t)][:3], jobs[int(t)][5], sd) for t, sd in zip(ids, seeds)}
+        out = np.zeros((len(obs), self.game.num_actions), dtype=np.float32)
+        for i, t in enumerate(ids):
+            root, hh = futs[int(t)].result()
+            jobs[int(t)][5]["last_root"] = root.astype(np.float64)
+            out[i] = root[hh]
+        self.solve_time += time.perf_counter() - t0
+        legal = legal_mask_from_obs(obs, self.game)
+        out[~legal] = 0.0
+        s = out.sum(axis=1, keepdims=True)
+        out = np.where(s > 0, out / np.maximum(s, 1e-12), legal / legal.sum(axis=1, keepdims=True))
+        return out.astype(np.float32)
+
+    def __call__(self, obs, ids=None):
+        from headsup.players import sample_actions
+
+        ids = np.arange(len(obs)) if ids is None else np.asarray(ids)
+        self.last_probs = self.probs(obs, ids)
+        actions = sample_actions(self.last_probs, self.rng)
+        for t, a in zip(ids, actions):
+            self.state[int(t)]["last_action"] = int(a)
+        return actions
+
+
+def parse_search_spec(arg):
+    """``<blueprint spec>[@it<N>][@rit<N>][@rv<variant>][@focus<f>][@cont<policy|iterate|bank>][@thin<K>]`` -> kwargs."""
+    parts = arg.split("@")
+    # the blueprint spec itself may contain '@' options (sdcfr:...@g2): the search options are the
+    # trailing ones that parse as ours
+    kw = {}
+    while len(parts) > 1:
+        o = parts[-1]
+        if o.startswith("it") and o[2:].isdigit():
+            kw["iterations"] = int(o[2:])
+        elif o.startswith("rit") and o[3:].isdigit():
+            kw["river_iterations"] = int(o[3:])
+        elif o.startswith("rv") and o[2:] in ("lcfr", "dcfr", "cfr+", "pcfr+"):
+            kw["river_variant"] = o[2:]
+        elif o.startswith("focus"):
+            kw["focus"] = float(o[5:])
+        elif o.startswith("cont"):
+            kw["continuation"] = o[4:]
+        elif o.startswith("thin") and o[4:].isdigit():
+            kw["thin"] = int(o[4:])
+        else:
+            break
+        parts.pop()
+    return "@".join(parts), kw

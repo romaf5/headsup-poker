@@ -19,7 +19,9 @@ rules (free fold allowed); the no-free-fold rule is now in place and everything 
   engines / traversal / players / envs / SD-CFR / LBR / web UI / rl env generic in `num_actions`
   (default 4-action game bit-identical). Not yet trained (see Step 3 below: retrain, more traversals).
 - Step 4: `--regret-power` (t^alpha sample weights, DCFR alpha = 1.5) and `--strategy-power` (gamma = 2)
-  options added; DREAM / ESCHER / search not started.
+  options added; real-time search DONE in code (headsup/search.py: unsafe depth-limited subgame solving,
+  sampled LCFR pre-river + vector-form DCFR/CFR+/PCFR+ river solver, verified with exact best responses);
+  its evaluation vs the blueprint is pending; DREAM / ESCHER not started.
 
 ## Step 0 — retrain on the fixed rules (first thing on the new machine)
 

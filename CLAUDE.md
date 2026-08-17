@@ -54,6 +54,10 @@ headsup/sdcfr.py         IterateBank (all iterations' nets, vmapped) + SDCFRPlay
 headsup/compare.py       head-to-head round robin CLI;   headsup/exploit.py: K PPO exploiters -> exploitability lower bound
 headsup/lbr.py           Local Best Response: range over 1326 combos, C++ equity_vs_all kernel, one-street lookahead; CLI;
                          trainer hook --lbr-every (lbr/current_strategy, lbr/sdcfr; final lbr_final/* incl. avg_strategy)
+headsup/public.py        replay_from_obs(): rebuild the public state (engine) from an observation's bet history
+headsup/search.py        SearchPlayer (spec `search:<blueprint>@it..@rit..`): unsafe depth-limited subgame solving; C++
+                         SubgameSolver (sampled LCFR, hero-hand focus, blueprint rollouts) / RiverSolver (vector-form
+                         CFR: lcfr|dcfr|cfr+|pcfr+); exploitability() = exact BR check on river subgames
 headsup/web/             browser table: server.py (stdlib http.server), session.py (game logic), static/ (HTML/CSS/JS)
 headsup/rl/              rl_games integration: env.py (registration, own vec env, no Ray), exploitability.py (PPO CLI), onnx.py (export)
 models/                  deepcfr_policy.pth (shipped), deepcfr_policy_v1.pth (original), rl_games_exploiter.onnx, README.json
@@ -152,6 +156,10 @@ epochs ~30 min in parallel; the final 50-epoch policy fit ~3 min. Checkpoints wi
 - Keep C++ and Python behaviour identical; every engine/traversal change needs both implementations
   and the differential tests. Rebuild the extension after touching `headsup/cpp/`.
 - Commit/push only when asked; results changes go with README + `models/README.json` updates.
+- Search: pre-river subgames use *sampled* MCCFR where LCFR beats DCFR/CFR+/PCFR+ (measured); the
+  river uses full-width vector CFR where DCFR/CFR+/PCFR+ win. Do not "improve" the sampled solver with
+  regret flooring. `search:` players are stateful (wants_ids) and slow (~1-2 s/decision): evaluate on
+  1-2k hands, LBR models them with the blueprint (still a valid lower bound).
 - Prefer measuring (compare / exploit / lbr tools, 400k+ hands; LBR 20k+ duplicate pairs) over anecdotes;
   report ± standard errors. LBR vs an SD-CFR bank: query cost ~4 ms x iterates per 64-table query, so
   thin the queried bank (`--model-iterates 32`); the bound stays valid (LBR only gets weaker).
