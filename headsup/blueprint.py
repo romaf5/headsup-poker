@@ -185,7 +185,8 @@ def main(argv=None):
     p.add_argument("--prune-after", type=float, default=0.2, help="start pruning after this fraction of the iterations (Pluribus: 200 minutes)")
     p.add_argument("--no-prune", action="store_true")
     p.add_argument("--strategy-every", type=int, default=None,
-                   help="UPDATE-STRATEGY interval in iterations (Pluribus: 10 000; default: iterations / 100 000, at least 1)")
+                   help="UPDATE-STRATEGY interval in iterations (Pluribus: 10 000 of ~1e9+; default: iterations / 1 000 000, at least 1 - "
+                        "the sampled counters need many visits per infoset to be a precise average)")
     p.add_argument("--chunks", type=int, default=20, help="training chunks (checkpoint + evaluation after each)")
     p.add_argument("--eval-hands", type=int, default=50_000)
     p.add_argument("--seed", type=int, default=0)
@@ -197,7 +198,7 @@ def main(argv=None):
     bp = TabularBlueprint(game, args.buckets, args.samples)
     bp.configure(lcfr_iterations=int(args.lcfr * args.iterations), discount_interval=max(1, int(args.discount_every * args.iterations)),
                  prune_after=0 if args.no_prune else int(args.prune_after * args.iterations),
-                 strategy_interval=args.strategy_every or max(1, args.iterations // 100_000))
+                 strategy_interval=args.strategy_every or max(1, args.iterations // 1_000_000))
     print(f"{args.game}: {bp.cpp.num_nodes} public nodes, {bp.cpp.num_infosets:,} infosets; params {bp.params}", flush=True)
     t0 = time.perf_counter()
     bp.fit_abstraction(args.situations, args.seed, args.threads)
