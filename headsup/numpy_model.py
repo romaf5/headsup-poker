@@ -26,7 +26,8 @@ class NumpyModel:
         self.dim, self.rm_fallback = self.config["dim"], self.config["rm_fallback"]
         self.game = GameConfig.from_dict(self.config["game"])
         self.num_actions = self.game.num_actions
-        self.obs_dim = obs_dim_for(self.features)
+        self.opp_cards = self.config["opp_cards"]
+        self.obs_dim = obs_dim_for(self.features, self.opp_cards)
         self.bet_index = np.asarray(bet_feature_indices(self.features, self.arch), dtype=np.int64)
 
         if self.cards == "embed":
@@ -37,7 +38,7 @@ class NumpyModel:
                         w[f"card_model.group_embeddings.{g}.suit_embedding.weight"],
                         w[f"card_model.group_embeddings.{g}.card_embedding.weight"],
                     )
-                    for g in range(4)
+                    for g in range(5 if self.opp_cards else 4)
                 ]
             else:
                 self.emb = (
@@ -73,23 +74,26 @@ class NumpyModel:
         if self.cards == "embed":
             if self.arch == "paper":
                 g = self.group_emb
-                x = np.concatenate(
-                    [
-                        self._embed(g[0], cards[:, 0]) + self._embed(g[0], cards[:, 1]),
-                        self._embed(g[1], cards[:, 2]) + self._embed(g[1], cards[:, 3]) + self._embed(g[1], cards[:, 4]),
-                        self._embed(g[2], cards[:, 5]),
-                        self._embed(g[3], cards[:, 6]),
-                    ],
-                    axis=1,
-                )
+                groups = [
+                    self._embed(g[0], cards[:, 0]) + self._embed(g[0], cards[:, 1]),
+                    self._embed(g[1], cards[:, 2]) + self._embed(g[1], cards[:, 3]) + self._embed(g[1], cards[:, 4]),
+                    self._embed(g[2], cards[:, 5]),
+                    self._embed(g[3], cards[:, 6]),
+                ]
+                if self.opp_cards:
+                    groups.append(self._embed(g[4], cards[:, 7]) + self._embed(g[4], cards[:, 8]))
+                x = np.concatenate(groups, axis=1)
             else:
                 emb = self._embed(self.emb, cards)
-                x = np.concatenate([emb[:, :2].sum(axis=1), emb[:, 2:5].sum(axis=1), emb[:, 5], emb[:, 6]], axis=1)
+                groups = [emb[:, :2].sum(axis=1), emb[:, 2:5].sum(axis=1), emb[:, 5], emb[:, 6]]
+                if self.opp_cards:
+                    groups.append(emb[:, 7:9].sum(axis=1))
+                x = np.concatenate(groups, axis=1)
             x = _relu(self._linear(self.card_fc1, x))
         else:
             # Linear on the concatenated one-hot cards == sum of the selected weight columns
             w, b = self.onehot
-            cols = cards[:, :, 2] + CARD_CLASSES * np.arange(7)[None, :]  # (B, 7)
+            cols = cards[:, :, 2] + CARD_CLASSES * np.arange(cards.shape[1])[None, :]  # (B, slots)
             x = _relu(w.T[cols].sum(axis=1) + b)
         for wb in self.card_fc:
             x = _relu(self._linear(wb, x))
@@ -103,6 +107,10 @@ class NumpyModel:
         if obs.shape[1] < self.obs_dim:
             raise ValueError(f"observation has {obs.shape[1]} features, this network needs {self.obs_dim}")
         cards = obs[:, :21].astype(np.int64).reshape(-1, 7, 3)
+        if self.opp_cards:
+            from headsup.model import OPP_CARDS_OFFSET
+
+            cards = np.concatenate([cards, obs[:, OPP_CARDS_OFFSET:OPP_CARDS_OFFSET + 6].astype(np.int64).reshape(-1, 2, 3)], axis=1)
         parts = [self._card_branch(cards)]
         if self.arch == "current":
             s = np.concatenate(

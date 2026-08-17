@@ -15,6 +15,9 @@ VARIANTS = [
     dict(arch="paper"),
     dict(cards="onehot"),
     dict(features="history", arch="paper", cards="onehot", dim=96, rm_fallback="argmax"),
+    dict(features="history", opp_cards=True),
+    dict(features="history", arch="paper", opp_cards=True),
+    dict(features="both", cards="onehot", opp_cards=True),
 ]
 
 
@@ -27,16 +30,21 @@ def _random_model(seed=0, **config):
     return m.eval()
 
 
-def random_observations(n=2000, seed=0):
+def random_observations(n=2000, seed=0, opp_cards=False):
+    """Random observation rows; with ``opp_cards`` the history inputs (observation + opponent's cards)."""
+    from headsup.model import history_observation
+
     rng = np.random.default_rng(seed)
     e = HeadsUpPoker(rng=rng)
-    rows = []
+    rows, opp = [], []
     while len(rows) < n:
         e.reset()
         while not e.done:
             rows.append(e.observation())
+            opp.append(e.hands[1 - e.current])
             e.step(rng.integers(4))
-    return np.stack(rows[:n])
+    obs = np.stack(rows[:n])
+    return history_observation(obs, np.array(opp[:n])) if opp_cards else obs
 
 
 def test_pretrained_policy_loads_and_beats_calling_station():
@@ -63,7 +71,7 @@ def test_numpy_model_matches_torch():
 @pytest.mark.parametrize("config", VARIANTS)
 def test_variants_torch_numpy_cpp_agree(config):
     model = _random_model(**config)
-    obs = random_observations(1500, seed=3)
+    obs = random_observations(1500, seed=3, opp_cards=config.get("opp_cards", False))
     with torch.no_grad():
         ref = model(torch.from_numpy(obs)).numpy()
         assert np.abs(ref).max() > 0.1  # non-trivial outputs
@@ -86,7 +94,7 @@ def test_config_round_trip(config, tmp_path):
     model.save(tmp_path / "m.pth")
     other = load_model(tmp_path / "m.pth")
     assert other.config == model.config
-    obs = torch.from_numpy(random_observations(64))
+    obs = torch.from_numpy(random_observations(64, opp_cards=config.get("opp_cards", False)))
     with torch.no_grad():
         np.testing.assert_allclose(other(obs).numpy(), model(obs).numpy())
 

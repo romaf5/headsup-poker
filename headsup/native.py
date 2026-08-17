@@ -69,5 +69,6 @@ def make_model(weights: dict):
     weights = dict(weights)
     config = weights.pop("config")
     arrays = {k: np.ascontiguousarray(v, dtype=np.float32) for k, v in weights.items()}
-    arrays["config"] = {k: (int(v) if k == "dim" else dict(v) if k == "game" else str(v)) for k, v in config.items()}
+    arrays["config"] = {k: (int(v) if k == "dim" else dict(v) if k == "game" else bool(v) if k == "opp_cards" else str(v))
+                        for k, v in config.items()}
     return module().Model(arrays)

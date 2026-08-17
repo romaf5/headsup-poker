@@ -25,11 +25,12 @@ Models are saved as ``{"config": ..., "state_dict": ...}`` (:meth:`BaseModel.sav
 travels with every artefact (policy.pth, iterates.pt, checkpoints, numpy weight dicts).
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from headsup.engine import HISTORY_DIM, HISTORY_OFFSET, OBS_DIM_AGGREGATED, OBS_DIM_HISTORY
+from headsup.engine import HISTORY_DIM, HISTORY_OFFSET, OBS_DIM, OBS_DIM_AGGREGATED, OBS_DIM_HISTORY
 from headsup.game import DEFAULT_GAME, GameConfig
 
 SUITS = 4
@@ -37,6 +38,8 @@ RANKS = 13
 NUM_STAGES = 4
 CARD_SLOTS = 7  # hole 2, flop 3, turn 1, river 1
 CARD_CLASSES = RANKS * SUITS + 1  # 0 = no card
+OPP_CARDS_OFFSET = OBS_DIM  # history inputs: the opponent's two hole cards (rank+1, suit+1, card+1 x 2) after the observation
+OBS_DIM_WITH_OPP = OBS_DIM + 6
 EMBEDDING_DIM = 64  # default width
 
 FEATURES = ("aggregated", "history", "both")
@@ -44,7 +47,7 @@ ARCHS = ("current", "paper")
 CARDS = ("embed", "onehot")
 RM_FALLBACKS = ("uniform", "argmax")
 DEFAULT_CONFIG = dict(features="aggregated", arch="current", cards="embed", dim=EMBEDDING_DIM, rm_fallback="uniform",
-                      game=DEFAULT_GAME.tree_dict())
+                      game=DEFAULT_GAME.tree_dict(), opp_cards=False)
 
 
 def normalize_config(config=None, **overrides):
@@ -62,12 +65,28 @@ def normalize_config(config=None, **overrides):
     if cfg["rm_fallback"] not in RM_FALLBACKS:
         raise ValueError(f"rm_fallback must be one of {RM_FALLBACKS}, got {cfg['rm_fallback']!r}")
     cfg["dim"] = int(cfg["dim"])
+    cfg["opp_cards"] = bool(cfg["opp_cards"])
     return cfg
 
 
-def obs_dim_for(features):
-    """Observation width a network with these bet features reads (a prefix of the full layout)."""
+def obs_dim_for(features, opp_cards=False):
+    """Observation width a network with these bet features reads (a prefix of the full layout);
+    history-input networks (``opp_cards``: the DREAM baseline / ESCHER value nets, which see both
+    players' hole cards) read the full observation plus the opponent's cards appended to it."""
+    if opp_cards:
+        return OBS_DIM_WITH_OPP
     return OBS_DIM_AGGREGATED if features == "aggregated" else OBS_DIM_HISTORY
+
+
+def history_observation(obs, opp_cards):
+    """(B, OBS_DIM) observation rows of a seat + that seat's opponent's hole cards (B, 2) ->
+    (B, OBS_DIM_WITH_OPP) history inputs (rank+1, suit+1, card+1 of the sorted opponent cards)."""
+    from headsup.cards import CARD_FEATURES
+
+    obs = np.asarray(obs, dtype=np.float32)
+    opp = np.sort(np.asarray(opp_cards, dtype=np.int64).reshape(-1, 2), axis=1)
+    feats = CARD_FEATURES[opp].reshape(len(opp), 6).astype(np.float32)
+    return np.concatenate([obs, feats], axis=1)
 
 
 def bet_feature_indices(features, arch):
@@ -111,37 +130,42 @@ def _group_sums(emb):
 class CardModel(nn.Module):
     """Card branch: 3 layers; input = summed embeddings per group or concatenated one-hot cards."""
 
-    def __init__(self, dim=EMBEDDING_DIM, cards="embed", per_group=False):
+    def __init__(self, dim=EMBEDDING_DIM, cards="embed", per_group=False, opp_cards=False):
         super().__init__()
         self.cards = cards
         self.per_group = per_group
+        self.opp_cards = opp_cards
+        n_groups, n_slots = (5, 9) if opp_cards else (4, 7)
         if cards == "embed":
             if per_group:  # DeepCFR paper: one embedding per card group
-                self.group_embeddings = nn.ModuleList([CardEmbedding(dim) for _ in range(4)])
+                self.group_embeddings = nn.ModuleList([CardEmbedding(dim) for _ in range(n_groups)])
             else:
                 self.cards_embeddings = CardEmbedding(dim)
-            self.fc1 = nn.Linear(4 * dim, dim)
+            self.fc1 = nn.Linear(n_groups * dim, dim)
         else:  # SD-CFR paper: one-hot cards, so the first layer is the (only) embedding
-            self.onehot = nn.Linear(CARD_SLOTS * CARD_CLASSES, dim)
+            self.onehot = nn.Linear(n_slots * CARD_CLASSES, dim)
         self.fc2 = nn.Linear(dim, dim)
         self.fc3 = nn.Linear(dim, dim)
         self.act = nn.ReLU()
 
-    def forward(self, cards):  # (B, 7, 3) long
+    def forward(self, cards):  # (B, 7 or 9, 3) long
         if self.cards == "embed":
             if self.per_group:
                 g = self.group_embeddings
-                x = torch.cat(
-                    [
-                        g[0](cards[:, 0]) + g[0](cards[:, 1]),
-                        g[1](cards[:, 2]) + g[1](cards[:, 3]) + g[1](cards[:, 4]),
-                        g[2](cards[:, 5]),
-                        g[3](cards[:, 6]),
-                    ],
-                    dim=1,
-                )
+                groups = [
+                    g[0](cards[:, 0]) + g[0](cards[:, 1]),
+                    g[1](cards[:, 2]) + g[1](cards[:, 3]) + g[1](cards[:, 4]),
+                    g[2](cards[:, 5]),
+                    g[3](cards[:, 6]),
+                ]
+                if self.opp_cards:
+                    groups.append(g[4](cards[:, 7]) + g[4](cards[:, 8]))
+                x = torch.cat(groups, dim=1)
             else:
-                x = _group_sums(self.cards_embeddings(cards))
+                emb = self.cards_embeddings(cards)
+                x = _group_sums(emb)
+                if self.opp_cards:
+                    x = torch.cat([x, emb[:, 7] + emb[:, 8]], dim=1)
             x = self.act(self.fc1(x))
         else:
             onehot = F.one_hot(cards[:, :, 2], CARD_CLASSES).to(self.onehot.weight.dtype).flatten(1)
@@ -180,14 +204,16 @@ class BetsModel(nn.Module):
 class BaseModel(nn.Module):
     """Maps a batch of observations (B, >= obs_dim) to per-action logits / advantages (B, num_actions)."""
 
-    def __init__(self, features=None, arch=None, cards=None, dim=None, rm_fallback=None, game=None, config=None):
+    def __init__(self, features=None, arch=None, cards=None, dim=None, rm_fallback=None, game=None, config=None, opp_cards=None):
         super().__init__()
-        cfg = normalize_config(config, features=features, arch=arch, cards=cards, dim=dim, rm_fallback=rm_fallback, game=game)
+        cfg = normalize_config(config, features=features, arch=arch, cards=cards, dim=dim, rm_fallback=rm_fallback, game=game,
+                               opp_cards=opp_cards)
         self.config = cfg
         self.features, self.arch, self.cards_mode = cfg["features"], cfg["arch"], cfg["cards"]
         self.dim, self.rm_fallback = cfg["dim"], cfg["rm_fallback"]
+        self.opp_cards = cfg["opp_cards"]
         self.game = GameConfig.from_dict(cfg["game"])  # action tree (stack / blinds at their defaults)
-        self.obs_dim = obs_dim_for(self.features)
+        self.obs_dim = obs_dim_for(self.features, self.opp_cards)
         self.num_actions = self.game.num_actions
         d = self.dim
         idx = bet_feature_indices(self.features, self.arch)
@@ -197,7 +223,7 @@ class BaseModel(nn.Module):
         # single flipped bit on a non-ECC card) cannot trigger a device-side assert and kill a run
         self.register_buffer("card_max", torch.tensor([RANKS, SUITS, RANKS * SUITS], dtype=torch.long), persistent=False)
 
-        self.card_model = CardModel(d, self.cards_mode, per_group=self.arch == "paper")
+        self.card_model = CardModel(d, self.cards_mode, per_group=self.arch == "paper", opp_cards=self.opp_cards)
         if self.arch == "current":
             self.stage_and_order_model = StageAndOrderModel(d)
         self.bets_model = BetsModel(len(idx), d)
@@ -220,7 +246,10 @@ class BaseModel(nn.Module):
             if obs.shape[1] < self.obs_dim:
                 raise ValueError(f"observation has {obs.shape[1]} features, this network needs {self.obs_dim}")
             obs = obs[:, : self.obs_dim]
-        cards = torch.minimum(obs[:, :21].long().view(-1, 7, 3), self.card_max).clamp_(min=0)
+        cards = obs[:, :21].long().view(-1, 7, 3)
+        if self.opp_cards:
+            cards = torch.cat([cards, obs[:, OPP_CARDS_OFFSET:OPP_CARDS_OFFSET + 6].long().view(-1, 2, 3)], dim=1)
+        cards = torch.minimum(cards, self.card_max).clamp_(min=0)
         bets = obs.index_select(1, self.bet_index)
         parts = [self.card_model(cards)]
         if self.arch == "current":

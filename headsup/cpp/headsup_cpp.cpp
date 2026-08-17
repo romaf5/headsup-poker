@@ -377,16 +377,21 @@ enum Cards { EMBED = 0, ONEHOT = 1 };
 constexpr int MAX_DIM = 256;                       // widest supported hidden layer
 constexpr int CARD_CLASSES = NUM_CARDS + 1;        // one-hot classes per card slot (0 = no card)
 constexpr int MAX_BET_FEATURES = 8 + HISTORY_DIM + 2 + 1;
-constexpr int GROUP_OF_SLOT[7] = {0, 0, 1, 1, 1, 2, 3};  // hole, flop, turn, river
+constexpr int GROUP_OF_SLOT[9] = {0, 0, 1, 1, 1, 2, 3, 4, 4};  // hole, flop, turn, river, (opponent's hole cards)
+constexpr int OPP_CARDS_OFFSET = OBS_DIM;                      // history inputs: opponent's cards after the observation
+constexpr int OBS_DIM_WITH_OPP = OBS_DIM + 6;
+inline int slot_offset(int s) { return s < 7 ? 3 * s : OPP_CARDS_OFFSET + 3 * (s - 7); }
 
 // Mirrors headsup.model.BaseModel for every variant (see the docstring there).
 struct Model {
   int dim = 64, obs_dim = OBS_DIM_AGGREGATED, num_actions = 4;
+  bool opp_cards = false;  // history-input network: + the opponent's hole cards as a fifth card group
+  int n_slots = 7, n_groups = 4;
   int features = AGGREGATED, arch = CURRENT, cards = EMBED;
   bool rm_argmax = false;  // regret-matching fallback: highest advantage instead of uniform
   std::vector<int> bet_index;
   // embed: rank/suit/card tables, shared (index 0) or one set per card group (paper arch)
-  std::vector<float> rank_emb[4], suit_emb[4], card_emb[4];
+  std::vector<float> rank_emb[5], suit_emb[5], card_emb[5];
   bool per_group = false;
   std::vector<float> onehot_t;  // (7 * CARD_CLASSES, dim): transposed weight of the one-hot layer
   std::vector<float> onehot_b;
@@ -399,11 +404,11 @@ struct Model {
     float c1[MAX_DIM], c2[MAX_DIM];
     // 1. card branch
     if (cards == EMBED) {
-      float x[4 * MAX_DIM];
-      std::memset(x, 0, sizeof(float) * 4 * D);
-      for (int s = 0; s < 7; ++s) {
-        const int g = GROUP_OF_SLOT[s], tbl = per_group ? g : 0;
-        const int r = int(obs[3 * s]), su = int(obs[3 * s + 1]), c = int(obs[3 * s + 2]);
+      float x[5 * MAX_DIM];
+      std::memset(x, 0, sizeof(float) * n_groups * D);
+      for (int s = 0; s < n_slots; ++s) {
+        const int g = GROUP_OF_SLOT[s], tbl = per_group ? g : 0, o = slot_offset(s);
+        const int r = int(obs[o]), su = int(obs[o + 1]), c = int(obs[o + 2]);
         const float* er = rank_emb[tbl].data() + size_t(r) * D;
         const float* es = suit_emb[tbl].data() + size_t(su) * D;
         const float* ec = card_emb[tbl].data() + size_t(c) * D;
@@ -413,8 +418,8 @@ struct Model {
       card_fc[0].apply(x, c1);
     } else {  // Linear on concatenated one-hot cards == bias + sum of the selected weight columns
       std::memcpy(c1, onehot_b.data(), sizeof(float) * D);
-      for (int s = 0; s < 7; ++s) {
-        const float* row = onehot_t.data() + (size_t(s) * CARD_CLASSES + int(obs[3 * s + 2])) * D;
+      for (int s = 0; s < n_slots; ++s) {
+        const float* row = onehot_t.data() + (size_t(s) * CARD_CLASSES + int(obs[slot_offset(s) + 2])) * D;
         for (int i = 0; i < D; ++i) c1[i] += row[i];
       }
     }
@@ -541,13 +546,16 @@ std::shared_ptr<Model> model_from_dict(const py::dict& d) {
     m->num_actions = int(py::len(game["bet_sizes"])) + 2 + (all_in ? 1 : 0);
   }
   if (m->num_actions < 3 || m->num_actions > MAX_ACTIONS) throw std::runtime_error("unsupported number of actions");
-  m->obs_dim = m->features == AGGREGATED ? OBS_DIM_AGGREGATED : OBS_DIM_HISTORY;
+  m->opp_cards = cfg.contains("opp_cards") && !cfg["opp_cards"].is_none() && cfg["opp_cards"].cast<bool>();
+  m->n_slots = m->opp_cards ? 9 : 7;
+  m->n_groups = m->opp_cards ? 5 : 4;
+  m->obs_dim = m->opp_cards ? OBS_DIM_WITH_OPP : m->features == AGGREGATED ? OBS_DIM_AGGREGATED : OBS_DIM_HISTORY;
   m->bet_index = bet_feature_indices(m->features, m->arch);
   m->per_group = m->arch == PAPER;
   const int D = m->dim;
   if (m->cards == EMBED) {
     if (m->per_group) {
-      for (int g = 0; g < 4; ++g) {
+      for (int g = 0; g < m->n_groups; ++g) {
         const std::string pre = "card_model.group_embeddings." + std::to_string(g) + ".";
         m->rank_emb[g] = to_vec(d, (pre + "rank_embedding.weight").c_str(), 14 * D);
         m->suit_emb[g] = to_vec(d, (pre + "suit_embedding.weight").c_str(), 5 * D);
@@ -558,9 +566,9 @@ std::shared_ptr<Model> model_from_dict(const py::dict& d) {
       m->suit_emb[0] = to_vec(d, "card_model.cards_embeddings.suit_embedding.weight", 5 * D);
       m->card_emb[0] = to_vec(d, "card_model.cards_embeddings.card_embedding.weight", 53 * D);
     }
-    m->card_fc[0] = to_linear(d, "card_model.fc1", 4 * D, D);
+    m->card_fc[0] = to_linear(d, "card_model.fc1", m->n_groups * D, D);
   } else {
-    Linear oh = to_linear(d, "card_model.onehot", 7 * CARD_CLASSES, D);
+    Linear oh = to_linear(d, "card_model.onehot", m->n_slots * CARD_CLASSES, D);
     m->onehot_t = std::move(oh.wt);  // (7 * CARD_CLASSES, D): row i = weights of one-hot input i
     m->onehot_b = oh.b;
   }
