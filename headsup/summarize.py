@@ -56,6 +56,11 @@ def summarize_run(run):
         if d:
             lb = d.get("lower_bound", {})
             out[f"exploit_{name}"] = (lb.get("chips_per_hand"), lb.get("se"), lb.get("exploiter"))
+        for path in (f"br_{name}.json", f"br_{name}_12.json"):  # best-response exploitability (headsup.algos.holdem_br)
+            d = _load(os.path.join(run, path))
+            if d:
+                out[f"br_{name}"] = (d["exploitability_chips"], None, d["boards"])
+                break
     return out
 
 
@@ -69,7 +74,7 @@ def _fmt(pair, digits=2):
 def markdown(rows):
     cfg = lambda r: (r.get("model_config") or {})
     head = ["run", "features", "net", "cards", "rm", "policy vs random/call/allin", "SD-CFR vs random/call/allin",
-            "policy vs SD-CFR", "LBR policy", "LBR SD-CFR", "LBR last iterate", "PPO policy", "PPO SD-CFR"]
+            "policy vs SD-CFR", "LBR policy", "LBR SD-CFR", "LBR last iterate", "PPO policy", "PPO SD-CFR", "BR policy", "BR SD-CFR"]
     lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for r in rows:
         c = cfg(r)
@@ -80,6 +85,7 @@ def markdown(rows):
             _fmt(r.get("deepcfr_vs_sdcfr")),
             _fmt(r.get("lbr_policy")), _fmt(r.get("lbr_sdcfr")), _fmt(r.get("lbr_last_iterate")),
             _fmt(r.get("exploit_policy")), _fmt(r.get("exploit_sdcfr")),
+            _fmt(r.get("br_policy")), _fmt(r.get("br_sdcfr")),
         ]
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
