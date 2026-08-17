@@ -85,11 +85,51 @@ def markdown(rows):
     return "\n".join(lines)
 
 
+def small_game_table(directory, iterations=(10, 20, 50, 100, 200), unit=1000.0):
+    """Markdown table of the small-game reproduction curves written by ``headsup.algos.deep --json``
+    (``<algo>.json`` with a ``curve`` of exploitabilities per iteration) and the tabular baselines
+    (``tabular.json``: {name: [{iteration, exploitability}]}); values x ``unit`` (chips -> milli-antes)."""
+    lines = []
+    deep = {}
+    for path in sorted(glob.glob(os.path.join(directory, "*.json"))):
+        name = os.path.splitext(os.path.basename(path))[0]
+        data = _load(path)
+        if not data or name == "tabular":
+            continue
+        curve = {c["iteration"]: c for c in data.get("curve", [])}
+        deep[name] = (data.get("args", {}), curve)
+    if deep:
+        cols = " | ".join(f"it. {i}" for i in iterations)
+        lines.append(f"| algorithm (traversals / it.) | {cols} | current @ last |")
+        lines.append("|---|" + "---|" * (len(iterations) + 1))
+        for name, (args, curve) in deep.items():
+            vals = []
+            for i in iterations:
+                c = curve.get(i)
+                vals.append(f"{unit * c['average']:.0f}" if c else "–")
+            last = curve[max(curve)] if curve else None
+            cur = f"{unit * last['current']:.0f} (it. {max(curve)})" if last else "–"
+            lines.append(f"| {name} ({args.get('traversals', '?')}) | " + " | ".join(vals) + f" | {cur} |")
+    tab = _load(os.path.join(directory, "tabular.json"))
+    if tab:
+        lines.append("")
+        lines.append("| tabular | exploitability of the average strategy by iteration |")
+        lines.append("|---|---|")
+        for name, curve in tab.items():
+            lines.append(f"| {name} | " + ", ".join(f"it. {c['iteration']}: {unit * c['exploitability']:.0f}" for c in curve) + " |")
+    return "\n".join(lines)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("runs", nargs="+", help="run directories")
+    p.add_argument("runs", nargs="*", help="run directories")
     p.add_argument("--json", default=None)
+    p.add_argument("--small-game", default=None, help="directory of small-game reproduction curves (headsup.algos.deep --json)")
     args = p.parse_args(argv)
+    if args.small_game:
+        print(small_game_table(args.small_game))
+        if not args.runs:
+            return
     rows = [summarize_run(r) for r in args.runs]
     print(markdown(rows))
     for r in rows:
