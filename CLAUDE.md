@@ -151,16 +151,21 @@ one iteration 40–55 s at 40k traversals; 300 iterations ~4.5 h; `headsup.explo
 epochs ~30 min in parallel; the final 50-epoch policy fit ~3 min. Checkpoints with 10 M memories are
 ~4 GB (`--checkpoint-every`), `runs/` is git-ignored — clean it up after experiments.
 
-## Results so far (all measured with this code; details in models/README.json)
+## Results so far (all measured with this code; details in README "Results" and models/README.json)
 
-- Shipped `models/deepcfr_policy.pth` (300 it., 10k->40k traversals, old rules): +3.7 / +6.3 / +3.0
-  chips/hand vs random / call / all-in; best PPO exploiter +0.31 (old rules) -> +0.09 with the
-  no-free-fold mask; head-to-head tie with the original v1 model.
-- Finding: the average strategies (policy net and exact SD-CFR average alike) folded ~17 % of flops
-  for free before the rule change; the latest iterate only 1 % — early iterations' weight in the
-  average. Hence the rule change; retrain everything on the new rules before comparing to old numbers.
-- Under the fixed rules a run was started (`--algo both`, 300 it., 40k traversals) and stopped at
-  it. 52 to move to a faster machine; at it. 50 both averages were at ~+4.5 / +8 / +3 vs the bots.
+- Shipped `models/deepcfr_policy.pth` = `runs/abl_history_paper` (history features, paper net, 300 it. x 40k
+  traversals, new rules): +4.3 / +7.9 / +3.3 chips/hand vs random / call / all-in; LBR 1.33 +- 0.09; PPO
+  exploiter 0.01; best-response exploitability (holdem_br, 12 boards) 3.24 chips = 1620 mbb/g. All DeepCFR
+  arms tie head-to-head with their SD-CFR averages (+-0.05 at 1.5 M hands).
+- Shipped `models/blueprint_nlhe.pt` = tabular MCCFR-P blueprint (20 M it., 200 EHS buckets, 40 min): LBR
+  0.67 +- 0.09; beats its 400k-iteration version +0.33 +- 0.09 head-to-head; scores less vs fixed bots
+  (+1.8 / +2.5 / +0.9) - equilibria don't exploit. Table-mode abstraction trains at ~60k it/s once warm.
+- Exploiter power: PPO << LBR << BR (BR finds ~2.5x LBR); use `holdem_br` for exploitability claims.
+- FHP: EHS-bucket tabular blueprints floor at ~380 mbb/g regardless of buckets / iterations (1-D
+  abstraction floor; cf. DeepCFR paper Fig. 2 abstraction baselines). Leduc (1 seed, 200 it., mA/g):
+  SD-CFR 270, DeepCFR 307, DREAM 385, ESCHER 528; tabular CFR+ 35 / DCFR 32 at 1000 it.
+- In flight (2026-08-17): long_history_paper (1000 it.), FHP DeepCFR / DREAM / ESCHER reproductions,
+  betsize (0.5/1/2 pot) DeepCFR vs tabular, search-player LBRs (`runs/bp/eval.log`, `runs/queue.log`).
 
 ## Working agreements
 
