@@ -211,7 +211,11 @@ python -m headsup.compare search:runs/x/policy.pth@it20000 cfr:runs/x/policy.pth
 python -m headsup.web --opponent search:runs/x/iterates.pt@contbank@thin8   # search on top of SD-CFR
 ```
 
-Player spec: `search:<blueprint>[@it<N>][@rit<N>][@rv<lcfr|dcfr|cfr+|pcfr+>][@focus<f>][@cont<policy|iterate|bank>][@thin<K>]`.
+Later decisions on the same street are warm-started from the previous solve's regrets (scaled
+to a few thousand equivalent iterations, Brown & Sandholm 2016 style): on the checked-down river
+example, re-solving after check / bet reaches 0.98 instead of 4.3 chips of exploitability at 5k
+iterations. Player spec:
+`search:<blueprint>[@it<N>][@rit<N>][@rv<lcfr|dcfr|cfr+|pcfr+>][@focus<f>][@cont<policy|iterate|bank>][@thin<K>][@warm<N>]`.
 The public state (bet history) is rebuilt from the observation (`headsup/public.py`), so the
 search player works everywhere a player does (envs, UI, LBR, PPO exploiters). A decision costs
 ~1–2 s pre-river at 20k iterations (tables are solved in parallel threads) and ~0.5 s on the river.

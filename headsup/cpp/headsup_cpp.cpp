@@ -1230,6 +1230,33 @@ struct SubgameSolver {
     }
   }
 
+  // Warm start: copy the regret / strategy tables of the subtree rooted at `old_root` of a previous
+  // solve of the same street (nested re-solving: the new root is a node of the previous tree; the
+  // trees under both roots are identical up to node numbering).
+  // Regrets are copied scaled to `weight` equivalent iterations (Brown & Sandholm 2016, strategy-based
+  // warm starting: the copied state behaves like a short run that already reached the old strategy),
+  // the average-strategy sums are reset (they were accumulated under the pre-action ranges).
+  void warm_start(const SubgameSolver& prev, int old_root, int weight = 2000) {
+    if (prev.n_actions != n_actions) throw std::runtime_error("warm start: different games");
+    if (prev.iteration <= 0) return;
+    const double scale = double(weight) / double(prev.iteration);
+    std::vector<std::pair<int, int>> stack = {{0, old_root}};
+    while (!stack.empty()) {
+      auto [mine, theirs] = stack.back();
+      stack.pop_back();
+      const SubgameNode& a = nodes[mine];
+      const SubgameNode& b = prev.nodes[theirs];
+      if (a.kind != b.kind || a.player != b.player) throw std::runtime_error("warm start: subtree mismatch");
+      if (a.kind == 0) {
+        const size_t na = size_t(mine) * NUM_COMBOS * n_actions, nb = size_t(theirs) * NUM_COMBOS * n_actions;
+        for (size_t i = 0; i < size_t(NUM_COMBOS) * n_actions; ++i) regret[na + i] = float(prev.regret[nb + i] * scale);
+        for (int act = 0; act < n_actions; ++act)
+          if (a.legal[act] && b.legal[act]) stack.push_back({a.child[act], b.child[act]});
+      }
+    }
+    iteration = weight;
+  }
+
   // average strategy of every hand at a decision node: (NUM_COMBOS, n_actions)
   py::array_t<float> node_strategy(int node_id) {
     if (node_id < 0 || node_id >= int(nodes.size()) || nodes[node_id].kind != 0) throw std::runtime_error("not a decision node");
@@ -1673,6 +1700,13 @@ PYBIND11_MODULE(headsup_cpp, m) {
       }, py::arg("name"), py::arg("alpha") = 1.5, py::arg("beta") = 0.0, py::arg("gamma") = 2.0)
       .def("root_strategy", [](SubgameSolver& sv) { return sv.node_strategy(0); })
       .def("node_strategy", &SubgameSolver::node_strategy)
+      .def("warm_start", &SubgameSolver::warm_start, py::arg("previous"), py::arg("old_root"), py::arg("weight") = 2000)
+      .def("child", [](const SubgameSolver& sv, int node, int action) {
+        if (node < 0 || node >= int(sv.nodes.size()) || action < 0 || action >= sv.n_actions) throw std::runtime_error("bad node / action");
+        const SubgameNode& nd = sv.nodes[node];
+        if (nd.kind != 0) return -1;
+        return nd.legal[action] ? nd.child[action] : nd.child[nd.twin[action]];
+      })
       .def("tree", [](const SubgameSolver& sv) {
         py::list out;
         for (const SubgameNode& nd : sv.nodes) {

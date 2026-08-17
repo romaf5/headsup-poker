@@ -107,6 +107,37 @@ def test_focused_sampling_solves_the_real_hand():
     assert gaps[0.5] < 0.05 and gaps[0.5] < 0.1 * gaps[0.0], gaps
 
 
+def test_warm_start_from_the_previous_solve_helps():
+    cpp = native.module()
+    root = _river_root()
+    r = valid_combos(BOARD).astype(np.float32)
+    first = cpp.SubgameSolver()
+    first.build(root)
+    first.set_ranges(r, r.copy())
+    first.run(100_000, 1)
+    # BB checks, SB bets: the new root is a node of the previous tree
+    e2 = cpp.Engine()
+    e2.reset(list(range(9)))
+    for a in [1, 1, 1, 1, 1, 1, 1, 2]:
+        e2.step(a)
+    old_node = first.child(first.child(0, 1), 2)
+    assert old_node > 0
+    r_bb = (r * first.node_strategy(0)[:, 1]).astype(np.float32)
+    r_sb = (r * first.node_strategy(first.child(0, 1))[:, 2]).astype(np.float32)
+    ex = {}
+    for warm in (0, 5000):
+        sv = cpp.SubgameSolver()
+        sv.build(e2)
+        sv.set_ranges(r_sb, r_bb)
+        if warm:
+            sv.warm_start(first, old_node, warm)
+        sv.run(5000, 2)
+        tree = sv.tree()
+        strat = {i: sv.node_strategy(i).astype(np.float64) for i, nd in enumerate(tree) if nd["kind"] == 0}
+        ex[warm] = exploitability(tree, strat, [r_sb, r_bb], BOARD)[0]
+    assert ex[5000] < 0.5 * ex[0], ex
+
+
 @pytest.mark.parametrize("variant", ["lcfr", "dcfr", "cfr+", "pcfr+"])
 def test_vector_river_solver_is_near_exact(variant):
     cpp = native.module()

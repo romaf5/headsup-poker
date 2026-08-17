@@ -187,7 +187,7 @@ class SearchPlayer:
     wants_ids = True
 
     def __init__(self, blueprint, iterations=20_000, focus=0.5, continuation=None, thin=8, device=None, seed=0,
-                 workers=None, game=None, river_iterations=200, river_variant="dcfr"):
+                 workers=None, game=None, river_iterations=200, river_variant="dcfr", warm_start=5000):
         from headsup import native
         from headsup.lbr import _model_for
         from headsup.players import make_player
@@ -195,6 +195,7 @@ class SearchPlayer:
         self.spec = blueprint
         self.iterations, self.focus = int(iterations), float(focus)
         self.river_iterations, self.river_variant = int(river_iterations), river_variant
+        self.warm_start = int(warm_start)  # equivalent iterations of the previous solve's regrets to start from (0 = off)
         self.model = _model_for(blueprint, device, seed + 1, model_iterates=thin, game=game)  # models the opponent
         self.model_observes = hasattr(self.model, "observe")
         self.game = getattr(self.model, "game", None) or make_player(blueprint, device=device, seed=seed).game
@@ -216,7 +217,8 @@ class SearchPlayer:
         mine = hero_cards(obs)
         villain = valid_combos(mine).astype(np.float64)
         hero = np.ones(NUM_COMBOS)
-        return {"villain": villain, "hero": hero, "processed": 0, "last_root": None, "last_action": None, "cards": tuple(mine)}
+        return {"villain": villain, "hero": hero, "processed": 0, "last_root": None, "last_action": None, "cards": tuple(mine),
+                "solver": None, "solver_actions": None}
 
     @staticmethod
     def _n_actions(obs):
@@ -306,7 +308,18 @@ class SearchPlayer:
         sv.set_ranges(ranges[0].astype(np.float32), ranges[1].astype(np.float32))
         n0, n1, rm, w = self.conts
         sv.set_continuations(n0, n1, rm, w)
+        prev, prev_actions = st.get("solver"), st.get("solver_actions")
+        if self.warm_start and prev is not None and prev_actions is not None and actions[: len(prev_actions)] == prev_actions:
+            node = 0  # the new root inside the previous tree, if the street did not change
+            for a in actions[len(prev_actions):]:
+                node = prev.child(node, int(a)) if node >= 0 else -1
+            if node > 0:
+                try:
+                    sv.warm_start(prev, node, self.warm_start)
+                except RuntimeError:  # different street / structure: solve from scratch
+                    pass
         sv.run(self.iterations, int(seed), hero, hh, self.focus)
+        st["solver"], st["solver_actions"] = sv, list(actions)
         return sv.root_strategy(), hh
 
     # ------------------------------------------------------------------ player protocol
@@ -362,6 +375,8 @@ def parse_search_spec(arg):
             kw["river_iterations"] = int(o[3:])
         elif o.startswith("rv") and o[2:] in ("lcfr", "dcfr", "cfr+", "pcfr+"):
             kw["river_variant"] = o[2:]
+        elif o.startswith("warm") and o[4:].isdigit():
+            kw["warm_start"] = int(o[4:])
         elif o.startswith("focus"):
             kw["focus"] = float(o[5:])
         elif o.startswith("cont"):
