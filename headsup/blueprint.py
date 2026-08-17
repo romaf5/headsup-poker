@@ -133,14 +133,18 @@ class TabularPlayer:
 
         obs = np.asarray(obs, dtype=np.float32)
         out = np.zeros((len(obs), self.game.num_actions), dtype=np.float32)
-        groups = {}
-        for i, row in enumerate(obs):
-            groups.setdefault(row[6:].tobytes(), []).append(i)  # same board / public state (hands differ)
-        for idx in groups.values():
-            rows = obs[idx]
-            board = board_cards(rows[0])
+        # rows sharing the public part (everything but the hand slots) form one query
+        _, first, inverse = np.unique(obs[:, 6:], axis=0, return_index=True, return_inverse=True)
+        inverse = inverse.ravel()
+        all_hands = np.sort(np.stack([obs[:, 2], obs[:, 5]], axis=1).astype(np.int32) - 1, axis=1)
+        for g, ref_i in enumerate(first):
+            idx = np.flatnonzero(inverse == g)
+            row = obs[ref_i]
+            board = board_cards(row)
+            hands = all_hands[idx]
             # a valid hero hand is needed to replay the public state (hand-substituted rows may overlap the board)
-            ref = next((r for r in rows if not set(hero_cards(r)) & set(board)), rows[0])
+            valid = ~np.isin(hands, board).any(axis=1)
+            ref = obs[idx[np.argmax(valid)]] if valid.any() else row
             try:
                 node = self._node(ref)
             except ValueError:  # terminal observation (the hand is over): any action
@@ -149,7 +153,6 @@ class TabularPlayer:
             if self.bp.cpp.node_player(node) < 0:
                 out[idx, 1] = 1.0
                 continue
-            hands = np.array([sorted(hero_cards(r)) for r in rows], dtype=np.int32)
             out[idx] = self.bp.strategy_for_hands(node, hands, board, int(self.rng.integers(2**31)), self.current)
         legal = legal_mask_from_obs(obs, self.game)
         out[~legal] = 0.0

@@ -55,9 +55,16 @@ def public_state_from_obs(obs):
 
 
 def legal_mask_from_obs(obs, game=DEFAULT_GAME):
-    """bool[N, num_actions]: the engine's ``legal_mask`` recomputed from observations."""
+    """bool[N, num_actions]: the engine's ``legal_mask`` recomputed from observations (computed once
+    per distinct public state: to-call, pot, stack, raise count and round)."""
+    obs = np.asarray(obs)
     to_call, pot, stack, raises = public_state_from_obs(obs)
-    return np.array([game.legal_mask(int(c), int(p), int(s), int(r)) for c, p, s, r in zip(to_call, pot, stack, raises)], dtype=bool)
+    stage = np.rint(obs[:, 21]).astype(np.int64)
+    keys = np.stack([to_call, pot, stack, raises, stage], axis=1)
+    uniq, inverse = np.unique(keys, axis=0, return_inverse=True)
+    masks = np.array([game.legal_mask(int(c), int(p), int(s), int(r), round_index=min(int(st), game.num_rounds - 1))
+                      for c, p, s, r, st in uniq], dtype=bool)
+    return masks[inverse.ravel()]
 
 
 class HeadsUpPoker:

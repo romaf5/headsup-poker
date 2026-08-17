@@ -2857,7 +2857,7 @@ PYBIND11_MODULE(headsup_cpp, m) {
         std::vector<float> row(b.n_actions), all;
         const int nb = BOARD_CARDS_BY_STAGE[round];
         const bool vector_path = round > 0 && n >= 64;  // many hands of one state: shared runouts for all combos
-        if (vector_path) b.abs.ehs_all(bd, nb, std::max(20, b.abs.samples / 5), rng, all);
+        if (vector_path) b.abs.ehs_all(bd, nb, std::max(20, b.abs.samples / 12), rng, all);  // ~40 runouts x all opponents: noise ~ the per-hand MC of training
         for (int i = 0; i < n; ++i) {
           bool blocked = h(i, 0) == h(i, 1);
           for (int k = 0; k < nb; ++k) blocked |= (bd[k] == h(i, 0) || bd[k] == h(i, 1));
