@@ -346,6 +346,44 @@ class SearchPlayer:
                     total = st[key].sum()
                 st[key] /= total
 
+    class _RoundSolve:
+        """What a Pluribus-mode solve leaves behind for the round's range updates: the average
+        strategy of every root-round decision node and the root-round tree structure (a few hundred
+        KB) instead of the C++ solver with its board tables (~50 MB per table)."""
+
+        def __init__(self, sv):
+            self.root_round = sv.root_round
+            self._player, self._round, self._child, self._strategy = {}, {}, {}, {}
+            stack = [0]
+            seen = set()
+            while stack:
+                node = stack.pop()
+                if node in seen or node < 0:
+                    continue
+                seen.add(node)
+                self._player[node] = sv.node_player(node)
+                self._round[node] = sv.node_round(node)
+                if self._player[node] < 0 or self._round[node] != sv.root_round:
+                    continue  # terminal / later-round node: keep its identity only
+                self._strategy[node] = np.asarray(sv.node_strategy(node), dtype=np.float64)
+                for a in range(self._strategy[node].shape[1]):
+                    c = sv.child(node, a)
+                    self._child[(node, a)] = c
+                    if c > 0:
+                        stack.append(c)
+
+        def child(self, node, a):
+            return self._child.get((node, a), -1)
+
+        def node_player(self, node):
+            return self._player.get(node, -1)
+
+        def node_round(self, node):
+            return self._round.get(node, -1)
+
+        def node_strategy(self, node):
+            return self._strategy[node]
+
     def _solve_round(self, engine, hero, actions, st, seed):
         """Pluribus mode: solve the remaining game from the start of the current betting round
         (the hero's actions taken in the round frozen for its real hand) and return the strategy
@@ -370,8 +408,9 @@ class SearchPlayer:
             node = sv.child(node, int(act))
         sv.run(self.iterations, int(seed) & 0xFFFFFFFF, self.threads)
         self.solves += 1
-        st["solver"], st["solver_actions"], st["solver_round"] = sv, list(actions[:n_root]), current
-        return sv.node_strategy(node, self.play == "final"), hh
+        out = sv.node_strategy(node, self.play == "final")
+        st["solver"], st["solver_actions"], st["solver_round"] = self._RoundSolve(sv), list(actions[:n_root]), current
+        return out, hh
 
     def _solve(self, engine, hero, actions, st, seed):
         cpp = self._cpp
