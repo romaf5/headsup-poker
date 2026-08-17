@@ -120,16 +120,44 @@ def small_game_table(directory, iterations=(10, 20, 50, 100, 200), unit=1000.0):
     return "\n".join(lines)
 
 
+def holdem_br_table(runs):
+    """Markdown table of the hold'em best-response exploitability files (headsup.algos.holdem_br
+    --json): per run the policy net (``br_policy*.json``) and the SD-CFR average after t
+    iterations (``br_sdcfr_t<N>.json``), in mbb/g."""
+    lines = ["| run | policy net | SD-CFR average by iteration (mbb/g) |", "|---|---|---|"]
+    for run in runs:
+        pol = None
+        for name in ("br_policy.json", "br_policy_12.json"):
+            d = _load(os.path.join(run, name))
+            if d:
+                pol = f"{d['exploitability_mbb']:.0f} ({d['boards']} boards)"
+                break
+        curve = []
+        for path in glob.glob(os.path.join(run, "br_sdcfr_t*.json")):
+            m = re.search(r"_t(\d+)\.json$", path)
+            d = _load(path)
+            if m and d:
+                curve.append((int(m.group(1)), d["exploitability_mbb"]))
+        curve.sort()
+        lines.append(f"| {os.path.basename(os.path.normpath(run))} | {pol or '–'} | "
+                     + (", ".join(f"t={t}: {v:.0f}" for t, v in curve) if curve else "–") + " |")
+    return "\n".join(lines)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("runs", nargs="*", help="run directories")
     p.add_argument("--json", default=None)
     p.add_argument("--small-game", default=None, help="directory of small-game reproduction curves (headsup.algos.deep --json)")
+    p.add_argument("--br", action="store_true", help="print the hold'em best-response exploitability table of the runs instead")
     args = p.parse_args(argv)
     if args.small_game:
         print(small_game_table(args.small_game))
         if not args.runs:
             return
+    if args.br:
+        print(holdem_br_table(args.runs))
+        return
     rows = [summarize_run(r) for r in args.runs]
     print(markdown(rows))
     for r in rows:
