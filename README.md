@@ -186,6 +186,39 @@ weaker, so the bound stays valid; T = 300 iterates cost ~4 ms per iterate per 64
 The trainer logs `lbr/current_strategy`, `lbr/sdcfr` (and, at the end, `lbr_final/*` incl. the
 policy net) — LBR's chips/hand, lower is better.
 
+## Tabular blueprint (Pluribus's MCCFR-P) — trains in minutes
+
+`headsup/blueprint.py` + `headsup_cpp.TabularBlueprint` compute a blueprint the way Pluribus does
+(Brown & Sandholm 2019, supplementary Algorithm 1): tabular regrets over the public betting
+tree of the whole game × a card abstraction — 169 lossless hand classes pre-flop, `--buckets`
+(200) equal-mass buckets of the expected hand strength (equity vs a uniform random hand,
+Monte-Carlo runouts on the flop / turn, exact on the river) on the later rounds — trained by
+external-sampling **Linear MCCFR** (unweighted regret updates, regrets and strategy counters
+discounted by k/(k+1) every `--discount-every` for the first `--lcfr` fraction of the run),
+**negative-regret pruning** (after `--prune-after`, on 95 % of the iterations the traverser skips
+actions whose regret is below −300·stack·100 chips — Pluribus's −300 M for 10 000-chip stacks —
+except on the last round or into terminals; regret floor slightly below), and the average
+strategy from sampled action counters (UPDATE-STRATEGY, on every round here — Pluribus tracked
+only the first round and averaged later-round snapshots to save memory). Threads share the
+tables (benign races, as in Pluribus). Our NL abstraction has 8 426 public nodes / 436 k
+infosets (`0.5,1,2`-pot sizes: 224 k nodes / 7.6 M infosets, 200 bb: 17 M — all tabular-sized);
+~8–13 k iterations/s on 24 threads, so 20 M iterations take under an hour.
+
+```bash
+python -m headsup.blueprint --game nlhe --iterations 20000000 --threads 24 --out runs/bp/nlhe.pt
+python -m headsup.compare tab:runs/bp/nlhe.pt cfr:runs/x/policy.pth --hands 200000
+python -m headsup.lbr --policy tab:runs/bp/nlhe.pt --hands 30000
+python -m headsup.web --opponent search:tab:runs/bp/nlhe.pt@pluribus@th16      # = Pluribus (heads-up): blueprint + search
+```
+
+Player spec `tab:path.pt[@current]`. Deviations from Pluribus's blueprint: equal-mass EHS
+buckets instead of k-means over equity distributions (potential-aware, EMD), iterations instead
+of minutes for the schedule, the average kept on every round, no action translation (the
+abstraction is played as is). Measured: 400 k iterations (40 s) already score +4.1 / +6.4 / +2.9
+chips/hand vs random / call / all-in; more training makes the blueprint stronger head-to-head
+(5 M beats 400 k by +0.33 ± 0.09) while it exploits the fixed bots *less* (equilibria do not
+exploit) — compare with LBR / head-to-head, not with bot scores.
+
 ## Real-time search (subgame solving)
 
 `headsup/search.py` + `headsup_cpp.SubgameSolver` / `VectorSolver` implement search at play time
@@ -282,6 +315,7 @@ headsup/deepcfr/         memory.py (reservoir), traverse.py, train.py, evaluate.
 headsup/sdcfr.py         Single Deep CFR: iterate bank + average-strategy player (exact / trajectory sampling)
 headsup/compare.py       head-to-head comparison CLI;  headsup/exploit.py: multi-seed PPO exploitability CLI
 headsup/lbr.py           Local Best Response (range tracking, equity vs range, one-street lookahead) CLI
+headsup/blueprint.py     tabular Pluribus-style MCCFR-P blueprint (C++ TabularBlueprint): trainer CLI, tab: player
 headsup/search.py        real-time search player (depth-limited MCCFR / Pluribus-style full-game vector solves), exploitability check
 headsup/public.py        rebuild the public state (engine replay) from an observation
 headsup/games/           game interface for the generic algorithms: Kuhn, Leduc (leduc.py), hold'em presets (holdem.py: nlhe / fhp / hulh)
