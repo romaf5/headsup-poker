@@ -49,7 +49,8 @@ def random_observations(n=2000, seed=0, opp_cards=False):
 
 def test_pretrained_policy_loads_and_beats_calling_station():
     model = load_model(DEFAULT_POLICY_PATH)
-    assert sum(p.numel() for p in model.parameters()) == 67844
+    assert model.config["features"] == "history" and model.config["arch"] == "paper"
+    assert sum(p.numel() for p in model.parameters()) == 67524
     from headsup.env import PokerVecEnv, play_hands
     from headsup.players import AlwaysCallPlayer, TorchPolicyPlayer
 

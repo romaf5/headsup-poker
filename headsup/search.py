@@ -473,36 +473,36 @@ def parse_search_spec(arg):
     ``[@pluribus][@b<buckets>][@th<threads>][@avg][@pfsearch][@k<leaf choices>]`` -> kwargs."""
     parts = arg.split("@")
     # the blueprint spec itself may contain '@' options (sdcfr:...@g2): the search options are the
-    # trailing ones that parse as ours
+    # trailing ones that parse as ours; when an option repeats, the rightmost wins
     kw = {}
     while len(parts) > 1:
         o = parts[-1]
         if o.startswith("it") and o[2:].isdigit():
-            kw["iterations"] = int(o[2:])
+            kw.setdefault("iterations", int(o[2:]))
         elif o.startswith("rit") and o[3:].isdigit():
-            kw["river_iterations"] = int(o[3:])
+            kw.setdefault("river_iterations", int(o[3:]))
         elif o.startswith("rv") and o[2:] in ("lcfr", "dcfr", "cfr+", "pcfr+"):
-            kw["river_variant"] = o[2:]
+            kw.setdefault("river_variant", o[2:])
         elif o.startswith("warm") and o[4:].isdigit():
-            kw["warm_start"] = int(o[4:])
+            kw.setdefault("warm_start", int(o[4:]))
         elif o.startswith("focus"):
-            kw["focus"] = float(o[5:])
+            kw.setdefault("focus", float(o[5:]))
         elif o.startswith("cont"):
-            kw["continuation"] = o[4:]
+            kw.setdefault("continuation", o[4:])
         elif o.startswith("thin") and o[4:].isdigit():
-            kw["thin"] = int(o[4:])
+            kw.setdefault("thin", int(o[4:]))
         elif o == "pluribus":
-            kw["mode"] = "pluribus"
+            kw.setdefault("mode", "pluribus")
         elif o.startswith("b") and o[1:].isdigit():
-            kw["buckets"] = int(o[1:])
+            kw.setdefault("buckets", int(o[1:]))
         elif o.startswith("th") and o[2:].isdigit():
-            kw["threads"] = int(o[2:])
+            kw.setdefault("threads", int(o[2:]))
         elif o == "avg":
-            kw["play"] = "average"
+            kw.setdefault("play", "average")
         elif o == "pfsearch":
-            kw["preflop"] = "search"
+            kw.setdefault("preflop", "search")
         elif o.startswith("k") and o[1:].isdigit():
-            kw["leaf_choices"] = int(o[1:])
+            kw.setdefault("leaf_choices", int(o[1:]))
         else:
             break
         parts.pop()

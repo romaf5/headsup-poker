@@ -1,26 +1,27 @@
 {
   "deepcfr_policy.pth": {
-    "trained": "2026-08-16",
-    "hardware": "Apple M2 Max (MPS), 11 traversal threads",
+    "trained": "2026-08-16/17 (runs/abl_history_paper)",
+    "hardware": "64-core Linux box, RTX 3090, 32 traversal threads",
+    "rules": "no free fold (fold only when facing a bet), 100-chip stacks, blinds 1/2, fold / call / min-raise / all-in, 3rd raise -> all-in",
+    "algorithm": "DeepCFR average-strategy net; features=history (DeepCFR paper bet history), arch=paper, cards=embed, dim 64, uniform RM fallback",
     "iterations": 300,
-    "traversals_per_iteration": "10000 (it. 1-70), 40000 (it. 71-300)",
+    "traversals_per_iteration": 40000,
     "advantage_fit": "4000 steps x 16384, Adam 1e-3, from scratch each iteration",
-    "memories": "reservoir 10M advantage samples per seat, 10M strategy samples",
+    "memories": "reservoir 20M advantage samples per seat, 20M strategy samples",
     "policy_fit": "50 epochs over the strategy memory",
-    "wall_clock_hours": 3.6,
-    "chips_per_hand_vs": {
-      "random": 3.702665090560913,
-      "call": 6.202459812164307,
-      "allin": 3.040635108947754
-    },
-    "exploiter_max_chips_per_hand": 0.31,
-    "head_to_head_vs_v1": "-0.06 +- 0.05 chips/hand (tie)"
+    "chips_per_hand_vs": {"random": 4.31, "call": 7.86, "allin": 3.27},
+    "lbr_chips_per_hand": "1.33 +- 0.09 (30 000 duplicate pairs)",
+    "ppo_exploiter_chips_per_hand": "0.01 +- 0.03 (best of 3 seeds x 1000 epochs)",
+    "best_response_exploitability": "3.24 chips/hand = 1620 mbb/g (headsup.algos.holdem_br, 12 boards)",
+    "head_to_head_vs_sdcfr_average": "-0.04 +- 0.05 chips/hand (tie)"
   },
-  "deepcfr_policy_v1.pth": {
-    "note": "original 300-iteration model from the previous code base",
-    "exploiter_max_chips_per_hand": 0.37
-  },
-  "rl_games_exploiter.onnx": {
-    "note": "PPO best response to deepcfr_policy.pth, 1000 epochs, rl_config/poker_env.yaml; argmax play wins +0.31 chips/hand vs it"
+  "blueprint_nlhe.pt": {
+    "trained": "2026-08-17 (runs/bp/nlhe_20m.pt), ~40 min on 24 threads",
+    "algorithm": "tabular Pluribus-style MCCFR-P blueprint (headsup.blueprint): Linear MCCFR with negative-regret pruning, 169 lossless preflop classes + 200 equal-mass EHS buckets per later round (Monte-Carlo EHS, 500 runouts), 20M iterations; play-only file (average-strategy counters, no regrets)",
+    "public_nodes": 8426,
+    "infosets": 436366,
+    "chips_per_hand_vs": {"random": 1.76, "call": 2.53, "allin": 0.85},
+    "lbr_chips_per_hand": "0.67 +- 0.09 (30 000 duplicate pairs)",
+    "note": "an equilibrium approximation exploits fixed bots less than the DeepCFR nets do; use it with real-time search: python -m headsup.web --opponent pluribus"
   }
 }

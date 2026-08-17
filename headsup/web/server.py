@@ -15,13 +15,15 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from headsup.paths import DEFAULT_ONNX_PATH, DEFAULT_POLICY_PATH, MODELS_DIR, ROOT
+from headsup.paths import DEFAULT_BLUEPRINT_PATH, DEFAULT_POLICY_PATH, MODELS_DIR, ROOT
 from headsup.web.session import GameSession
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 SIMPLE_OPPONENTS = [
     ("cfr", "DeepCFR policy (models/deepcfr_policy.pth)"),
-    ("onnx", "PPO exploiter (models/rl_games_exploiter.onnx)"),
+    ("tab", "Tabular MCCFR blueprint (models/blueprint_nlhe.pt)"),
+    ("pluribus", "Pluribus-style: tabular blueprint + real-time search (slow: seconds per decision)"),
+    ("search:cfr", "DeepCFR policy + depth-limited search"),
     ("random", "Random bot"),
     ("call", "Calling station"),
     ("allin", "Maniac (always all-in)"),
@@ -32,18 +34,21 @@ SIMPLE_OPPONENTS = [
 def available_players():
     """Player specs offered in the settings dialog: built-ins + policies found on disk."""
     out = [{"spec": s, "label": l} for s, l in SIMPLE_OPPONENTS]
-    seen = {DEFAULT_POLICY_PATH, DEFAULT_ONNX_PATH}
+    seen = {DEFAULT_POLICY_PATH, DEFAULT_BLUEPRINT_PATH}
     for path in sorted(glob.glob(os.path.join(MODELS_DIR, "*.pth")) + glob.glob(os.path.join(ROOT, "runs", "*", "policy.pth"))):
         if path in seen:
             continue
         seen.add(path)
         rel = os.path.relpath(path, ROOT)
         out.append({"spec": f"cfr:{rel}", "label": f"DeepCFR policy ({rel})"})
-    for path in sorted(glob.glob(os.path.join(MODELS_DIR, "*.onnx"))):
+    for path in sorted(glob.glob(os.path.join(MODELS_DIR, "*.onnx")) + glob.glob(os.path.join(ROOT, "runs", "*", "*.onnx"))):
+        rel = os.path.relpath(path, ROOT)
+        out.append({"spec": f"onnx:{rel}", "label": f"ONNX exploiter ({rel})"})
+    for path in sorted(glob.glob(os.path.join(MODELS_DIR, "blueprint*.pt")) + glob.glob(os.path.join(ROOT, "runs", "bp", "*.pt"))):
         if path in seen:
             continue
         rel = os.path.relpath(path, ROOT)
-        out.append({"spec": f"onnx:{rel}", "label": f"ONNX exploiter ({rel})"})
+        out.append({"spec": f"tab:{rel}", "label": f"Tabular blueprint ({rel})"})
     for path in sorted(glob.glob(os.path.join(MODELS_DIR, "*iterates*.pt")) + glob.glob(os.path.join(ROOT, "runs", "*", "iterates.pt"))):
         rel = os.path.relpath(path, ROOT)
         out.append({"spec": f"sdcfr:{rel}", "label": f"SD-CFR average strategy ({rel})"})

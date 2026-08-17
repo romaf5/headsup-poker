@@ -49,7 +49,9 @@ it automatically on macOS). On CUDA the network fits are captured into CUDA grap
 
 ```bash
 python -m headsup.web                                # http://127.0.0.1:8000/  vs the DeepCFR policy
-python -m headsup.web --opponent onnx                # vs the PPO exploiter
+python -m headsup.web --opponent pluribus            # Pluribus-style bot: tabular blueprint + real-time search (seconds per decision)
+python -m headsup.web --opponent tab                 # the tabular blueprint alone
+python -m headsup.web --opponent search:cfr@it20000  # DeepCFR policy + depth-limited search
 python -m headsup.web --opponent call --advisor ''   # calling station, no advisor
 python -m headsup.web --opponent cfr:runs/deepcfr_full/policy.pth --port 8080
 ```
@@ -156,7 +158,7 @@ policies head-to-head (round-robin, alternating seats, ± standard error):
 
 ```bash
 python -m headsup.deepcfr.evaluate --policy cfr --hands 200000
-python -m headsup.compare cfr sdcfr:runs/deepcfr/iterates.pt cfr:models/deepcfr_policy_v1.pth --hands 400000 --bots
+python -m headsup.compare cfr sdcfr:runs/deepcfr/iterates.pt tab --hands 400000 --bots
 ```
 
 ## Exploitability (best-response lower bound with rl_games)
@@ -170,7 +172,7 @@ exploiter reward is the number to quote (a lower bound on exploitability, ± SE)
 ```bash
 python -m headsup.exploit --policy cfr --seeds 3 --epochs 1000 --hands 400000 --out runs/exploit_cfr
 python -m headsup.exploit --policy sdcfr:runs/deepcfr/iterates.pt --seeds 3
-python -m headsup.exploit --policy cfr --onnx models/rl_games_exploiter.onnx     # evaluate existing exploiters
+python -m headsup.exploit --policy cfr --onnx runs/x/exploit_policy/exploiter_seed100.onnx   # evaluate existing exploiters
 ```
 
 The lower-level pieces are still available: `python -m headsup.rl.exploitability -t/-p` (one
@@ -397,7 +399,7 @@ headsup/algos/           tabular CFR / CFR+ / DCFR / PCFR+ / LCFR / MCCFR (tabul
                          DeepCFR / SD-CFR / DREAM / ESCHER on small games (deep.py), hold'em exploitability estimator (holdem_br.py)
 headsup/web/             browser table: server.py (http.server), session.py (game logic), static/ (HTML/CSS/JS)
 headsup/rl/              rl_games registration (env.py), exploiter CLI (exploitability.py), ONNX export (onnx.py)
-models/                  deepcfr_policy.pth, rl_games_exploiter.onnx
+models/                  deepcfr_policy.pth (DeepCFR net, history / paper), blueprint_nlhe.pt (tabular blueprint), README.json
 tests/                   pytest suite (rules, C++ ⇔ Python ⇔ numpy equivalence for every network variant, envs, memories, SD-CFR, web API)
 ```
 

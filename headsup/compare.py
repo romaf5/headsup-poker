@@ -1,6 +1,6 @@
 """Head-to-head comparison of policies (and simple bots).
 
-    python -m headsup.compare cfr sdcfr:runs/x/iterates.pt cfr:models/deepcfr_policy_v1.pth --hands 400000
+    python -m headsup.compare cfr sdcfr:runs/x/iterates.pt tab --hands 400000
     python -m headsup.compare cfr onnx --hands 200000 --bots
 
 Every pair plays ``--hands`` hands with alternating seats; the table shows the row player's

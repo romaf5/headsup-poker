@@ -203,6 +203,7 @@ class TabularPlayer:
 
 
 def parse_tab_spec(arg):
+    """``[path.pt][@current]`` -> (path or '', current)."""
     parts = arg.split("@")
     return parts[0], "current" in parts[1:]
 

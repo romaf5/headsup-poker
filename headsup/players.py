@@ -277,7 +277,8 @@ def make_player(spec: str, device=None, deterministic=False, seed=None, game=Non
     tree for players that do not carry one themselves (simple bots, ONNX exploiters); network
     players bring their own (``player.game``).
 
-    ``random`` | ``call`` | ``allin`` | ``raise`` | ``cfr[:path.pth]`` | ``onnx[:path.onnx]`` |
+    ``random`` | ``call`` | ``allin`` | ``raise`` | ``cfr[:path.pth]`` | ``onnx:path.onnx`` |
+    ``tab[:path.pt]`` (tabular blueprint) | ``pluribus[@options]`` (the shipped blueprint + Pluribus-style search) |
     ``sdcfr:path/iterates.pt[@exact][@g<gamma>][@t<N>][@k<K>]`` (Single Deep CFR average strategy; default
     trajectory sampling; ``@g2`` quadratic iterate weights; ``@t100`` = the average after 100 iterations;
     ``@k64`` = the bank thinned to 64 representative iterates) |
@@ -286,10 +287,12 @@ def make_player(spec: str, device=None, deterministic=False, seed=None, game=Non
     [@cont<policy|iterate|bank>][@thin<K>]`` (real-time subgame search on top of the blueprint) |
     ``tab:path.pt[@current]`` (tabular MCCFR blueprint over the card abstraction, headsup.blueprint)
     """
-    from headsup.paths import DEFAULT_ONNX_PATH, DEFAULT_POLICY_PATH
+    from headsup.paths import DEFAULT_BLUEPRINT_PATH, DEFAULT_POLICY_PATH
 
     kind, _, arg = spec.partition(":")
     kind = kind.lower()
+    if kind.startswith("pluribus@"):  # options without a path: pluribus@it300@th8
+        kind, arg = "pluribus", kind[len("pluribus@"):]
     game = game or DEFAULT_GAME
     if kind in SIMPLE_PLAYERS:
         return SIMPLE_PLAYERS[kind](seed=seed, game=game)
@@ -301,7 +304,15 @@ def make_player(spec: str, device=None, deterministic=False, seed=None, game=Non
         model = load_model(arg or DEFAULT_POLICY_PATH, device=device)
         return TorchPolicyPlayer(model, device=device, deterministic=deterministic, seed=seed)
     if kind == "onnx":
-        return ONNXPolicyPlayer(arg or DEFAULT_ONNX_PATH, deterministic=deterministic, seed=seed, game=game)
+        if not arg:
+            raise ValueError("onnx:<path.onnx> needs the exported exploiter's path (headsup.rl.onnx)")
+        return ONNXPolicyPlayer(arg, deterministic=deterministic, seed=seed, game=game)
+    if kind == "pluribus":  # the shipped tabular blueprint + Pluribus-style search (options after '@' as for search:)
+        from headsup.search import SearchPlayer, parse_search_spec
+
+        blueprint, kw = parse_search_spec(f"tab:{DEFAULT_BLUEPRINT_PATH}@pluribus@th16" + (f"@{arg}" if arg else ""))
+        kw.setdefault("threads", 16)
+        return SearchPlayer(blueprint, device=device, seed=seed, game=game, **kw)
     if kind == "sdcfr":
         from headsup.device import get_device
         from headsup.sdcfr import SDCFRPlayer
@@ -318,7 +329,7 @@ def make_player(spec: str, device=None, deterministic=False, seed=None, game=Non
         from headsup.blueprint import TabularPlayer, parse_tab_spec
 
         path, current = parse_tab_spec(arg)
-        return TabularPlayer(path, current=current, seed=seed)
+        return TabularPlayer(path or DEFAULT_BLUEPRINT_PATH, current=current, seed=seed)
     if kind == "iterate":
         import torch
 
