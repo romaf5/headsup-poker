@@ -1969,6 +1969,41 @@ struct Abstraction {
     return float(win / cnt);
   }
 
+  // EHS of every combo at once (shared runouts): exact on a complete board, otherwise the mean over
+  // `runouts` sampled completions of the BoardTable equities (hands blocked by a runout skip it).
+  // Used for hand-substituted queries (1326 hands of one public state); ~100x cheaper than per hand.
+  template <class RNG>
+  void ehs_all(const int* board, int n, int runouts, RNG& rng, std::vector<float>& out) const {
+    out.assign(NUM_COMBOS, -1.0f);
+    const int missing = showdown - n;
+    if (missing == 0) {
+      BoardTable t;
+      t.build(board, showdown);
+      out = t.equity;
+      return;
+    }
+    bool used[NUM_CARDS] = {};
+    for (int i = 0; i < n; ++i) used[board[i]] = true;
+    int deck[NUM_CARDS], nd = 0;
+    for (int c = 0; c < NUM_CARDS; ++c)
+      if (!used[c]) deck[nd++] = c;
+    std::vector<double> acc(NUM_COMBOS, 0.0), cnt(NUM_COMBOS, 0.0);
+    int full[5];
+    for (int i = 0; i < n; ++i) full[i] = board[i];
+    BoardTable t;
+    for (int r = 0; r < runouts; ++r) {
+      for (int i = 0; i < missing; ++i) {
+        std::uniform_int_distribution<int> d(i, nd - 1);
+        std::swap(deck[i], deck[d(rng)]);
+        full[n + i] = deck[i];
+      }
+      t.build(full, showdown);
+      for (int h : t.order) { acc[h] += t.equity[h]; cnt[h] += 1.0; }
+    }
+    for (int h = 0; h < NUM_COMBOS; ++h)
+      if (cnt[h] > 0) out[h] = float(acc[h] / cnt[h]);
+  }
+
   int bucket_of(int round, float e) const {
     const std::vector<float>& ed = edges[round];
     return int(std::upper_bound(ed.begin(), ed.end(), e) - ed.begin());
@@ -2578,9 +2613,24 @@ PYBIND11_MODULE(headsup_cpp, m) {
         auto o = out.mutable_unchecked<2>();
         py::gil_scoped_release release;
         std::mt19937_64 rng(seed);
-        std::vector<float> row(b.n_actions);
+        std::vector<float> row(b.n_actions), all;
+        const int nb = BOARD_CARDS_BY_STAGE[round];
+        const bool vector_path = round > 0 && n >= 64;  // many hands of one state: shared runouts for all combos
+        if (vector_path) b.abs.ehs_all(bd, nb, std::max(20, b.abs.samples / 5), rng, all);
         for (int i = 0; i < n; ++i) {
-          const int key = b.abs.bucket(round, h(i, 0), h(i, 1), bd, rng);
+          bool blocked = h(i, 0) == h(i, 1);
+          for (int k = 0; k < nb; ++k) blocked |= (bd[k] == h(i, 0) || bd[k] == h(i, 1));
+          if (blocked) {  // impossible hand (hand-substituted queries): zeros, the caller masks / normalises
+            for (int a = 0; a < b.n_actions; ++a) o(i, a) = 0.0f;
+            continue;
+          }
+          int key;
+          if (vector_path) {
+            const int lo = std::min(h(i, 0), h(i, 1)), hi = std::max(h(i, 0), h(i, 1));
+            key = b.abs.bucket_of(round, all[combo_index(lo, hi)]);
+          } else {
+            key = b.abs.bucket(round, h(i, 0), h(i, 1), bd, rng);
+          }
           b.strategy_at(node, key, current, row.data());
           for (int a = 0; a < b.n_actions; ++a) o(i, a) = row[a];
         }
