@@ -13,6 +13,7 @@ memory, saved to ``<out>/policy.pth`` and evaluated against simple opponents.
 """
 
 import argparse
+import sys
 import json
 import os
 import time
@@ -677,9 +678,23 @@ def resolve_args(args):
     return args
 
 
+RESUME_INHERITED = ("algo", "traversals", "adv_capacity", "strat_capacity", "value_steps", "batch_size", "policy_epochs",
+                    "policy_steps", "policy_batch_size", "regret_power", "strategy_power", "epsilon", "q_steps", "q_batch",
+                    "q_capacity", "value_trajectories", "eval_hands", "eval_every", "policy_eval_every", "lbr_every", "lbr_hands",
+                    "lbr_final_hands", "lbr_tables", "lbr_model_iterates", "seed", "lr")
+
+
 def main(argv=None):
-    args = resolve_args(build_parser().parse_args(argv))
+    parser = build_parser()
+    args = parser.parse_args(argv)
     checkpoint = args.policy_only or args.resume
+    if checkpoint:  # the run's hyperparameters come from the checkpoint unless given explicitly on this command line
+        saved = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True).get("args", {})
+        given = {a.dest for a in parser._actions if any(opt in (argv if argv is not None else sys.argv[1:]) for opt in a.option_strings)}
+        for key in RESUME_INHERITED:
+            if key in saved and key not in given:
+                setattr(args, key, saved[key])
+    args = resolve_args(args)
     if checkpoint:  # the network variant and the game are fixed by the checkpoint
         cfg = DeepCFRTrainer.checkpoint_model_config(checkpoint)
         args.features, args.net, args.cards, args.dim, args.rm_fallback = (
