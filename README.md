@@ -356,8 +356,12 @@ are running.
 (`search:tab:…@pluribus@it300`, 2 000 duplicate pairs) is **−0.78 ± 0.39** chips/hand — LBR
 cannot exploit it at all (vs +0.67 for the blueprint alone, +1.33 for the DeepCFR net); Pluribus
 mode on top of the DeepCFR net: **−0.00 ± 0.28**; the depth-limited solver on the DeepCFR net
-(`search:cfr:…@it20000`): **−0.41 ± 0.26** — every search variant is beyond LBR's reach; a
-head-to-head round robin of the search players is running (`runs/bp/eval.log`).
+(`search:cfr:…@it20000`): **−0.41 ± 0.26** — every search variant is beyond LBR's reach. A
+head-to-head round robin of the search players (2 000 hands per pair, ± 0.4–0.7): search on
+top of the DeepCFR net gains +0.86 ± 0.55 chips/hand against the net alone, the tabular
+blueprint's edge over the net is confirmed (+0.93 ± 0.44), and every pairing among the
+search players and the blueprint is within noise — near-equilibrium strategies do not beat
+each other, exploitability is what separates them (`runs/bp/compare_search.json`).
 
 ### Reproductions on the papers' games
 
