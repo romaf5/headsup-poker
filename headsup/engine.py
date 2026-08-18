@@ -18,6 +18,8 @@ The engine is deliberately dependency-light and cheap to ``clone()`` so that CFR
 traversals can branch on it.
 """
 
+import os
+
 import numpy as np
 
 from headsup.cards import CARD_FEATURES, NUM_CARDS, hand_strength
@@ -44,8 +46,14 @@ def history_slot(round_index, k):
     return HISTORY_OFFSET + 2 * (HISTORY_SLOTS * round_index + k)
 
 
+STACK_FEATURE_CAP = int(os.environ.get("HEADSUP_STACK_FEATURE_CAP", 1000))  # chips: the stack features (obs[28],
+# obs[30]) saturate here - beyond it a stack cannot matter for the betting (our NL games use 100-200 chips; the limit
+# games' 100 000-chip stacks are a formality).  The env var exists for the encoding ablation only.
+
+
 def public_state_from_obs(obs):
-    """(to_call, pot, stack, consecutive_raises) as ints from observation rows (N, >= 80)."""
+    """(to_call, pot, stack, consecutive_raises) as ints from observation rows (N, >= 80); the stack is
+    the encoded one (capped at STACK_FEATURE_CAP)."""
     obs = np.asarray(obs)
     pot = np.rint(obs[:, 29] * 1000).astype(np.int64)
     to_call = np.rint(obs[:, 23] * pot).astype(np.int64)
@@ -202,7 +210,7 @@ class HeadsUpPoker:
         obs[22] = p != self.dealer
 
         pot = self.pot
-        stack = self.stacks[p]
+        stack = min(self.stacks[p], STACK_FEATURE_CAP)  # limit games have effectively infinite stacks
         diff = self.stage_bets[o] - self.stage_bets[p]
         obs[23] = diff / pot
         obs[24] = self.bets[p] / pot

@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -43,6 +44,11 @@ constexpr int NUM_CARDS = 52;
 enum Action { FOLD = 0, CHECK_CALL = 1, RAISE = 2 };  // raise sizes are 2 .. num_actions-2, all-in = num_actions-1
 enum Stage { PREFLOP = 0, FLOP = 1, TURN = 2, RIVER = 3, END = 4 };
 constexpr int BOARD_CARDS_BY_STAGE[5] = {0, 3, 4, 5, 5};
+constexpr int STACK_FEATURE_CAP = 1000;  // the stack features of the observation saturate here (see engine.py)
+inline int stack_feature_cap() {  // HEADSUP_STACK_FEATURE_CAP overrides it (encoding ablation only)
+  static const int cap = [] { const char* v = std::getenv("HEADSUP_STACK_FEATURE_CAP"); return v ? std::atoi(v) : STACK_FEATURE_CAP; }();
+  return cap;
+}
 
 // ------------------------------------------------------------------ hand evaluator
 // treys card encoding: bitrank(16+) | suit(12..15) | rank(8..11) | prime(0..7)
@@ -198,7 +204,7 @@ struct Engine {
     obs[21] = float(stage);
     obs[22] = float(p != dealer);
     const float fpot = float(pot);
-    const int stack = stacks[p];
+    const int stack = std::min(stacks[p], stack_feature_cap());  // limit games: effectively infinite stacks
     const int diff = stage_bets[o] - stage_bets[p];
     obs[23] = float(diff) / fpot;
     obs[24] = float(bets[p]) / fpot;

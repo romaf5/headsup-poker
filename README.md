@@ -384,9 +384,13 @@ ours are single seeds — the ordering SD-CFR < DeepCFR is the papers' too, DREA
 in the paper is not reproduced at this length).
 
 **FHP** (flop hold'em, DeepCFR / DREAM papers): the DeepCFR reproduction (paper hyperparameters:
-10 000 traversals, batch 10 000, 40 M memories, 450 iterations; paper: 37 mbb/g), DREAM and
-ESCHER (50 000 outcome-sampling traversals per iteration, 300 iterations) are queued on the GPU;
-their exploitability curves come from `headsup.algos.holdem_br` (200 boards). Already measured:
+10 000 traversals, batch 10 000, 20 M memories, 450 iterations; paper: 37 mbb/g) has trained,
+DREAM and ESCHER (50 000 outcome-sampling traversals per iteration, 300 iterations) follow on
+the GPU; their exploitability curves come from `headsup.algos.holdem_br` (200 boards) and are
+being computed. (A first evaluation of the FHP run was garbage because model configs stored the
+action tree without blinds / stacks — for limit games the bet sizes are absolute chips, so the
+model players reconstructed a 1/2-blind, 100-chip-stack game; fixed 2026-08-18: `tree_dict`
+carries them, the artefacts were repaired and re-evaluated.) Already measured:
 tabular MCCFR blueprints on FHP plateau at **~380 mbb/g** whatever the number of EHS buckets
 (50 … 1000), iterations (0.3 … 10 M) or averaging — the floor of a one-dimensional
 equity-vs-uniform-range abstraction (the DeepCFR paper's own 40 000-cluster MCCFR baseline

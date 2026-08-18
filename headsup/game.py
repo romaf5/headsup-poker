@@ -126,11 +126,16 @@ class GameConfig:
 
     # -- (de)serialisation ------------------------------------------------------------
     def tree_dict(self):
-        """The part that defines the action tree (stored in model configs)."""
+        """The part that defines the action tree (stored in model configs).  Stacks and blinds are
+        included when they differ from the no-limit defaults: for limit games the bet sizes are
+        absolute chips, so blinds / stacks are part of the tree (a model trained on FHP must not be
+        evaluated in a 100-chip-stack, 1/2-blind game)."""
         d = {"bet_sizes": list(self.bet_sizes), "raise_cap": self.raise_cap, "mask_redundant": self.mask_redundant}
         if self.limit is not None or self.raise_caps is not None or self.num_rounds != 4 or not self.all_in:
             d.update({"limit": list(self.limit) if self.limit else None, "raise_caps": list(self.raise_caps) if self.raise_caps else None,
                       "num_rounds": self.num_rounds, "all_in": self.all_in})
+        if (self.stack_size, self.small_blind, self.big_blind) != (100, 1, 2):
+            d.update({"stack_size": self.stack_size, "small_blind": self.small_blind, "big_blind": self.big_blind})
         return d
 
     def to_dict(self):
