@@ -333,9 +333,13 @@ DeepCFR / SD-CFR arms, 300 iterations × 40 000 traversals, 20 M memories each (
 Findings: the paper's bet-history features and network are less exploitable than the aggregated
 features / current network (LBR 1.33 vs 1.62); the argmax regret-matching fallback (paper) lowers
 LBR further but the strategy is far more passive against the bots; DeepCFR's policy net and the
-SD-CFR average tie head-to-head in every arm (±0.05 at 1.5 M hands). Longer runs
-(`long_history_paper`: 1000 it. × 100 000 traversals) and the 0.5 / 1 / 2-pot action tree
-(`betsize_history_paper`) are still training / evaluating.
+SD-CFR average tie head-to-head in every arm (±0.05 at 1.5 M hands). The long run
+(`long_history_paper`: history / paper, **1000 iterations × 100 000 traversals**, ~16 h on a
+3090) lands at the same place as the 300-iteration arm: LBR 1.44 ± 0.15 (policy) / 1.38 ± 0.16
+(SD-CFR average) at 10 000 pairs, +4.28 / +7.86 / +2.85 vs the bots, tie vs its SD-CFR average
+(−0.02 ± 0.05) — more iterations and traversals do not buy lower exploitability with these nets.
+The 0.5 / 1 / 2-pot action tree run (`betsize_history_paper`, 300 it.): LBR 0.68 ± 0.21 (policy)
+/ 0.50 ± 0.20 (SD-CFR) at 10 000 pairs, tie vs its SD-CFR average (+0.02 ± 0.05).
 
 **Tabular Pluribus blueprint** (`runs/bp/nlhe_20m.pt` = `models/blueprint_nlhe.pt`: 20 M
 Linear-MCCFR-P iterations, 200 EHS buckets, ~40 min on 24 threads): LBR **0.67 ± 0.09** chips/hand
