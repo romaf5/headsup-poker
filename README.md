@@ -390,7 +390,11 @@ the GPU; their exploitability curves come from `headsup.algos.holdem_br` (200 bo
 being computed. (A first evaluation of the FHP run was garbage because model configs stored the
 action tree without blinds / stacks — for limit games the bet sizes are absolute chips, so the
 model players reconstructed a 1/2-blind, 100-chip-stack game; fixed 2026-08-18: `tree_dict`
-carries them, the artefacts were repaired and re-evaluated.) Already measured:
+carries them, the artefacts were repaired and re-evaluated.) First number: the DeepCFR policy
+net after 450 iterations is **248 mbb/g** exploitable (100 boards; +59 / +14 chips per hand vs
+random / call with a 100-chip big blind) — ~7× the paper's 37 mbb/g; a second run with the
+corrected observation encoding (the run above still fed a `stack/pot ≈ 667` feature) is
+training, and the SD-CFR-average curve is being computed. Already measured:
 tabular MCCFR blueprints on FHP plateau at **~380 mbb/g** whatever the number of EHS buckets
 (50 … 1000), iterations (0.3 … 10 M) or averaging — the floor of a one-dimensional
 equity-vs-uniform-range abstraction (the DeepCFR paper's own 40 000-cluster MCCFR baseline
