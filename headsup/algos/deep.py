@@ -63,44 +63,101 @@ class CircularBuffer:
         return self.x[idx], self.target[idx], self.mask[idx]
 
 
-def _fit(model, opt, xs, targets, weights, steps, batch, rng, device, masks=None, grad_clip=1.0):
+def _adam(model, lr):
+    """Adam (lr 1e-3 in all the papers); fused and CUDA-graph capturable on the GPU."""
+    cuda = next(model.parameters()).is_cuda
+    return torch.optim.Adam(model.parameters(), lr=lr, **({"fused": True, "capturable": True} if cuda else {}))
+
+
+def _optimise(model, opt, loss_fn, steps, grad_clip=1.0):
+    """``steps`` optimiser steps on ``loss_fn()`` (which samples its own minibatch on the model's
+    device), gradient-norm clipping as the papers.  On CUDA the whole step - sampling, forward,
+    backward, clipping, fused Adam - is captured once in a CUDA graph and replayed: the small games'
+    networks are launch-bound (5 ms -> ~0.3-0.7 ms per step).  Returns the last loss."""
+    params = list(model.parameters())
+    cuda = params[0].is_cuda
+
+    def step():
+        loss = loss_fn()
+        loss.backward()
+        if grad_clip:
+            torch.nn.utils.clip_grad_norm_(params, grad_clip, foreach=cuda)
+        opt.step()
+        opt.zero_grad(set_to_none=not cuda)  # the graph needs the gradient buffers to stay in place
+        return loss
+
+    model.train()
+    loss = None
+    if not cuda or steps <= 4:
+        for _ in range(steps):
+            loss = step()
+    else:
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):  # warm-up outside the graph (allocates the gradient / optimiser state)
+            for _ in range(3):
+                step()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):  # recorded, not executed
+            loss = step()
+        for _ in range(steps - 3):
+            graph.replay()
+    model.eval()
+    return float(loss.item()) if loss is not None else float("nan")
+
+
+def _batch_index(n, batch, device):
+    return (torch.rand(batch, device=device) * n).long()  # uniform with replacement (graph-safe RNG)
+
+
+def _fit(model, opt, xs, targets, weights, steps, batch, device, masks=None, grad_clip=1.0):
     """Weighted MSE regression steps on numpy arrays; ``masks`` restricts the loss to some outputs."""
     xs_t = torch.as_tensor(xs, device=device)
     tg_t = torch.as_tensor(targets, device=device)
     w_t = torch.as_tensor(weights, device=device)
     m_t = torch.as_tensor(masks, device=device) if masks is not None else None
     n = len(xs)
-    for _ in range(steps):
-        idx = torch.as_tensor(rng.integers(0, n, batch), device=device)
-        pred = model(xs_t[idx])
-        err = (pred - tg_t[idx]).pow(2)
+
+    def loss_fn():
+        idx = _batch_index(n, batch, device)
+        err = (model(xs_t[idx]) - tg_t[idx]).pow(2)
         if m_t is not None:
             err = err * m_t[idx]
-        loss = (w_t[idx][:, None] * err).mean()
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        if grad_clip:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip, foreach=False)
-        opt.step()
-    return float(loss.item())
+        return (w_t[idx][:, None] * err).mean()
+
+    return _optimise(model, opt, loss_fn, steps, grad_clip)
 
 
 def _fit_from_buffer(model, buffer, steps, batch, lr, device, loss="mse", weight_power=1.0):
-    """DeepCFR-style fit on a ReservoirBuffer: targets weighted by t^power; ``loss`` mse (advantages)
-    or 'policy' (softmax(logits) vs stored probabilities)."""
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    model.train()
-    for obs, t, target in buffer.prefetch(batch, steps):
+    """DeepCFR-style fit on a ReservoirBuffer (on ``device``): targets weighted by t^power; ``loss``
+    mse (advantages) or 'policy' (softmax(logits) vs stored probabilities)."""
+    n = len(buffer)
+    if n == 0:
+        return model
+
+    def loss_fn():
+        idx = _batch_index(n, batch, device)
+        obs = torch.cat([buffer.obs_int[idx].to(torch.float32), buffer.obs_float[idx]], dim=1)
         pred = model(obs)
         if loss == "policy":
             pred = torch.softmax(pred, dim=-1)
-        l = ((t.pow(weight_power))[:, None] * (pred - target).pow(2)).mean()
-        opt.zero_grad(set_to_none=True)
-        l.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=False)
-        opt.step()
-    model.eval()
+        return (buffer.t[idx].pow(weight_power)[:, None] * (pred - buffer.target[idx]).pow(2)).mean()
+
+    _optimise(model, _adam(model, lr), loss_fn, steps)
     return model
+
+
+def regret_matching_rows(adv, legal, argmax_fallback=False):
+    """Row-wise :func:`regret_matching_np` for (..., A) arrays."""
+    pos = np.where(legal, np.maximum(adv, 0.0), 0.0)
+    total = pos.sum(-1, keepdims=True)
+    if argmax_fallback:
+        fb = np.zeros_like(pos)
+        np.put_along_axis(fb, np.argmax(np.where(legal, adv, -np.inf), axis=-1)[..., None], 1.0, axis=-1)
+    else:
+        fb = legal / legal.sum(-1, keepdims=True)
+    return np.where(total > 1e-12, pos / np.maximum(total, 1e-300), fb)
 
 
 def regret_matching_np(adv, legal, argmax_fallback=False):
@@ -147,7 +204,7 @@ class DeepSolver:
     def __init__(self, game, algo="deepcfr", traversals=1000, adv_capacity=2_000_000, strat_capacity=2_000_000,
                  adv_steps=3000, adv_batch=2048, policy_steps=4000, policy_batch=2048, q_steps=1000, q_batch=512,
                  q_capacity=200_000, value_traversals=None, epsilon=0.5, value_epsilon=0.01, lr=1e-3, device="cpu", seed=0,
-                 model_kwargs=None, rm_argmax=True):
+                 model_kwargs=None, rm_argmax=True, warm_start=False):
         assert algo in ALGOS
         self.game, self.algo = game, algo
         self.traversals = traversals
@@ -157,6 +214,7 @@ class DeepSolver:
         self.q_steps, self.q_batch = q_steps, q_batch
         self.epsilon, self.value_epsilon, self.lr = epsilon, value_epsilon, lr
         self.rm_argmax = rm_argmax
+        self.warm_start = warm_start  # SD-CFR paper (Leduc): each advantage net starts from the player's previous one
         self.device = torch.device(device)
         self.rng = np.random.default_rng(seed)
         torch.manual_seed(seed)
@@ -165,14 +223,17 @@ class DeepSolver:
         self.nets = [self._new_model() for _ in range(2)]
         self.iterates = [[self._cpu_state(n)] for n in self.nets]
         self.adv_memory = [ReservoirBuffer(adv_capacity, self.device, obs_dim=D, target_dim=A, seed=seed + i, int_dim=0) for i in range(2)]
-        self.strat_memory = ReservoirBuffer(strat_capacity, self.device, obs_dim=D, target_dim=A, seed=seed + 2, int_dim=0)
+        # the average-strategy memory is only needed where a policy net is fitted (SD-CFR / DREAM average the iterates)
+        self.strat_memory = ReservoirBuffer(strat_capacity if algo in ("deepcfr", "escher") else 1, self.device, obs_dim=D, target_dim=A,
+                                            seed=seed + 2, int_dim=0)
         if algo == "dream":  # baseline Q_i(s*(h), a) per player, expected-SARSA targets
             self.q_nets = [self._new_model(2 * D) for _ in range(2)]
-            self.q_opts = [torch.optim.Adam(n.parameters(), lr=lr) for n in self.q_nets]
+            self.q_opts = [_adam(n, lr) for n in self.q_nets]
             self.q_memory = [CircularBuffer(q_capacity, 2 * D, A) for _ in range(2)]
         if algo == "escher":  # history value q(h, a): player 0's expected return per action
             self.v_net = self._new_model(2 * D)
         self.iteration = 0
+        self.nodes_touched = 0  # states visited by the traversals / trajectories (the DREAM paper's x-axis)
         self.stats = {}
         # small games: every infoset / history is enumerated once and the networks are evaluated in
         # one batch per fit (exact tables) instead of one forward pass per visited state
@@ -203,6 +264,7 @@ class DeepSolver:
 
         walk(self.game.new_initial_state())
         self._info_keys = list(info)
+        self._info_index = {k: i for i, k in enumerate(self._info_keys)}
         self._info_player = np.array([info[k][0] for k in self._info_keys])
         self._info_obs = np.stack([info[k][1] for k in self._info_keys]).astype(np.float32)
         self._info_legal = np.stack([info[k][2] for k in self._info_keys])
@@ -254,6 +316,7 @@ class DeepSolver:
 
     # -- external sampling (Deep CFR / SD-CFR) --------------------------------------------------
     def _es(self, state, p, t, adv, strat):
+        self.nodes_touched += 1
         if state.is_terminal():
             return state.returns()[p]
         if state.is_chance():
@@ -280,6 +343,7 @@ class DeepSolver:
 
     def _os_dream(self, state, p, t, own_sample_reach, adv, q_data):
         """Returns the baseline-corrected sampled value of ``state`` for player p (DREAM eq. 6-7)."""
+        self.nodes_touched += 1
         if state.is_terminal():
             return state.returns()[p]
         if state.is_chance():
@@ -329,6 +393,7 @@ class DeepSolver:
         state = self.game.new_initial_state()
         rows = []
         while not state.is_terminal():
+            self.nodes_touched += 1
             if state.is_chance():
                 state = state.child(state.sample_chance(self.rng))
                 continue
@@ -350,6 +415,7 @@ class DeepSolver:
         """One trajectory: update player p samples uniformly, the opponent from sigma; regrets from q."""
         state = self.game.new_initial_state()
         while not state.is_terminal():
+            self.nodes_touched += 1
             if state.is_chance():
                 state = state.child(state.sample_chance(self.rng))
                 continue
@@ -378,8 +444,7 @@ class DeepSolver:
                     self._escher_value_data(data)
                 xs, tgs, mks = (np.stack([d[i] for d in data]).astype(np.float32) for i in range(3))
                 self.v_net = self._new_model(2 * self.game.obs_dim).train()
-                self.v_opt = torch.optim.Adam(self.v_net.parameters(), lr=self.lr)
-                _fit(self.v_net, self.v_opt, xs, tgs, np.ones(len(xs), np.float32), self.q_steps, self.q_batch, self.rng, self.device, masks=mks)
+                _fit(self.v_net, _adam(self.v_net, self.lr), xs, tgs, np.ones(len(xs), np.float32), self.q_steps, self.q_batch, self.device, masks=mks)
                 self.v_net.eval()
                 self._v_tab = None
             for p in range(2):
@@ -393,20 +458,24 @@ class DeepSolver:
                         self._escher_regrets(p, t, adv, strat)
                 if adv:
                     self.adv_memory[p].add(np.stack([a[0] for a in adv]), np.array([a[1] for a in adv], np.float32), np.stack([a[2] for a in adv]))
-                if strat:
+                if strat and self.algo in ("deepcfr", "escher"):
                     self.strat_memory.add(np.stack([s[0] for s in strat]), np.array([s[1] for s in strat], np.float32), np.stack([s[2] for s in strat]))
                 if self.algo == "dream" and q_data:
                     self.q_memory[p].add(*(np.stack([d[i] for d in q_data]).astype(np.float32) for i in range(3)))
                     xs, tgs, mks = self.q_memory[p].sample(min(self.q_memory[p].size, 200_000), self.rng)
                     self.q_nets[p].train()
-                    _fit(self.q_nets[p], self.q_opts[p], xs, tgs, np.ones(len(xs), np.float32), self.q_steps, self.q_batch, self.rng, self.device, masks=mks)
+                    _fit(self.q_nets[p], self.q_opts[p], xs, tgs, np.ones(len(xs), np.float32), self.q_steps, self.q_batch, self.device, masks=mks)
                     self.q_nets[p].eval()
                     self._q_tab[p] = None
                 # advantage / regret net from scratch (linear CFR weights t)
-                self.nets[p] = _fit_from_buffer(self._new_model(), self.adv_memory[p], self.adv_steps, self.adv_batch, self.lr, self.device)
+                start = self._new_model()
+                if self.warm_start and self.iteration > 1:
+                    start.load_state_dict(self.nets[p].state_dict())
+                self.nets[p] = _fit_from_buffer(start, self.adv_memory[p], self.adv_steps, self.adv_batch, self.lr, self.device)
                 self.iterates[p].append(self._cpu_state(self.nets[p]))
                 self._sigma_tab[p] = None
-            self.stats = {"iteration": self.iteration, "seconds": time.perf_counter() - t0, "adv_samples": [len(m) for m in self.adv_memory], "strat_samples": len(self.strat_memory)}
+            self.stats = {"iteration": self.iteration, "seconds": time.perf_counter() - t0, "adv_samples": [len(m) for m in self.adv_memory],
+                          "strat_samples": len(self.strat_memory), "nodes_touched": self.nodes_touched}
         return self
 
     # -- policies for evaluation ---------------------------------------------------------------
@@ -421,39 +490,49 @@ class DeepSolver:
 
     def average_policy(self):
         """Exact SD-CFR average: per infoset the reach-weighted (weight t * own reach) mixture of all
-        iterates' regret-matching strategies (deepcfr/escher: the fitted policy net instead)."""
+        iterates' regret-matching strategies (deepcfr/escher: the fitted policy net instead).  All
+        iterates are evaluated at every infoset in one pass, then one tree walk per player carries the
+        vector of the iterates' own reach probabilities."""
         if self.algo in ("deepcfr", "escher"):
             return NetPolicy(self.game, self.policy_net(), "softmax", self.device)
-        num, den = {}, {}
+        T = len(self.iterates[0]) - 1
+        weights = np.arange(1, T + 1, dtype=np.float64)
         net = self._new_model()
-        for t in range(1, len(self.iterates[0])):
-            for p in range(2):
+        num = np.zeros((len(self._info_keys), self.game.num_actions))
+        den = np.zeros(len(self._info_keys))
+        for p in range(2):
+            rows = np.flatnonzero(self._info_player == p)
+            sig = np.zeros((T, len(self._info_keys), self.game.num_actions))
+            for t in range(1, T + 1):
                 net.load_state_dict(self.iterates[p][t])
-                out = self._forward(net, self._info_obs)
-                tab = {k: regret_matching_np(out[i], self._info_legal[i], self.rm_argmax) for i, k in enumerate(self._info_keys) if self._info_player[i] == p}
-                self._accumulate(self.game.new_initial_state(), p, float(t), 1.0, lambda st, tab=tab: tab[st.info_key(st.current_player)], num, den)
-        table = {k: num[k] / den[k] for k in num if den[k] > 0}
+                out = self._forward(net, self._info_obs[rows])
+                sig[t - 1, rows] = regret_matching_rows(out, self._info_legal[rows], self.rm_argmax)
+            self._accumulate(self.game.new_initial_state(), p, np.ones(T), weights, sig, num, den)
+        table = {k: num[i] / den[i] for i, k in enumerate(self._info_keys) if den[i] > 0}
         return TabularPolicy(self.game, table)
 
-    def _accumulate(self, state, p, w, own_reach, sigma_t, num, den):
+    def _accumulate(self, state, p, reach, weights, sig, num, den):
+        """num[I] += sum_t w_t reach_t(I) sigma_t(I), den[I] += sum_t w_t reach_t(I) at p's infosets
+        (``reach``: the iterates' own reach probabilities, shape (T,))."""
         if state.is_terminal():
             return
         if state.is_chance():
             for a, _ in state.chance_outcomes():
-                self._accumulate(state.child(a), p, w, own_reach, sigma_t, num, den)
+                self._accumulate(state.child(a), p, reach, weights, sig, num, den)
             return
-        cur = state.current_player
-        if cur == p:
-            key = state.info_key(p)
-            sig = sigma_t(state)
-            num[key] = num.get(key, 0.0) + w * own_reach * sig
-            den[key] = den.get(key, 0.0) + w * own_reach
+        if state.current_player == p:
+            i = self._info_index[state.info_key(p)]
+            s = sig[:, i]  # (T, A)
+            wr = weights * reach
+            num[i] += wr @ s
+            den[i] += wr.sum()
             for a in state.legal_actions():
-                if sig[a] > 0:
-                    self._accumulate(state.child(a), p, w, own_reach * sig[a], sigma_t, num, den)
+                r = reach * s[:, a]
+                if r.any():
+                    self._accumulate(state.child(a), p, r, weights, sig, num, den)
         else:
             for a in state.legal_actions():
-                self._accumulate(state.child(a), p, w, own_reach, sigma_t, num, den)
+                self._accumulate(state.child(a), p, reach, weights, sig, num, den)
 
     def evaluate(self):
         cur = exploitability(self.game, self.current_policy())[0]
@@ -471,6 +550,9 @@ def main(argv=None):
     p.add_argument("--traversals", type=int, default=346, help="per iteration and player (SD-CFR Leduc: 346 ES; DREAM: 900 OS; ESCHER 1000)")
     p.add_argument("--adv-steps", type=int, default=3000)
     p.add_argument("--adv-batch", type=int, default=2048)
+    p.add_argument("--adv-capacity", type=int, default=2_000_000, help="advantage reservoir per player (DREAM paper 2M, SD-CFR paper 1M)")
+    p.add_argument("--strat-capacity", type=int, default=2_000_000)
+    p.add_argument("--warm-start", action="store_true", help="advantage nets start from the player's previous net (SD-CFR paper's Leduc setup)")
     p.add_argument("--policy-steps", type=int, default=4000)
     p.add_argument("--policy-batch", type=int, default=2048)
     p.add_argument("--q-steps", type=int, default=1000, help="DREAM baseline / ESCHER value-net steps per iteration")
@@ -489,15 +571,17 @@ def main(argv=None):
     solver = DeepSolver(game, args.algo, traversals=args.traversals, adv_steps=args.adv_steps, adv_batch=args.adv_batch,
                         policy_steps=args.policy_steps, policy_batch=args.policy_batch, q_steps=args.q_steps, q_batch=args.q_batch,
                         value_traversals=args.value_traversals, epsilon=args.epsilon, value_epsilon=args.value_epsilon,
-                        device=args.device, seed=args.seed, rm_argmax=args.rm_fallback == "argmax")
+                        device=args.device, seed=args.seed, rm_argmax=args.rm_fallback == "argmax", warm_start=args.warm_start,
+                        adv_capacity=args.adv_capacity, strat_capacity=args.strat_capacity)
     curve = []
     t0 = time.perf_counter()
     for it in range(1, args.iterations + 1):
         solver.iterate()
         if it % args.eval_every == 0 or it == args.iterations:
             ev = solver.evaluate()
-            curve.append({"iteration": it, **ev, "seconds": time.perf_counter() - t0})
-            print(f"{args.game} {args.algo} it {it}: exploitability current {ev['current']:.4f} average {ev['average']:.4f}  ({time.perf_counter() - t0:.0f}s)", flush=True)
+            curve.append({"iteration": it, **ev, "nodes_touched": solver.nodes_touched, "seconds": time.perf_counter() - t0})
+            print(f"{args.game} {args.algo} it {it}: exploitability current {ev['current']:.4f} average {ev['average']:.4f}  "
+                  f"nodes {solver.nodes_touched:.3g}  ({time.perf_counter() - t0:.0f}s)", flush=True)
     if args.json:
         with open(args.json, "w") as f:
             json.dump({"game": args.game, "algo": args.algo, "args": vars(args), "curve": curve}, f, indent=2)

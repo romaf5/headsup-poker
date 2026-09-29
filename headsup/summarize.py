@@ -14,6 +14,8 @@ import json
 import os
 import re
 
+import numpy as np
+
 
 def _load(path):
     try:
@@ -59,7 +61,7 @@ def summarize_run(run):
         for path in (f"br_{name}.json", f"br_{name}_12.json"):  # best-response exploitability (headsup.algos.holdem_br)
             d = _load(os.path.join(run, path))
             if d:
-                out[f"br_{name}"] = (d["exploitability_chips"], None, d["boards"])
+                out[f"br_{name}"] = (d["exploitability_chips"], None, d.get("cards", d.get("boards")))
                 break
     return out
 
@@ -91,10 +93,11 @@ def markdown(rows):
     return "\n".join(lines)
 
 
-def small_game_table(directory, iterations=(10, 20, 50, 100, 200), unit=1000.0):
-    """Markdown table of the small-game reproduction curves written by ``headsup.algos.deep --json``
-    (``<algo>.json`` with a ``curve`` of exploitabilities per iteration) and the tabular baselines
-    (``tabular.json``: {name: [{iteration, exploitability}]}); values x ``unit`` (chips -> milli-antes)."""
+def small_game_table(directory, iterations=(20, 50, 100, 200, 400), unit=1000.0):
+    """Markdown table of the small-game curves written by ``headsup.algos.deep --json`` (``<algo>.json``
+    or ``<algo>_s<seed>.json`` with a ``curve`` of exploitabilities per iteration; seeds are averaged,
+    mean ± sd) and the tabular baselines (``tabular*.json``: {name: [{iteration, exploitability}]});
+    values x ``unit`` (chips -> milli-antes)."""
     lines = []
     deep = {}
     for path in sorted(glob.glob(os.path.join(directory, "*.json"))):
@@ -102,27 +105,33 @@ def small_game_table(directory, iterations=(10, 20, 50, 100, 200), unit=1000.0):
         data = _load(path)
         if not data or name.startswith("tabular"):
             continue
+        algo = re.sub(r"_s\d+$", "", name)
         curve = {c["iteration"]: c for c in data.get("curve", [])}
-        deep[name] = (data.get("args", {}), curve)
+        deep.setdefault(algo, (data.get("args", {}), []))[1].append(curve)
     if deep:
         cols = " | ".join(f"it. {i}" for i in iterations)
-        lines.append(f"| algorithm (traversals / it.) | {cols} | current @ last |")
-        lines.append("|---|" + "---|" * (len(iterations) + 1))
-        for name, (args, curve) in deep.items():
+        lines.append(f"| algorithm (traversals / it.) | seeds | {cols} |")
+        lines.append("|---|---|" + "---|" * len(iterations))
+        for algo, (args, curves) in deep.items():
             vals = []
             for i in iterations:
-                c = curve.get(i)
-                vals.append(f"{unit * c['average']:.0f}" if c else "–")
-            last = curve[max(curve)] if curve else None
-            cur = f"{unit * last['current']:.0f} (it. {max(curve)})" if last else "–"
-            lines.append(f"| {name} ({args.get('traversals', '?')}) | " + " | ".join(vals) + f" | {cur} |")
-    tab = _load(os.path.join(directory, "tabular.json"))
-    if tab:
+                xs = [unit * c[i]["average"] for c in curves if i in c]
+                if not xs:
+                    vals.append("–")
+                elif len(xs) == 1:
+                    vals.append(f"{xs[0]:.0f}")
+                else:
+                    vals.append(f"{np.mean(xs):.0f} ± {np.std(xs, ddof=1):.0f}")
+            lines.append(f"| {algo} ({args.get('traversals', '?')}) | {len(curves)} | " + " | ".join(vals) + " |")
+    for path in sorted(glob.glob(os.path.join(directory, "tabular*.json"))):
+        tab = _load(path)
+        if not tab:
+            continue
         lines.append("")
         lines.append("| tabular | exploitability of the average strategy by iteration |")
         lines.append("|---|---|")
         for name, curve in tab.items():
-            lines.append(f"| {name} | " + ", ".join(f"it. {c['iteration']}: {unit * c['exploitability']:.0f}" for c in curve) + " |")
+            lines.append(f"| {name} | " + ", ".join(f"it. {c['iteration']}: {unit * c['exploitability']:.3g}" for c in curve) + " |")
     return "\n".join(lines)
 
 
@@ -136,7 +145,7 @@ def holdem_br_table(runs):
         for name in ("br_policy.json", "br_policy_12.json"):
             d = _load(os.path.join(run, name))
             if d:
-                pol = f"{d['exploitability_mbb']:.0f} ({d['boards']} boards)"
+                pol = f"{d['exploitability_mbb']:.0f} ({d.get('cards', d.get('boards'))} boards)"
                 break
         curve = []
         for path in glob.glob(os.path.join(run, "br_sdcfr_t*.json")):

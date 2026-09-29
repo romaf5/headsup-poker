@@ -12,7 +12,7 @@ def test_deep_algorithms_reduce_kuhn_exploitability(algo):
     g = make_game("kuhn")
     uniform = exploitability(g, UniformPolicy(g))[0]
     # ESCHER re-fits its value net from scratch every iteration (as the reference code): more data / steps
-    its, trav, q_steps = (20, 100, 300) if algo == "escher" else (12, 60, 60)
+    its, trav, q_steps = (20, 200, 300) if algo == "escher" else (12, 60, 60)
     s = DeepSolver(g, algo, traversals=trav, adv_steps=120, adv_batch=256, policy_steps=200, policy_batch=256,
                    q_steps=q_steps, q_batch=128, seed=0)
     s.iterate(its)
