@@ -69,7 +69,7 @@ def _adam(model, lr):
     return torch.optim.Adam(model.parameters(), lr=lr, **({"fused": True, "capturable": True} if cuda else {}))
 
 
-_GRAPH_POOLS, _SIDE_STREAMS = {}, {}
+_SIDE_STREAMS = {}
 
 
 def _side_stream(device):
@@ -78,14 +78,6 @@ def _side_stream(device):
     if device not in _SIDE_STREAMS:
         _SIDE_STREAMS[device] = torch.cuda.Stream(device=device)
     return _SIDE_STREAMS[device]
-
-
-def _graph_pool(device):
-    """One memory pool for all the fits' CUDA graphs on a device: each graph is replayed only within
-    its own fit, so later captures may reuse its memory (per-capture private pools leaked ~20 MB per fit)."""
-    if device not in _GRAPH_POOLS:
-        _GRAPH_POOLS[device] = torch.cuda.graph_pool_handle()
-    return _GRAPH_POOLS[device]
 
 
 def _optimise(model, opt, loss_fn, steps, grad_clip=1.0):
@@ -118,12 +110,10 @@ def _optimise(model, opt, loss_fn, steps, grad_clip=1.0):
                 step()
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=_graph_pool(params[0].device)):  # recorded, not executed
+        with torch.cuda.graph(graph):  # recorded, not executed
             loss = step()
         for _ in range(steps - 3):
             graph.replay()
-        loss = loss.detach().clone()
-        del graph  # its memory returns to the shared pool (a private pool per capture was never released)
     model.eval()
     return float(loss.item()) if loss is not None else float("nan")
 
