@@ -41,3 +41,17 @@ def test_graph_captured_fits_do_not_grow_gpu_memory():
     for _ in range(10):
         _fit_from_buffer(s._new_model(), s.adv_memory[0], 20, 256, 1e-3, s.device)
     assert torch.cuda.memory_reserved() - before < 8 << 20
+
+
+def test_checkpoint_resume_continues_the_run(tmp_path):
+    from headsup.algos.deep import main
+
+    ck = tmp_path / "ck.pt"
+    args = ["--game", "kuhn", "--algo", "dream", "--traversals", "20", "--adv-steps", "10", "--adv-batch", "64", "--q-steps", "5",
+            "--eval-every", "2", "--checkpoint", str(ck), "--json", str(tmp_path / "c.json")]
+    main(args + ["--iterations", "2"])
+    main(args + ["--iterations", "4"])  # resumes at iteration 2
+    import json
+
+    curve = json.load(open(tmp_path / "c.json"))["curve"]
+    assert [c["iteration"] for c in curve] == [2, 4]

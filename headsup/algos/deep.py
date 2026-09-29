@@ -30,6 +30,7 @@ the hold'em pipeline in headsup.deepcfr keeps its C++ kernels.
 
 import argparse
 import json
+import os
 import time
 
 import numpy as np
@@ -545,6 +546,42 @@ class DeepSolver:
             for a in state.legal_actions():
                 self._accumulate(state.child(a), p, reach, weights, sig, num, den)
 
+    # -- checkpoints ------------------------------------------------------------------------------
+    def state_dict(self):
+        state = {"iteration": self.iteration, "nodes_touched": self.nodes_touched, "nets": [self._cpu_state(n) for n in self.nets],
+                 "iterates": self.iterates, "adv_memory": [m.state_dict() for m in self.adv_memory],
+                 "adv_rng": [m.rng.bit_generator.state for m in self.adv_memory], "rng": self.rng.bit_generator.state,
+                 "torch_rng": torch.get_rng_state()}
+        if self.algo in ("deepcfr", "escher"):
+            state["strat_memory"], state["strat_rng"] = self.strat_memory.state_dict(), self.strat_memory.rng.bit_generator.state
+        if self.algo == "dream":
+            state["q_nets"] = [self._cpu_state(n) for n in self.q_nets]
+            state["q_opts"] = [o.state_dict() for o in self.q_opts]
+            state["q_memory"] = [(m.x[: m.size].copy(), m.target[: m.size].copy(), m.mask[: m.size].copy(), m.pos, m.size) for m in self.q_memory]
+        return state
+
+    def load_state_dict(self, state):
+        self.iteration, self.nodes_touched = int(state["iteration"]), int(state["nodes_touched"])
+        for net, sd in zip(self.nets, state["nets"]):
+            net.load_state_dict(sd)
+        self.iterates = state["iterates"]
+        for m, sd, rs in zip(self.adv_memory, state["adv_memory"], state["adv_rng"]):
+            m.load_state_dict(sd)
+            m.rng.bit_generator.state = rs
+        self.rng.bit_generator.state = state["rng"]
+        torch.set_rng_state(state["torch_rng"])
+        if "strat_memory" in state:
+            self.strat_memory.load_state_dict(state["strat_memory"])
+            self.strat_memory.rng.bit_generator.state = state["strat_rng"]
+        if self.algo == "dream":
+            for net, opt, sd, osd in zip(self.q_nets, self.q_opts, state["q_nets"], state["q_opts"]):
+                net.load_state_dict(sd)
+                opt.load_state_dict(osd)
+            for m, (x, tg, mk, pos, size) in zip(self.q_memory, state["q_memory"]):
+                m.x[:size], m.target[:size], m.mask[:size], m.pos, m.size = x, tg, mk, pos, size
+        self._sigma_tab, self._q_tab, self._v_tab = [None, None], [None, None], None
+        return self
+
     def evaluate(self):
         cur = exploitability(self.game, self.current_policy())[0]
         avg = exploitability(self.game, self.average_policy())[0]
@@ -577,6 +614,7 @@ def main(argv=None):
     p.add_argument("--device", default="cpu")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", default=None)
+    p.add_argument("--checkpoint", default=None, help="saved at every evaluation; an existing file is resumed from")
     args = p.parse_args(argv)
     game = make_game(args.game)
     solver = DeepSolver(game, args.algo, traversals=args.traversals, adv_steps=args.adv_steps, adv_batch=args.adv_batch,
@@ -584,15 +622,23 @@ def main(argv=None):
                         value_traversals=args.value_traversals, epsilon=args.epsilon, value_epsilon=args.value_epsilon,
                         device=args.device, seed=args.seed, rm_argmax=args.rm_fallback == "argmax", warm_start=args.warm_start,
                         adv_capacity=args.adv_capacity, strat_capacity=args.strat_capacity)
-    curve = []
-    t0 = time.perf_counter()
-    for it in range(1, args.iterations + 1):
+    curve, elapsed = [], 0.0
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        solver.load_state_dict(saved["solver"])
+        curve, elapsed = saved["curve"], saved["seconds"]
+        print(f"resumed from {args.checkpoint} at iteration {solver.iteration}", flush=True)
+    t0 = time.perf_counter() - elapsed
+    for it in range(solver.iteration + 1, args.iterations + 1):
         solver.iterate()
         if it % args.eval_every == 0 or it == args.iterations:
             ev = solver.evaluate()
             curve.append({"iteration": it, **ev, "nodes_touched": solver.nodes_touched, "seconds": time.perf_counter() - t0})
             print(f"{args.game} {args.algo} it {it}: exploitability current {ev['current']:.4f} average {ev['average']:.4f}  "
                   f"nodes {solver.nodes_touched:.3g}  ({time.perf_counter() - t0:.0f}s)", flush=True)
+            if args.checkpoint:  # atomic: a crash while writing leaves the previous checkpoint intact
+                torch.save({"solver": solver.state_dict(), "curve": curve, "seconds": time.perf_counter() - t0}, args.checkpoint + ".tmp")
+                os.replace(args.checkpoint + ".tmp", args.checkpoint)
     if args.json:
         with open(args.json, "w") as f:
             json.dump({"game": args.game, "algo": args.algo, "args": vars(args), "curve": curve}, f, indent=2)
