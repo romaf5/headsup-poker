@@ -56,7 +56,8 @@ python -m pytest tests -q                                    # ~115 tests, ~8 mi
 - Search: pre-river subgames use *sampled* MCCFR where LCFR beats DCFR / CFR+ / PCFR+ (measured); the
   river uses full-width vector CFR where DCFR / CFR+ / PCFR+ win. Do not add regret flooring to the
   sampled solver. `search:` players are slow (~1-2 s/decision): evaluate on 1-2k hands.
-- Exploitability claims: use `headsup.algos.holdem_br` (BR ≈ 2.5 × LBR ≈ 10 × PPO here). LBR vs an
+- Exploitability claims: use `headsup.algos.holdem_br` (GPU; FHP exact with `--cards all`; papers differ on
+  mean-over-seats vs total exploitability - DeepCFR's FHP numbers are totals). LBR vs an
   SD-CFR bank: thin the queried bank (`--model-iterates 32`; the bound stays valid).
 - Measure, don't anecdote: 400k+ hands for head-to-head, 20k+ LBR pairs, report ± SE.
 

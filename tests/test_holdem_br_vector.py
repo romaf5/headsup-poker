@@ -1,12 +1,11 @@
-"""Vectorised hold'em best response (headsup.algos.vector_br) against the per-board reference."""
+"""Vectorised hold'em best response (headsup.algos.holdem_br.VectorBestResponse) against the per-board reference."""
 
 import numpy as np
 import pytest
 import torch
 
 from headsup import native
-from headsup.algos.holdem_br import HoldemBestResponse
-from headsup.algos.vector_br import MixturePolicy, VectorBestResponse, mixture_policy
+from headsup.algos.holdem_br import HoldemBestResponse, MixturePolicy, VectorBestResponse, mixture_policy
 from headsup.engine import HeadsUpPoker
 from headsup.game import FHP
 from headsup.model import BaseModel
@@ -85,3 +84,25 @@ def test_mixture_values_are_bilinear_in_the_components():
     only = MixturePolicy(lambda s, x, legal: torch.stack([rm(n, x, legal) for n in nets[s]]), [0.0, 1.0], FHP, "cpu")
     single = RegretMatchingPlayer([nets[0][1], nets[1][1]], device="cpu")
     assert value(only) == pytest.approx(value(mixture_policy(single, "cpu")), rel=1e-5)
+
+
+def test_best_response_to_always_call_matches_the_closed_form():
+    """Against always-call the best response per hand is: fold / check down / raise pre-flop, then
+    bet the flop exactly when ahead - a closed form in the flop's showdown sums.  Checks the chance
+    normalisation (values after the flop divided by P(flop misses a hand pair) = 0.7826)."""
+    from headsup.lbr import valid_combos
+    from headsup.players import make_player
+
+    flops = FLOPS + [(3, 20, 45), (8, 9, 10)]
+    s1, s2 = np.zeros(1326), np.zeros(1326)
+    for f in flops:
+        ok = valid_combos(f)
+        d = np.asarray(native.module().BoardTable(list(f), 3).showdown_values(ok.astype(float))) * ok
+        s1, s2 = s1 + d, s2 + np.maximum(d, 0)
+    norm = len(flops) * (48 * 47 * 46) / (52 * 51 * 50)
+    call, raise_ = (100 * s1 + 100 * s2) / norm, (200 * s1 + 100 * s2) / norm
+    br1 = np.maximum(call, raise_).sum() / (1326 * 1225)
+    br0 = np.maximum(np.maximum(call, raise_), -50.0 * 1225).sum() / (1326 * 1225)
+    policy = mixture_policy(make_player("call", game=FHP), "cpu")
+    res = _fixed_flops(VectorBestResponse(policy, FHP, cards=len(flops), chunk=3), flops).run()
+    assert res["br_values"] == pytest.approx([br0, br1], rel=1e-5)

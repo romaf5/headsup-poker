@@ -49,7 +49,7 @@ paper's hyperparameters; `python -m headsup.deepcfr.train -h` lists the network 
 
 | tool | measures |
 |---|---|
-| `python -m headsup.algos.holdem_br --policy <spec>` | best-response exploitability (exact over hands, sampled boards) |
+| `python -m headsup.algos.holdem_br --policy <spec> --cards all` | best-response exploitability: exact over hands, boards enumerated (FHP) or sampled per street; SD-CFR averages exactly |
 | `python -m headsup.lbr --policy <spec>` | Local Best Response, a lower bound |
 | `python -m headsup.compare <spec> <spec> --bots` | head-to-head chips/hand ± SE |
 | `python -m headsup.exploit --policy <spec>` | PPO exploiters, a weak lower bound |

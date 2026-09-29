@@ -103,6 +103,6 @@ def test_fhp_estimate_is_zero_sum_and_bounds_the_profile():
 
 
 def test_cli_runs(capsys):
-    main(["--policy", "call", "--game", "fhp", "--boards", "1", "--device", "cpu"])
+    main(["--policy", "call", "--game", "fhp", "--cards", "2", "--chunk", "2", "--device", "cpu"])
     out = capsys.readouterr().out
     assert "exploitability" in out and "mbb/g" in out
