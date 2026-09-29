@@ -216,6 +216,7 @@ class SearchPlayer:
         self.focus = float(focus)
         self.river_iterations, self.river_variant = int(river_iterations), river_variant
         self.warm_start = int(warm_start)  # equivalent iterations of the previous solve's regrets to start from (0 = off)
+        seed = 0 if seed is None else int(seed)
         self.model = _model_for(blueprint, device, seed + 1, model_iterates=thin, game=game)  # models the opponent
         self.model_observes = hasattr(self.model, "observe")
         self.game = getattr(self.model, "game", None) or make_player(blueprint, device=device, seed=seed).game
