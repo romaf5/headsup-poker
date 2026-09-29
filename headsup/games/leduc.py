@@ -122,8 +122,6 @@ class LeducState(State):
     # -- outcome ------------------------------------------------------------------------
     def returns(self):
         assert self.current_player == TERMINAL
-        invested = self.game.ante + sum(self.history_chips(p) for p in ()) if False else None  # placeholder for clarity
-        # chips each player put in: ante + bets over rounds -> recompute from the pot symmetric split
         contrib = self._contributions()
         if self.folded is not None:
             w = 1 - self.folded
