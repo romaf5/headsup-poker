@@ -9,6 +9,7 @@ import time
 import numpy as np
 
 from headsup.env import make_vec_env, play_hands
+from headsup.games.holdem import mbb_per_hand
 
 DEFAULT_OPPONENTS = ("random", "call", "allin")
 
@@ -51,7 +52,7 @@ def main():
         r = play_hands(env, player, args.hands, progress=True)
         dt = time.perf_counter() - t0
         se = r.std() / np.sqrt(len(r))
-        print(f"{args.policy} vs {opp:>10s}: {r.mean():+.3f} ± {se:.3f} chips/hand  ({r.mean()*500:+.0f} mbb/hand)  [{len(r)/dt:,.0f} hands/s]")
+        print(f"{args.policy} vs {opp:>10s}: {r.mean():+.3f} ± {se:.3f} chips/hand  ({mbb_per_hand(r.mean(), env.game):+.0f} mbb/hand)  [{len(r)/dt:,.0f} hands/s]")
 
 
 if __name__ == "__main__":

@@ -193,14 +193,14 @@ class GameSession:
         if self.game.is_raise(action):
             verb = "bets" if to_call == 0 else "raises"
             amt = self.game.raise_amount(action, to_call, before["pot"], stack)
-            if before["consecutive_raises"] + 1 >= e.raise_cap or amt >= stack:
+            if before["consecutive_raises"] + 1 >= e.game.cap(int(before["stage"])) or amt >= stack:
                 return f"{verb} all-in {stack}", stack
             return (f"bets {amt}", amt) if to_call == 0 else (f"raises to {before['stage_bets'][seat] + amt}", amt)
         return f"all-in {stack}", stack
 
     def _snapshot(self):
         e = self.engine
-        return dict(stage_bets=list(e.stage_bets), stacks=list(e.stacks), consecutive_raises=e.consecutive_raises, pot=e.pot)
+        return dict(stage_bets=list(e.stage_bets), stacks=list(e.stacks), consecutive_raises=e.consecutive_raises, pot=e.pot, stage=int(e.stage))
 
     def _record(self, seat, action, before):
         text, amount = self._describe_action(seat, action, before)
@@ -354,7 +354,7 @@ class GameSession:
             amt = e.raise_amount(a)
             key = str(k + 1) if multi else "R"
             suffix = f" ({size_label(size)})" if multi else ""
-            if e.consecutive_raises + 1 >= e.raise_cap or amt >= stack:
+            if e.consecutive_raises + 1 >= e.game.cap(int(e.stage)) or amt >= stack:
                 out.append({"action": self.action_names[a], "label": f"{verb} all-in {stack}{suffix}", "key": key, "allin": True})
             elif to_call == 0:
                 out.append({"action": self.action_names[a], "label": f"Bet {amt}{suffix}", "key": key})

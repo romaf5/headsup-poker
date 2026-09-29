@@ -38,7 +38,7 @@ def test_limit_games_fhp_hulh():
             e.reset()
             while not e.done:
                 e.step(int(rng.choice(np.flatnonzero(e.legal_mask()))))
-            assert sum(e.rewards) == 0 and e.folded >= 0 or abs(e.rewards[0]) <= 2 * sum(game.limit) * max(game.raise_caps) + game.big_blind
+            assert sum(e.rewards) == 0 and (e.folded >= 0 or abs(e.rewards[0]) <= 2 * sum(game.limit) * max(game.raise_caps) + game.big_blind)
 
 
 def test_game_config_basics():
@@ -93,7 +93,8 @@ def test_engine_multi_size_invariants_and_masks_from_obs(game):
 
 
 @pytest.mark.skipif(not native.available(), reason="C++ extension not built")
-@pytest.mark.parametrize("game", [POT_GAME, MIXED_GAME, FHP, HULH])
+# QUARTER_GAME: 0.25 x (pot + to_call) hits exact halves (rounding must match C++ std::lround)
+@pytest.mark.parametrize("game", [POT_GAME, MIXED_GAME, FHP, HULH, GameConfig(bet_sizes=(0.25, 0.75, 1.25), mask_redundant=True)])
 def test_cpp_engine_matches_python_engine_multi_size(game):
     cpp = native.module()
     rng = np.random.default_rng(5)

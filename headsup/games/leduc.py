@@ -6,10 +6,13 @@ round; showdown: a pair (private = public rank) wins, else the higher rank, ties
 Actions: 0 fold, 1 check/call, 2 bet/raise.  Kuhn: 3-card deck (J Q K), ante 1, one round with
 a single bet of 1, no raise on a bet.
 
-Information state features (Leduc): private card one-hot (3 ranks; suits are strategically
-irrelevant but kept as separate cards in the deck), public card one-hot (3, zeros before the
-flop), round, chips put in by each player this round / 4, pot / 20, and the round's action
-history (up to 4 slots x 3 actions one-hot) - 3 + 3 + 1 + 2 + 1 + 12 = 22 features.
+Information state features: private card one-hot (3 ranks; suits are strategically irrelevant
+but kept as separate cards in the deck), public card one-hot (3, zeros before the flop), round,
+chips put in by each player this round / 4, pot / 20, and the action history of *every* round
+(4 slots x 3 actions one-hot per round) - 10 + 12 per round = 34 features for Leduc, 22 for Kuhn.
+The full history keeps the features perfect-recall: with the current round's actions only,
+pre-flop raise-call and check-raise-call look the same on the flop (936 infosets collapse to
+180 inputs and even exact CFR+ on that abstraction stalls at ~400 mA/g).
 """
 
 import numpy as np
@@ -172,16 +175,16 @@ class LeducState(State):
         x[7] = self.bets[player] / 4.0
         x[8] = self.bets[1 - player] / 4.0
         x[9] = self.pot / 20.0
-        off = 10
-        for k, a in enumerate(self.history[self.round][:4]):
-            x[off + 3 * k + a] = 1.0
+        for r in range(self.round + 1):
+            for k, a in enumerate(self.history[r][:4]):
+                x[10 + 12 * r + 3 * k + a] = 1.0
         return x
 
 
 class Leduc(Game):
     name = "leduc"
     num_actions = 3
-    obs_dim = 22
+    obs_dim = 34
     ante = 1
     deck_size = 6
     num_rounds = 2

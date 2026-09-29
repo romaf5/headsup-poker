@@ -19,6 +19,7 @@ The part of the configuration that fixes the action tree (``bet_sizes``, ``raise
 ``mask_redundant``) is stored in every model's config; envs / players build engines from it.
 """
 
+import math
 from dataclasses import asdict, dataclass, replace
 
 MAX_ACTIONS = 8  # mirrored by headsup_cpp (MAX_ACTIONS): up to 5 raise sizes
@@ -97,7 +98,7 @@ class GameConfig:
         if size == "min":
             amount = min_raise
         else:
-            amount = max(min_raise, to_call + int(round(size * (pot + to_call))))
+            amount = max(min_raise, to_call + int(math.floor(size * (pot + to_call) + 0.5)))  # = C++ std::lround (halves up)
         return min(amount, stack)
 
     def legal_mask(self, to_call, pot, stack, consecutive_raises, with_twins=False, round_index=0):

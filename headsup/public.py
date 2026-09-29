@@ -40,7 +40,7 @@ def actions_for_amount(engine, amount):
     if amount == 0 and to_call > 0:  # a fold (recorded with size 0): only seen in terminal observations
         return [int(Action.FOLD)]
     out = []
-    capped = engine.consecutive_raises + 1 >= engine.raise_cap
+    capped = engine.consecutive_raises + 1 >= engine.game.cap(int(engine.stage))
     for a in range(2, 2 + engine.game.num_raises):
         if engine.raise_amount(a) == amount or (capped and amount == stack and engine.all_in is not None):
             out.append(a)

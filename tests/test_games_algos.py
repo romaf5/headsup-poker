@@ -78,3 +78,27 @@ def test_mccfr_external_and_outcome_sampling_converge():
     assert exploitability(g, ext.average_policy())[0] < 1.0
     pruned = MCCFR(g, "external", seed=1, prune_threshold=-1.0, prune_after=500).iterate(1500)
     assert exploitability(g, pruned.average_policy())[0] < 1.1
+
+
+@pytest.mark.parametrize("name", ["kuhn", "leduc"])
+def test_info_state_is_perfect_recall(name):
+    """The network input determines the infoset up to the (strategically irrelevant) suits: two
+    states with the same features must have the same ranks and the same betting history."""
+    game = make_game(name)
+    seen = {}
+
+    def walk(s):
+        if s.is_terminal():
+            return
+        if s.is_chance():
+            for a, _ in s.chance_outcomes():
+                walk(s.child(a))
+            return
+        p = s.current_player
+        board = None if s.board is None else game.rank_of(s.board)
+        key = (p, game.rank_of(s.cards[p]), board, tuple(tuple(h) for h in s.history))
+        assert seen.setdefault((p, s.info_state(p).tobytes()), key) == key
+        for a in s.legal_actions():
+            walk(s.child(a))
+
+    walk(game.new_initial_state())

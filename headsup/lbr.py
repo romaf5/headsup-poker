@@ -311,7 +311,7 @@ class LocalBestResponse:
         counts = {s: {action_label(self.game, a): int(self.action_counts[i, a]) for a in range(self.num_actions)} for i, s in enumerate(stages)}
         return {
             "policy": self.spec, "hands": int(len(results)), "duplicate": self.duplicate,
-            "lbr_chips_per_hand": m, "se": se, "mbb_per_hand": 500 * m, "mbb_se": 500 * se,
+            "lbr_chips_per_hand": m, "se": se, "mbb_per_hand": 1000.0 * m / self.game.big_blind, "mbb_se": 1000.0 * se / self.game.big_blind,
             "model_iterates": getattr(getattr(self.model, "bank", None), "T", None),
             "lbr_actions_by_stage": counts,
             "mean_value_gap_vs_call": float(np.mean(self.value_gap)) if self.value_gap else 0.0,
