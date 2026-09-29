@@ -130,7 +130,7 @@ class HoldemBestResponse:
             sign = 1.0 if nd.folder != p else -1.0
             return sign * nd.stake * _opponent_mass(reach_q)
         n_final = BOARD_CARDS_BY_STAGE[self.game.num_rounds - 1]
-        revealed = len(nd.engine.visible_board)
+        revealed = len(nodes[0].engine.visible_board)  # cards known on this street (the node's own engine may be past it)
         if nd.kind == 2:
             # showdown on the boards' final cards (the unrevealed ones are dealt): sum over the sampled
             # boards, hands overlapping a board contribute nothing there, normalised by N * P(compatible)

@@ -83,13 +83,24 @@ def _power_weighted_mse(power):
 
 def train_advantage_net(
     buffer, device, steps, batch_size, lr=1e-3, grad_clip=1.0, log=None, tag="", compile=True, log_step_offset=0, log_every=100,
-    model_config=None, weight_power=1.0,
+    model_config=None, weight_power=1.0, target_scale="auto",
 ):
     """Fresh network fitted to (obs -> regrets) with iteration-weighted MSE (weight t^weight_power).
 
-    Returns ``(model, final_loss)``.  Per-step losses are logged at ``log_step_offset + step``
-    so successive fits form one continuous curve in TensorBoard.
+    ``target_scale``: the regrets are divided by it for the fit and the output layer is multiplied
+    by it afterwards, so the network still predicts chips.  From a zero-initialised head, Adam's
+    ~lr-sized steps cannot reach outputs of hundreds of chips within a few thousand steps (FHP's
+    regrets have an RMS of ~270 chips: the raw fit explained half the variance the scaled one
+    does); regret matching is scale-free, so only the fit quality changes.  ``"auto"`` = the RMS of
+    the memory's targets, ``None`` / 1 = raw chips.
+
+    Returns ``(model, final_loss)`` (the loss in scaled units).  Per-step losses are logged at
+    ``log_step_offset + step`` so successive fits form one continuous curve in TensorBoard.
     """
+    if target_scale == "auto":
+        _, _, sample = buffer.sample(min(65536, len(buffer)))
+        target_scale = max(float(sample.pow(2).mean().sqrt()), 1e-6)
+    scale = float(target_scale or 1.0)
     model = BaseModel(config=model_config).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     model.train()
@@ -97,6 +108,8 @@ def train_advantage_net(
     loss_fn = _power_weighted_mse(weight_power)
     loss = None
     for step, (obs, t, target) in enumerate(buffer.prefetch(batch_size, steps)):
+        if scale != 1.0:
+            target = target / scale
         try:
             loss = _run_step(fwd, model, opt, obs, t, target, loss_fn, grad_clip)
         except Exception as exc:
@@ -108,9 +121,14 @@ def train_advantage_net(
         if log is not None and step % log_every == 0:
             log(f"advantage{tag}/loss", loss.item(), log_step_offset + step)
     model.eval()
+    if scale != 1.0:
+        with torch.no_grad():
+            model.action_head.weight.mul_(scale)
+            model.action_head.bias.mul_(scale)
     final_loss = float(loss.item()) if loss is not None else float("nan")
     if log is not None and steps:
         log(f"advantage{tag}/loss", final_loss, log_step_offset + steps - 1)
+        log(f"advantage{tag}/target_scale", scale, log_step_offset + steps - 1)
     return model, final_loss
 
 
@@ -386,6 +404,7 @@ class DeepCFRTrainer:
                 log_step_offset=(self.iteration - 1) * a.value_steps,
                 model_config=self.model_config,
                 weight_power=a.regret_power,
+                target_scale=None if a.target_scale == "none" else ("auto" if a.target_scale == "auto" else float(a.target_scale)),
             )
             weights[seat] = self.nets[seat].numpy_weights()
             if self.iterates is not None:
@@ -620,6 +639,8 @@ def build_parser():
     p.add_argument("--value-steps", type=int, default=None, help="SGD steps per advantage-net fit (default 4000)")
     p.add_argument("--batch-size", type=int, default=None, help="advantage-net batch size (default 16384)")
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--target-scale", default="auto",
+                   help="advantage-net fits: divide the regrets by this (auto = their RMS) and scale the output layer back; 'none' = raw chips")
     p.add_argument("--regret-power", type=float, default=1.0,
                    help="advantage samples of iteration t weigh t^power in the fit (1 = linear CFR; DCFR-style alpha = 1.5)")
     p.add_argument("--strategy-power", type=float, default=1.0,
@@ -633,8 +654,8 @@ def build_parser():
     p.add_argument("--net", default="current", choices=ARCHS, help="architecture: current (3 branches) | paper (Brown et al. Fig. 1)")
     p.add_argument("--cards", default="embed", choices=CARDS, help="card input: embed (rank+suit+card embeddings) | onehot (SD-CFR)")
     p.add_argument("--dim", type=int, default=64, help="hidden / embedding width")
-    p.add_argument("--rm-fallback", default="uniform", choices=RM_FALLBACKS,
-                   help="regret matching when no advantage is positive: uniform | argmax (DeepCFR paper)")
+    p.add_argument("--rm-fallback", default=None, choices=RM_FALLBACKS,
+                   help="regret matching when no advantage is positive: uniform (default) | argmax (DeepCFR paper; --preset paper)")
     # game (action tree; stored in the model config)
     p.add_argument("--game", default="nlhe", choices=["nlhe", "fhp", "hulh"],
                    help="nlhe: the no-limit abstraction below; fhp / hulh: the DeepCFR paper's limit games (blinds 50/100)")
@@ -675,13 +696,15 @@ def resolve_args(args):
         args.policy_steps = None  # an explicit epoch count beats the preset's step count
     if args.policy_steps is None and args.policy_epochs is None:
         args.policy_epochs = PRESETS["default"]["policy_epochs"]
+    if getattr(args, "rm_fallback", None) is None:
+        args.rm_fallback = "argmax" if args.preset == "paper" else "uniform"
     return args
 
 
 RESUME_INHERITED = ("algo", "traversals", "adv_capacity", "strat_capacity", "value_steps", "batch_size", "policy_epochs",
                     "policy_steps", "policy_batch_size", "regret_power", "strategy_power", "epsilon", "q_steps", "q_batch",
                     "q_capacity", "value_trajectories", "eval_hands", "eval_every", "policy_eval_every", "lbr_every", "lbr_hands",
-                    "lbr_final_hands", "lbr_tables", "lbr_model_iterates", "seed", "lr")
+                    "lbr_final_hands", "lbr_tables", "lbr_model_iterates", "seed", "lr", "target_scale")
 
 
 def main(argv=None):

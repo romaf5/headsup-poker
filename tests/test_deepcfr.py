@@ -222,3 +222,23 @@ def test_cpp_escher_samplers():
         expected = np.where(legal, q - v[:, None], 0.0)
         np.testing.assert_allclose(adv.target[legal], expected[legal], atol=1e-3)
         np.testing.assert_allclose(strat.target.sum(1), 1.0, atol=1e-5)
+
+
+def test_advantage_fit_scales_large_targets():
+    """Regrets of hundreds of chips (FHP) are fitted in scaled units and the output layer is scaled
+    back: the net predicts chips, while a raw-chip fit cannot grow its zero-initialised head in time."""
+    from headsup.deepcfr.train import train_advantage_net
+
+    w = [BaseModel().numpy_weights(), BaseModel().numpy_weights()]
+    adv, _, _ = run_traversals_python(w, 0, 100, 1.0, seed=0)
+    target = np.tile(np.array([300.0, -300.0, 0.0, 0.0], np.float32), (len(adv), 1))
+    buf = ReservoirBuffer(10000, "cpu", obs_dim=31, seed=0)
+    buf.add(adv.obs, np.ones(len(adv), np.float32), target)
+    obs = torch.as_tensor(adv.obs[:256, :31])
+    torch.manual_seed(0)
+    scaled, _ = train_advantage_net(buf, "cpu", steps=300, batch_size=64, compile=False)
+    torch.manual_seed(0)
+    raw, _ = train_advantage_net(buf, "cpu", steps=300, batch_size=64, compile=False, target_scale=None)
+    with torch.no_grad():
+        np.testing.assert_allclose(scaled(obs).mean(0).numpy(), [300.0, -300.0, 0.0, 0.0], atol=30.0)
+        assert raw(obs)[:, 0].mean().item() < 150.0

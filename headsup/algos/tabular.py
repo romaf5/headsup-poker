@@ -63,44 +63,48 @@ class CFR(_Tables):
         pred = self.last_regret.get(key) if self.variant == "pcfr+" else None
         return regret_matching(r, legal, pred)
 
-    def _walk(self, state, p, reach_p, reach_q):
-        """Counterfactual value for player p; updates p's regrets and strategy sums."""
+    def _walk(self, state, p, reach_p, reach_q, inst, own):
+        """Counterfactual value for player p.  The regrets stay fixed during the walk: the
+        instantaneous regrets are summed over an infoset's histories in ``inst`` and p's own reach /
+        strategy per infoset kept in ``own`` (the same for every history of the infoset); both are
+        applied once per iteration by :meth:`_update`.  Zero-probability branches are walked too, so
+        every infoset of p gets its strategy-sum increment."""
         if state.is_terminal():
             return state.returns()[p]
         if state.is_chance():
-            return sum(prob * self._walk(state.child(a), p, reach_p, reach_q * prob) for a, prob in state.chance_outcomes())
+            return sum(prob * self._walk(state.child(a), p, reach_p, reach_q * prob, inst, own) for a, prob in state.chance_outcomes())
         cur = state.current_player
         key = state.info_key(cur)
         legal = state.legal_mask()
         sigma = self._sigma(key, legal)
         if cur != p:
-            v = 0.0
-            for a in state.legal_actions():
-                if sigma[a] > 0:
-                    v += sigma[a] * self._walk(state.child(a), p, reach_p, reach_q * sigma[a])
-            return v
-        t = self.iteration
+            return sum(sigma[a] * self._walk(state.child(a), p, reach_p, reach_q * sigma[a], inst, own) for a in state.legal_actions())
         values = np.zeros(self.game.num_actions)
         for a in state.legal_actions():
-            values[a] = self._walk(state.child(a), p, reach_p * sigma[a], reach_q)
+            values[a] = self._walk(state.child(a), p, reach_p * sigma[a], reach_q, inst, own)
         v = float(sigma @ values)
-        inst = np.where(legal, values - v, 0.0) * reach_q
-        R = self._get(self.regret, key)
-        S = self._get(self.strategy_sum, key)
-        if self.variant == "vanilla":
-            R += inst
-            S += reach_p * sigma
-        elif self.variant == "lcfr":
-            R += t * inst
-            S += t * reach_p * sigma
-        elif self.variant == "dcfr":
-            R += inst
-            S += reach_p * sigma
-        else:  # cfr+ / pcfr+
-            np.maximum(R + inst, 0.0, out=R)
-            self.last_regret[key] = inst
-            S += (t if self.variant == "cfr+" else t * t) * reach_p * sigma
+        r = np.where(legal, values - v, 0.0) * reach_q
+        if key in inst:
+            inst[key] += r
+        else:
+            inst[key] = r
+        own[key] = (reach_p, sigma)
         return v
+
+    def _update(self, inst, own):
+        t = self.iteration
+        for key, r in inst.items():
+            R = self._get(self.regret, key)
+            if self.variant in ("vanilla", "dcfr"):
+                R += r
+            elif self.variant == "lcfr":
+                R += t * r
+            else:  # cfr+ / pcfr+: regret floor at zero once per iteration
+                np.maximum(R + r, 0.0, out=R)
+                self.last_regret[key] = r
+        weight = {"vanilla": 1.0, "dcfr": 1.0, "lcfr": t, "cfr+": t, "pcfr+": t * t}[self.variant]
+        for key, (reach_p, sigma) in own.items():
+            self._get(self.strategy_sum, key)[:] += weight * reach_p * sigma
 
     def _discount(self):
         if self.variant != "dcfr":
@@ -116,8 +120,10 @@ class CFR(_Tables):
     def iterate(self, n=1):
         for _ in range(n):
             self.iteration += 1
-            for p in range(2):
-                self._walk(self.game.new_initial_state(), p, 1.0, 1.0)
+            for p in range(2):  # alternating updates: player 1 already sees player 0's new strategy
+                inst, own = {}, {}
+                self._walk(self.game.new_initial_state(), p, 1.0, 1.0, inst, own)
+                self._update(inst, own)
             self._discount()
         return self
 
@@ -182,7 +188,8 @@ class MCCFR(_Tables):
             outcomes = state.chance_outcomes()
             i = int(self.rng.choice(len(outcomes), p=[pr for _, pr in outcomes]))
             a, pr = outcomes[i]
-            return self._outcome(state.child(a), p, reach_p, reach_q * pr, sample_prob * pr)
+            u, tail_p, tail_q = self._outcome(state.child(a), p, reach_p, reach_q * pr, sample_prob * pr)
+            return u, tail_p, tail_q * pr  # chance belongs to the "opponent" tail reach pi_-p(h -> z)
         cur = state.current_player
         key = state.info_key(cur)
         legal = state.legal_mask()
@@ -204,7 +211,7 @@ class MCCFR(_Tables):
             return u, tail_p * sigma[a], tail_q
         u, tail_p, tail_q = self._outcome(child, p, reach_p, reach_q * sigma[a], sample_prob * q[a])
         S = self._get(self.strategy_sum, key)
-        S += t * (reach_p / sample_prob) * sigma  # stochastically weighted averaging
+        S += t * (reach_q / sample_prob) * sigma  # stochastically weighted averaging: the acting player's own (x chance) reach
         return u, tail_p, tail_q * sigma[a]
 
     def iterate(self, n=1):

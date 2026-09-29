@@ -50,21 +50,22 @@ def test_kuhn_cfr_plus_reaches_the_equilibrium_value():
     assert best_response(g, UniformPolicy(g), 0)[0] > 0.4
 
 
-@pytest.mark.parametrize("variant", ["vanilla", "lcfr", "cfr+", "dcfr", "pcfr+"])
-def test_leduc_cfr_variants_converge(variant):
+# exploitability of the average after 100 iterations (antes): vanilla 0.096, LCFR 0.034, CFR+ 0.013,
+# DCFR 0.008, PCFR+ 0.020 (uniform: 2.37); regrets are applied once per iteration and every infoset's
+# strategy sum is updated (in-place per-history updates had CFR+ at 0.035 after 1000 iterations)
+@pytest.mark.parametrize("variant,bound", [("vanilla", 0.12), ("lcfr", 0.045), ("cfr+", 0.018), ("dcfr", 0.011), ("pcfr+", 0.026)])
+def test_leduc_cfr_variants_converge(variant, bound):
     g = make_game("leduc")
-    solver = CFR(g, variant).iterate(30)
+    solver = CFR(g, variant).iterate(100)
     ex, _ = exploitability(g, solver.average_policy())
-    assert ex < 0.6, ex  # uniform: 2.37; the accelerated variants are ~0.2 here
-    if variant in ("cfr+", "dcfr"):
-        assert ex < 0.3, ex
+    assert ex < bound, ex
 
 
 def test_leduc_value_from_a_long_cfr_plus_run():
     g = make_game("leduc")
     avg = CFR(g, "dcfr").iterate(150).average_policy()
-    assert expected_value(g, avg) == pytest.approx(-0.0856, abs=0.015)  # the known value of Leduc for player 0
-    assert exploitability(g, avg)[0] < 0.08
+    assert expected_value(g, avg) == pytest.approx(-0.0856, abs=0.002)  # the known value of Leduc for player 0
+    assert exploitability(g, avg)[0] < 0.006
 
 
 def test_mccfr_external_and_outcome_sampling_converge():
