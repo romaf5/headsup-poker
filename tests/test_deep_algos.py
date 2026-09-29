@@ -24,3 +24,20 @@ def test_deep_algorithms_reduce_kuhn_exploitability(algo):
         pol = s.average_policy()
         for key, probs in pol.table.items():
             assert probs.sum() == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="needs CUDA")
+def test_graph_captured_fits_do_not_grow_gpu_memory():
+    """Each fit is a captured CUDA graph; repeated fits must not accumulate GPU memory (a new warm-up
+    stream per fit leaked a cuBLAS workspace, ~20 MB, every time)."""
+    import torch
+
+    from headsup.algos.deep import _fit_from_buffer
+
+    s = DeepSolver(make_game("leduc"), "sdcfr", traversals=50, adv_steps=20, adv_batch=256, device="cuda", seed=0)
+    s.iterate(1)
+    _fit_from_buffer(s._new_model(), s.adv_memory[0], 20, 256, 1e-3, s.device)
+    before = torch.cuda.memory_reserved()
+    for _ in range(10):
+        _fit_from_buffer(s._new_model(), s.adv_memory[0], 20, 256, 1e-3, s.device)
+    assert torch.cuda.memory_reserved() - before < 8 << 20
