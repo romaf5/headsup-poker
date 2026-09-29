@@ -124,10 +124,13 @@ def traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats=None):
 
 
 def history_rows(engine):
-    """History input of the value nets: seat 0's observation + seat 1's hole cards (see headsup.model)."""
+    """History input of the value nets: seat 0's observation with obs[22] = the seat to act (seat 0's
+    view alone does not say whose turn it is) + seat 1's hole cards (see headsup.model)."""
     from headsup.model import history_observation
 
-    return history_observation(engine.observation(0)[None], np.array([engine.hands[1]]))[0]
+    obs = engine.observation(0)[None].copy()
+    obs[0, 22] = float(engine.current)
+    return history_observation(obs, np.array([engine.hands[1]]))[0]
 
 
 def dream_trajectory(engine, traverser, nets, baseline, t, epsilon, rng, own_reach, adv_mem, val_mem, stats=None):
@@ -293,12 +296,13 @@ class TraversalRunner:
         return (Samples.concat([Samples(o[0], o[1], o[2]) for o in outs]), Samples.concat([Samples(o[3], o[4], o[5]) for o in outs]),
                 sum(o[6] for o in outs))
 
-    def collect_escher_values(self, weights, n_trajectories, seed):
-        """ESCHER value trajectories under the current strategies: (value Samples, nodes)."""
+    def collect_escher_values(self, weights, n_trajectories, seed, value_epsilon=0.01):
+        """ESCHER value trajectories (both players on (1 - e) sigma + e uniform): (value Samples, nodes)."""
         if self.backend != "cpp":
             raise NotImplementedError("DREAM / ESCHER traversals need the C++ extension")
         nets = self._cpp_models(weights[0], weights[1])
-        outs = self._fan_out(lambda k, s: self._cpp.run_escher_values(nets[0], nets[1], k, s, self._cfg), n_trajectories, seed)
+        outs = self._fan_out(lambda k, s: self._cpp.run_escher_values(nets[0], nets[1], k, s, self._cfg, float(value_epsilon)),
+                             n_trajectories, seed)
         return Samples.concat([Samples(o[0], o[1], o[2]) for o in outs]), sum(o[3] for o in outs)
 
     def collect_escher_regrets(self, weights, value_weights, traverser, n_trajectories, t, seed):

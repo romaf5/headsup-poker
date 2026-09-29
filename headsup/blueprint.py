@@ -143,12 +143,14 @@ class TabularPlayer:
         self._pool = ThreadPoolExecutor(workers)
 
     def _node(self, row):
+        """Blueprint node of the observed public state; -1 when the hand is over.  A state the
+        blueprint's tree cannot reach (other stacks / blinds, a replay mismatch) raises ValueError."""
         key = row[21:].tobytes()  # stage, position, pot features, history: identifies the public state
         node = self._nodes.get(key)
         if node is None:
             actions = []
-            replay_from_obs(row, self.game, on_action=lambda e, seat, a: actions.append(int(a)))
-            node = self._nodes[key] = self.bp.node_of(actions)
+            engine, _ = replay_from_obs(row, self.game, on_action=lambda e, seat, a: actions.append(int(a)))
+            node = self._nodes[key] = -1 if engine.done else self.bp.node_of(actions)
         return node
 
     def probs(self, obs, ids=None):
@@ -173,12 +175,8 @@ class TabularPlayer:
             # a valid hero hand is needed to replay the public state (hand-substituted rows may overlap the board)
             valid = ~np.isin(hands, board).any(axis=1)
             ref = obs[idx[np.argmax(valid)]] if valid.any() else row
-            try:
-                node = self._node(ref)
-            except ValueError:  # terminal observation (the hand is over): any action
-                out[idx, 1] = 1.0
-                continue
-            if self.bp.cpp.node_player(node) < 0:
+            node = self._node(ref)
+            if node < 0 or self.bp.cpp.node_player(node) < 0:  # the hand is over: any action
                 out[idx, 1] = 1.0
                 continue
             jobs.append((idx, node, hands, board, int(self.rng.integers(2**31))))

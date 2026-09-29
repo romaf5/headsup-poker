@@ -21,10 +21,18 @@ from headsup.players import make_player
 
 
 def head_to_head(spec_a, spec_b, hands, num_envs=1024, seed=0, device=None):
-    """Mean and standard error of A's chips/hand against B (both seats, alternating)."""
+    """Mean and standard error of A's chips/hand against B (both seats, alternating).  The game is the
+    one the network players were trained in (simple bots adopt it); two different trees are an error."""
     a = make_player(spec_a, device=device, seed=seed)
     b = make_player(spec_b, device=device, seed=seed + 1, game=getattr(a, "game", None))
-    env = make_vec_env(num_envs, b, seed=seed, game=getattr(a, "game", None))  # the row player's action tree
+    game_a, game_b = getattr(a, "game", None), getattr(b, "game", None)
+    if game_b is not None and game_a is not None and game_a.tree_dict() != game_b.tree_dict():
+        if spec_a.split(":")[0] in ("random", "call", "allin", "raise"):  # a bot row player adopts the network's game
+            a = make_player(spec_a, device=device, seed=seed, game=game_b)
+            game_a = game_b
+        else:
+            raise ValueError(f"{spec_a} and {spec_b} play different games: {game_a.tree_dict()} vs {game_b.tree_dict()}")
+    env = make_vec_env(num_envs, b, seed=seed, game=game_a)
     r = play_hands(env, a, hands)
     return float(r.mean()), float(r.std() / np.sqrt(len(r)))
 
@@ -77,7 +85,7 @@ def main():
     if len(args.specs) < 2 and not args.bots:
         p.error("give at least two specs (or one spec with --bots)")
     results, opponents = compare(args.specs, args.hands, args.num_envs, args.seed, args.device, args.bots)
-    print("\nrow player's chips/hand vs column player (± standard error), 1 chip = 500 mbb\n")
+    print("\nrow player's chips/hand vs column player (± standard error)\n")
     print(format_table(args.specs, opponents, results))
     if args.json:
         with open(args.json, "w") as f:

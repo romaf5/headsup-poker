@@ -116,3 +116,21 @@ def test_lbr_beats_simple_bots_quickly():
     r = lbr.play(600, progress=False)  # duplicate pairs: the maniac's all-in luck largely cancels
     assert r.mean() > 2, r.mean()  # ~+8 chips/hand: folds junk, calls with strong hands
     assert lbr.action_counts[0, Action.FOLD] > 0 and lbr.action_counts[0, Action.CHECK_CALL] > 0
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_equity_uses_the_games_showdown_board():
+    """FHP's showdown is on the flop: equity_vs_all(final_cards=3) must not deal a turn and river."""
+    from headsup.cards import hand_strength
+
+    cpp = native.module()
+    board = [0, 18, 33]  # 2s 7h 9d
+    hero = (12, 25)  # As Ah
+    eq = np.asarray(cpp.equity_vs_all(hero[0], hero[1], board, 200, 100, 0, 3))
+    s_me = hand_strength(list(hero), board)
+    for a, b in [(1, 14), (5, 31), (18, 44), (26, 39)]:
+        if a in board or b in board or a in hero or b in hero:
+            continue
+        s = hand_strength([a, b], board)
+        exact = 1.0 if s_me < s else 0.5 if s_me == s else 0.0
+        assert eq[cpp.combo_index(a, b)] == pytest.approx(exact)

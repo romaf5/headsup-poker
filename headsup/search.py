@@ -324,13 +324,17 @@ class SearchPlayer:
                     st["last_root"] = None
                 else:
                     queries.append((tid, "hero", obs_h, eng, a))
-        if queries:
+        if queries and not self.model_observes:  # stateless model: one batched query
             rows = np.concatenate([substitute_hands(q[2]) for q in queries])
-            ids = np.concatenate([q[0] * NUM_COMBOS + np.arange(NUM_COMBOS) for q in queries])
-            probs = np.asarray(self.model.probs(rows, ids), dtype=np.float64).reshape(len(queries), NUM_COMBOS, -1)
-            if self.model_observes:
-                self.model.observe(rows, ids, np.repeat([q[4] for q in queries], NUM_COMBOS))
+            probs = np.asarray(self.model.probs(rows), dtype=np.float64).reshape(len(queries), NUM_COMBOS, -1)
             for (tid, kind, _, eng, a), sig in zip(queries, probs):
+                jobs[tid][5][kind] *= transition_likelihood(eng, a, sig)
+        elif queries:  # stateful model (SD-CFR exact average: own reach per id): the decisions in order, one
+            for tid, kind, obs_q, eng, a in queries:  # id space per (table, seat) so hero and villain never share a reach
+                rows = substitute_hands(obs_q)
+                ids = (2 * tid + (kind == "hero")) * NUM_COMBOS + np.arange(NUM_COMBOS)
+                sig = np.asarray(self.model.probs(rows, ids), dtype=np.float64)
+                self.model.observe(rows, ids, np.full(NUM_COMBOS, a))
                 jobs[tid][5][kind] *= transition_likelihood(eng, a, sig)
         for tid, (engine, hero, actions, pending, hero_pending, st) in jobs.items():
             st["processed"] = st.pop("processed_target", len(actions)) if self.mode == "pluribus" else len(actions)

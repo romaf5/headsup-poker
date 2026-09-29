@@ -62,18 +62,22 @@ def public_state_from_obs(obs):
     return to_call, pot, stack, raises
 
 
-def legal_mask_from_obs(obs, game=DEFAULT_GAME):
+def legal_mask_from_obs(obs, game=DEFAULT_GAME, with_twins=False):
     """bool[N, num_actions]: the engine's ``legal_mask`` recomputed from observations (computed once
-    per distinct public state: to-call, pot, stack, raise count and round)."""
+    per distinct public state: to-call, pot, stack, raise count and round); with ``with_twins`` also
+    int[N, num_actions]: the action the engine executes for each (itself when legal)."""
     obs = np.asarray(obs)
     to_call, pot, stack, raises = public_state_from_obs(obs)
     stage = np.rint(obs[:, 21]).astype(np.int64)
     # one integer key per distinct (to-call, pot, stack, raises, round) - all small non-negative ints
     keys = (((to_call * 4096 + pot) * 4096 + stack) * 64 + raises) * 8 + stage
     uniq, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
-    masks = np.array([game.legal_mask(int(to_call[i]), int(pot[i]), int(stack[i]), int(raises[i]),
-                                      round_index=min(int(stage[i]), game.num_rounds - 1)) for i in first], dtype=bool)
-    return masks[inverse.ravel()]
+    both = [game.legal_mask(int(to_call[i]), int(pot[i]), int(stack[i]), int(raises[i]), with_twins=True,
+                            round_index=min(int(stage[i]), game.num_rounds - 1)) for i in first]
+    masks = np.array([m for m, _ in both], dtype=bool)[inverse.ravel()]
+    if with_twins:
+        return masks, np.array([t for _, t in both], dtype=np.int64)[inverse.ravel()]
+    return masks
 
 
 class HeadsUpPoker:

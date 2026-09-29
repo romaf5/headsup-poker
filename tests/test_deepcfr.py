@@ -210,12 +210,20 @@ def test_cpp_escher_samplers():
         torch.nn.init.normal_(vnet.action_head.weight, std=0.5)
     vw = vnet.numpy_weights()
     with TraversalRunner(2, backend="cpp") as runner:
-        val, nodes = runner.collect_escher_values([w0, w1], 50, seed=0)
+        val, nodes = runner.collect_escher_values([w0, w1], 50, seed=0, value_epsilon=0.0)  # on-policy: plain returns
         assert val.obs.shape[1] == OBS_DIM_WITH_OPP and len(val) >= 50 and nodes == len(val)
         picked = val.target[np.arange(len(val)), val.t.astype(int)]  # u_0 of the trajectory in the taken action's slot
         assert np.all(np.abs(picked) <= 100.0) and np.all(val.target.sum(1) == picked)
+        assert set(np.unique(val.obs[:, 22])) == {0.0, 1.0}  # the history input says whose turn it is
+        # with exploration, returns are importance-weighted by sigma / xi of the later actions: peaked
+        # strategies make off-policy continuations worth ~0, on-policy ones ~u_0 / 0.99^k
+        val_x, _ = runner.collect_escher_values([w0, w1], 400, seed=1, value_epsilon=0.3)
+        picked_x = val_x.target[np.arange(len(val_x)), val_x.t.astype(int)]
+        assert np.all(np.abs(picked_x) <= 100.0 / 0.7**3) and (picked_x == 0).sum() < len(picked_x)
         adv, strat, hist, nodes = runner.collect_escher_regrets([w0, w1], vw, 1, 30, 4.0, seed=0)
-        assert len(adv) == len(strat) == len(hist) > 0 and np.all(adv.t == 4.0)
+        assert len(adv) == len(hist) > 0 and len(strat) > 0 and np.all(adv.t == 4.0) and np.all(strat.t == 4.0)
+        # regrets at the update player's (seat 1) infosets, average-policy rows at the opponent's (seat 0)
+        assert np.all(adv.obs[:, 22] == 1.0) and np.all(strat.obs[:, 22] == 0.0)
         q = -NumpyModel(vw)(hist.obs)  # player 1's values
         legal = adv.target != 0  # (illegal / duplicate actions have target 0; so may a legal one, rarely)
         v = hist.target[:, 0]

@@ -141,8 +141,13 @@ class GameSession:
         self.rng = np.random.default_rng(seed)
         self.opponent = make_player(player_spec(opponent), device=device, deterministic=deterministic, seed=int(self.rng.integers(2**31)))
         self.opponent_name = opponent
-        # the table plays the bot's action tree (bet sizes); stacks / blinds / raise cap from the settings
-        self.game = getattr(self.opponent, "game", DEFAULT_GAME).with_(
+        # the table plays the bot's action tree (bet sizes); stacks / blinds / raise cap from the settings -
+        # except for bots on a fixed public tree (tabular blueprint, search), which only know their own game
+        bot_game = getattr(self.opponent, "game", DEFAULT_GAME)
+        if type(self.opponent).__name__ in ("TabularPlayer", "SearchPlayer"):
+            stack_size, small_blind, big_blind, raise_cap = bot_game.stack_size, bot_game.small_blind, bot_game.big_blind, bot_game.raise_cap
+            self.settings.update(stack_size=stack_size, small_blind=small_blind, big_blind=big_blind, raise_cap=raise_cap)
+        self.game = bot_game.with_(
             stack_size=int(stack_size), small_blind=int(small_blind), big_blind=int(big_blind), raise_cap=int(raise_cap)
         )
         self.engine = HeadsUpPoker(game=self.game, rng=np.random.default_rng(self.rng.integers(2**63)))

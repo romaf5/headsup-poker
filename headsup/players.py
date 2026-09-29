@@ -43,13 +43,18 @@ class _FixedActionPlayer:
         return int(Action.CHECK_CALL)
 
     def probs(self, obs, ids=None):
+        """One-hot on the action the engine executes: a raise past the cap / the stack is played as its
+        twin (all-in, or call in limit games), so the mass must sit there (tools read ``probs``)."""
+        from headsup.engine import legal_mask_from_obs
+
+        _, twins = legal_mask_from_obs(obs, self.game, with_twins=True)
         p = np.zeros((len(obs), self.game.num_actions), dtype=np.float32)
-        p[:, self.action] = 1.0
+        p[np.arange(len(obs)), twins[:, self.action]] = 1.0
         return p
 
     def __call__(self, obs, ids=None):
         self.last_probs = self.probs(obs)
-        return np.full(len(obs), self.action, dtype=np.int64)
+        return self.last_probs.argmax(axis=1).astype(np.int64)
 
 
 class AlwaysCallPlayer(_FixedActionPlayer):

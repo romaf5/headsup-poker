@@ -98,10 +98,14 @@ def train_advantage_net(
     ``log_step_offset + step`` so successive fits form one continuous curve in TensorBoard.
     """
     if target_scale == "auto":
-        _, _, sample = buffer.sample(min(65536, len(buffer)))
-        target_scale = max(float(sample.pow(2).mean().sqrt()), 1e-6)
+        target_scale = 1.0
+        if len(buffer):
+            _, _, sample = buffer.sample(min(65536, len(buffer)))
+            target_scale = max(float(sample.pow(2).mean().sqrt()), 1e-6)
     scale = float(target_scale or 1.0)
     model = BaseModel(config=model_config).to(device)
+    if len(buffer) == 0:  # no samples yet (e.g. the opponent folds every hand before this seat acts): uniform net
+        return model.eval(), float("nan")
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     model.train()
     fwd = maybe_compile(model, compile)
@@ -229,7 +233,7 @@ class DeepCFRTrainer:
         self.iterates = [[n.state_dict_cpu()] for n in self.nets] if self.use_sdcfr else None
         self.runner = TraversalRunner(args.workers, backend=args.backend, game=self.game)
         # history value networks (both players' cards): DREAM baselines Q_p(h, a) per player, the
-        # ESCHER value net q(h, a) (player 0's return); trained continually on a FIFO of recent rows
+        # ESCHER value net q(h, a) (player 0's return; re-fitted every iteration on fresh trajectories)
         self.value_config = normalize_config(dict(self.model_config, opp_cards=True))
         self.value_nets, self.value_opts, self.value_memory = [], [], []
         if self.algo in ("dream", "escher"):
@@ -240,6 +244,7 @@ class DeepCFRTrainer:
                                  for i in range(n_value)]
             if self.runner.backend != "cpp":
                 raise SystemExit("DREAM / ESCHER need the C++ extension (python setup.py build_ext)")
+        self.value_scales = [None] * len(self.value_nets)
         cfg = self.model_config
         print(
             f"device={self.device}  algo={self.algo}  traversal backend={self.runner.backend} x{self.runner.num_workers} workers  "
@@ -272,6 +277,7 @@ class DeepCFRTrainer:
             "model_config": dict(self.model_config),
             "value_nets": [n.state_dict() for n in self.value_nets],
             "value_opts": [o.state_dict() for o in self.value_opts],
+            "value_scales": list(self.value_scales),
             "value_memory": [m.state_dict() for m in self.value_memory],
         }
         tmp = path + ".tmp"
@@ -320,6 +326,8 @@ class DeepCFRTrainer:
             o.load_state_dict(sd)
         for m, sd in zip(self.value_memory, state.get("value_memory", [])):
             m.load_state_dict(sd)
+        # value nets trained before the scaled fits were introduced predict raw chips (scale 1)
+        self.value_scales = list(state.get("value_scales", [1.0] * len(self.value_nets) if state.get("value_nets") else [None] * len(self.value_nets)))
         if self.iterates is not None:
             stacked = state.get("iterates")
             if stacked is not None:
@@ -337,24 +345,37 @@ class DeepCFRTrainer:
 
     def train_value_net(self, i, steps=None, batch=None):
         """Continue training value net ``i`` on its FIFO (masked MSE on the taken action's output;
-        DREAM / ESCHER: Adam 1e-3, grad clip 1, 1000 x 512 per iteration by default)."""
+        DREAM / ESCHER: Adam 1e-3, grad clip 1, 1000 x 512 per iteration by default).  The fit runs in
+        units of a per-net scale (the RMS of the first targets it sees; see train_advantage_net: a
+        zero-initialised head cannot reach FHP's hundreds of chips) - the output layer is divided by
+        it for the fit and multiplied back afterwards, so the net always predicts chips."""
         a = self.args
         steps, batch = steps or a.q_steps, batch or a.q_batch
         net, opt, mem = self.value_nets[i], self.value_opts[i], self.value_memory[i]
         if len(mem) < batch:
             return float("nan")
+        if self.value_scales[i] is None:
+            _, _, sample = mem.sample(min(65536, len(mem)))
+            self.value_scales[i] = max(float(sample.pow(2).mean().sqrt()), 1e-6) if a.target_scale != "none" else 1.0
+        scale = self.value_scales[i]
+        with torch.no_grad():
+            net.action_head.weight.div_(scale)
+            net.action_head.bias.div_(scale)
         net.train()
         loss_val = float("nan")
         for _ in range(steps):
             obs, action, target = mem.sample(batch)
             pred = net(obs).gather(1, action[:, None]).squeeze(1)
-            loss = torch.mean((pred - target) ** 2)
+            loss = torch.mean((pred - target / scale) ** 2)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0, foreach=False)
             opt.step()
             loss_val = float(loss.detach())
         net.eval()
+        with torch.no_grad():
+            net.action_head.weight.mul_(scale)
+            net.action_head.bias.mul_(scale)
         return loss_val
 
     def _sample_seat(self, seat, weights, t):
@@ -377,10 +398,14 @@ class DeepCFRTrainer:
         self.iteration += 1
         t = float(self.iteration)  # linear CFR weight
         weights = [n.numpy_weights() for n in self.nets]
-        if self.algo == "escher":  # value trajectories under the current strategies, then the value net
+        if self.algo == "escher":  # a fresh value net on this iteration's trajectories (ESCHER's reference code)
             t0 = time.perf_counter()
-            val, _ = self.runner.collect_escher_values(weights, a.value_trajectories or a.traversals, self._seed())
+            val, _ = self.runner.collect_escher_values(weights, a.value_trajectories or a.traversals, self._seed(), a.value_epsilon)
+            self.value_memory[0].clear()
             self.value_memory[0].add(val.obs, val.t, val.target[np.arange(len(val)), val.t.astype(int)])
+            self.value_nets[0] = BaseModel(config=self.value_config).to(self.device).eval()
+            self.value_opts[0] = torch.optim.Adam(self.value_nets[0].parameters(), lr=a.lr)
+            self.value_scales[0] = None
             self.log("value/loss", self.train_value_net(0), self.iteration)
             self.log("time/value", time.perf_counter() - t0, self.iteration)
         for seat in range(2):
@@ -430,6 +455,8 @@ class DeepCFRTrainer:
 
     def _advantage_fit_quality(self, seat, n=65536):
         """Unweighted MSE of the freshly fitted net on a memory sample, and the target scale."""
+        if len(self.adv_memory[seat]) == 0:
+            return float("nan"), float("nan")
         obs, _, target = self.adv_memory[seat].sample(min(n, len(self.adv_memory[seat])))
         with torch.no_grad():
             pred = self.nets[seat](obs)
@@ -623,6 +650,7 @@ def build_parser():
     p.add_argument("--q-batch", type=int, default=512, help="DREAM / ESCHER: value-net batch size (paper: 512)")
     p.add_argument("--q-capacity", type=int, default=200_000, help="DREAM / ESCHER: value-net FIFO capacity (paper: 200 000)")
     p.add_argument("--value-trajectories", type=int, default=None, help="ESCHER: value trajectories per iteration (default: --traversals)")
+    p.add_argument("--value-epsilon", type=float, default=0.01, help="ESCHER: uniform exploration of the value trajectories (reference code: 0.01)")
     p.add_argument("--iterations", type=int, default=300, help="CFR iterations")
     p.add_argument("--preset", default="default", choices=sorted(PRESETS),
                    help="hyperparameter preset; 'paper' = DeepCFR / SD-CFR papers (10k traversals, batch 10k, 40M memories, "
@@ -704,7 +732,7 @@ def resolve_args(args):
 RESUME_INHERITED = ("algo", "traversals", "adv_capacity", "strat_capacity", "value_steps", "batch_size", "policy_epochs",
                     "policy_steps", "policy_batch_size", "regret_power", "strategy_power", "epsilon", "q_steps", "q_batch",
                     "q_capacity", "value_trajectories", "eval_hands", "eval_every", "policy_eval_every", "lbr_every", "lbr_hands",
-                    "lbr_final_hands", "lbr_tables", "lbr_model_iterates", "seed", "lr", "target_scale")
+                    "lbr_final_hands", "lbr_tables", "lbr_model_iterates", "seed", "lr", "target_scale", "value_epsilon")
 
 
 def main(argv=None):

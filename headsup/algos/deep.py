@@ -13,11 +13,15 @@ fits with iteration weights, the bank of iterates, exact evaluation) is shared:
   Q_i(s*(h), a) on the concatenated infostates of all players (their footnote 3), fine-tuned by
   expected SARSA on a circular buffer; baseline-corrected sampled values (their eq. 6-7); the
   advantage sample weight is t / x^xi_i(s_i) (own sampling reach); averaging as SD-CFR.
-* ``escher`` (McAleer et al. 2022): the update player samples uniformly (a fixed sampling policy),
-  the opponent from sigma; a history value net q(h, a) (both players' infostates -> player 0's
-  value per action) fitted on Monte-Carlo returns of self-play trajectories; the regret estimate
-  is q_i(h, a) - sum_a sigma_i(s, a) q_i(h, a) with no importance weights; cumulative regret buffer
-  -> regret net from scratch each iteration; average policy net from the visited infosets.
+* ``escher`` (McAleer et al. 2023; as their reference code): the update player samples uniformly
+  (a fixed sampling policy), the opponent from sigma; a history value net q(h, a) (both players'
+  infostates -> player 0's value per action) re-fitted from scratch every iteration on that
+  iteration's self-play trajectories (both players play 0.99 sigma + 0.01 uniform, importance-
+  weighted returns); the regret estimate is q_i(h, a) - sum_a sigma_i(s, a) q_i(h, a) with no
+  importance weights; cumulative regret buffer -> regret net from scratch each iteration; the
+  average policy net is fitted on (I, t, sigma) samples taken at the *opponent's* on-policy
+  infosets (as Deep CFR; the update player's uniformly sampled infosets would weight the average
+  by the wrong reach).
 
 Networks come from ``game.make_model()``; ``policy_*`` helpers wrap them for the exact
 :func:`headsup.algos.best_response.exploitability` check.  Small games only (Python traversal);
@@ -142,8 +146,8 @@ class NetPolicy:
 class DeepSolver:
     def __init__(self, game, algo="deepcfr", traversals=1000, adv_capacity=2_000_000, strat_capacity=2_000_000,
                  adv_steps=3000, adv_batch=2048, policy_steps=4000, policy_batch=2048, q_steps=1000, q_batch=512,
-                 q_capacity=200_000, value_traversals=None, epsilon=0.5, lr=1e-3, device="cpu", seed=0, model_kwargs=None,
-                 rm_argmax=False):
+                 q_capacity=200_000, value_traversals=None, epsilon=0.5, value_epsilon=0.01, lr=1e-3, device="cpu", seed=0,
+                 model_kwargs=None, rm_argmax=True):
         assert algo in ALGOS
         self.game, self.algo = game, algo
         self.traversals = traversals
@@ -151,7 +155,7 @@ class DeepSolver:
         self.adv_steps, self.adv_batch = adv_steps, adv_batch
         self.policy_steps, self.policy_batch = policy_steps, policy_batch
         self.q_steps, self.q_batch = q_steps, q_batch
-        self.epsilon, self.lr = epsilon, lr
+        self.epsilon, self.value_epsilon, self.lr = epsilon, value_epsilon, lr
         self.rm_argmax = rm_argmax
         self.device = torch.device(device)
         self.rng = np.random.default_rng(seed)
@@ -168,8 +172,6 @@ class DeepSolver:
             self.q_memory = [CircularBuffer(q_capacity, 2 * D, A) for _ in range(2)]
         if algo == "escher":  # history value q(h, a): player 0's expected return per action
             self.v_net = self._new_model(2 * D)
-            self.v_opt = torch.optim.Adam(self.v_net.parameters(), lr=lr)
-            self.v_memory = CircularBuffer(q_capacity, 2 * D, A)
         self.iteration = 0
         self.stats = {}
         # small games: every infoset / history is enumerated once and the networks are evaluated in
@@ -321,23 +323,28 @@ class DeepSolver:
         return self._v_tab[state.history_key()]
 
     def _escher_value_data(self, data):
-        """One self-play trajectory under the current policies; (h, a, return of player 0) rows."""
+        """One trajectory with both players on (1 - e) sigma + e uniform (ESCHER's value exploration,
+        e = ``value_epsilon``); rows (h, a, player 0's return after h a importance-weighted by
+        sigma / sampling policy along the rest of the trajectory) - unbiased for q_sigma(h, a)."""
         state = self.game.new_initial_state()
         rows = []
         while not state.is_terminal():
             if state.is_chance():
                 state = state.child(state.sample_chance(self.rng))
                 continue
+            legal = state.legal_mask()
             sigma = self._sigma(state.current_player, state)
-            a = int(self.rng.choice(len(sigma), p=sigma))
-            rows.append((self._history(state), a))
+            xi = (1.0 - self.value_epsilon) * sigma + self.value_epsilon * legal / legal.sum()
+            a = int(self.rng.choice(len(xi), p=xi / xi.sum()))
+            rows.append((self._history(state), a, sigma[a] / xi[a]))
             state = state.child(a)
-        u0 = state.returns()[0]
-        for hist, a in rows:
+        ret = state.returns()[0]
+        for hist, a, ratio in reversed(rows):
             tgt = np.zeros(self.game.num_actions, np.float32)
             msk = np.zeros(self.game.num_actions, np.float32)
-            tgt[a], msk[a] = u0, 1.0
+            tgt[a], msk[a] = ret, 1.0
             data.append((hist, tgt, msk))
+            ret *= ratio  # the ratio at h belongs to the returns of the histories before h
 
     def _escher_regrets(self, p, t, adv, strat):
         """One trajectory: update player p samples uniformly, the opponent from sigma; regrets from q."""
@@ -353,9 +360,9 @@ class DeepSolver:
                 q = self._v(state) * (1.0 if p == 0 else -1.0)  # player p's value per action
                 v = float(sigma @ np.where(legal, q, 0.0))
                 adv.append((state.info_state(p), t, np.where(legal, q - v, 0.0)))
-                strat.append((state.info_state(p), t, sigma))
                 a = int(self.rng.choice(np.flatnonzero(legal)))
             else:
+                strat.append((state.info_state(cur), t, sigma))  # on-policy: visited in proportion to its own reach
                 a = int(self.rng.choice(len(sigma), p=sigma))
             state = state.child(a)
 
@@ -365,14 +372,13 @@ class DeepSolver:
             self.iteration += 1
             t = float(self.iteration)
             t0 = time.perf_counter()
-            if self.algo == "escher":  # 1. retrain the history value net on fresh self-play data
+            if self.algo == "escher":  # 1. a fresh history value net on this iteration's trajectories
                 data = []
                 for _ in range(self.value_traversals):
                     self._escher_value_data(data)
-                x, tg, mk = (np.stack([d[i] for d in data]).astype(np.float32) for i in range(3))
-                self.v_memory.add(x, tg, mk)
-                self.v_net.train()
-                xs, tgs, mks = self.v_memory.sample(min(self.v_memory.size, 200_000), self.rng)
+                xs, tgs, mks = (np.stack([d[i] for d in data]).astype(np.float32) for i in range(3))
+                self.v_net = self._new_model(2 * self.game.obs_dim).train()
+                self.v_opt = torch.optim.Adam(self.v_net.parameters(), lr=self.lr)
                 _fit(self.v_net, self.v_opt, xs, tgs, np.ones(len(xs), np.float32), self.q_steps, self.q_batch, self.rng, self.device, masks=mks)
                 self.v_net.eval()
                 self._v_tab = None
@@ -466,8 +472,14 @@ def main(argv=None):
     p.add_argument("--adv-steps", type=int, default=3000)
     p.add_argument("--adv-batch", type=int, default=2048)
     p.add_argument("--policy-steps", type=int, default=4000)
-    p.add_argument("--q-steps", type=int, default=1000)
-    p.add_argument("--epsilon", type=float, default=0.5)
+    p.add_argument("--policy-batch", type=int, default=2048)
+    p.add_argument("--q-steps", type=int, default=1000, help="DREAM baseline / ESCHER value-net steps per iteration")
+    p.add_argument("--q-batch", type=int, default=512)
+    p.add_argument("--value-traversals", type=int, default=None, help="ESCHER: value trajectories per iteration (default --traversals)")
+    p.add_argument("--epsilon", type=float, default=0.5, help="DREAM: traverser exploration")
+    p.add_argument("--value-epsilon", type=float, default=0.01, help="ESCHER: exploration of the value trajectories")
+    p.add_argument("--rm-fallback", default="argmax", choices=["argmax", "uniform"],
+                   help="regret matching without a positive advantage: the best action (Deep CFR / DREAM / ESCHER) or uniform")
     p.add_argument("--eval-every", type=int, default=10)
     p.add_argument("--device", default="cpu")
     p.add_argument("--seed", type=int, default=0)
@@ -475,7 +487,9 @@ def main(argv=None):
     args = p.parse_args(argv)
     game = make_game(args.game)
     solver = DeepSolver(game, args.algo, traversals=args.traversals, adv_steps=args.adv_steps, adv_batch=args.adv_batch,
-                        policy_steps=args.policy_steps, q_steps=args.q_steps, epsilon=args.epsilon, device=args.device, seed=args.seed)
+                        policy_steps=args.policy_steps, policy_batch=args.policy_batch, q_steps=args.q_steps, q_batch=args.q_batch,
+                        value_traversals=args.value_traversals, epsilon=args.epsilon, value_epsilon=args.value_epsilon,
+                        device=args.device, seed=args.seed, rm_argmax=args.rm_fallback == "argmax")
     curve = []
     t0 = time.perf_counter()
     for it in range(1, args.iterations + 1):

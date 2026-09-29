@@ -238,3 +238,17 @@ def test_lbr_and_trainer_smoke_multi_size(tmp_path):
     assert pol.game.bet_sizes == (0.5, 1.0) and pol.game.mask_redundant and pol.game.num_actions == 5
     sd = make_player(f"sdcfr:{tmp_path / 'iterates.pt'}", device="cpu", seed=0)
     assert sd.game.num_actions == 5 and sd.bank.T == 3
+
+
+def test_fixed_bots_put_their_mass_on_the_executed_action():
+    """At the raise cap of a limit game the raise bot's raise is executed as a call: probs say so."""
+    from headsup.players import make_player
+
+    e = HeadsUpPoker(rng=np.random.default_rng(0), game=FHP)
+    e.reset()
+    while e.consecutive_raises < FHP.cap(0):
+        e.step(2)
+    bot = make_player("raise", game=FHP)
+    p = bot.probs(e.observation(e.current)[None])[0]
+    assert not e.legal_mask()[2] and p[1] == 1.0 and p.sum() == 1.0
+    assert bot(e.observation(e.current)[None])[0] == 1

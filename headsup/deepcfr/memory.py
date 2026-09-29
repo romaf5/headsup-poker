@@ -201,6 +201,9 @@ class CircularBuffer:
     def __len__(self):
         return self.size
 
+    def clear(self):
+        self.size = self.head = 0
+
     def add(self, obs, action, target):
         obs = torch.as_tensor(np.asarray(obs, dtype=np.float32))
         action = torch.as_tensor(np.asarray(action).reshape(-1), dtype=torch.long)

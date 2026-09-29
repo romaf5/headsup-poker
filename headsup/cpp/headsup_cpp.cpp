@@ -759,12 +759,17 @@ py::tuple run_traversals(std::shared_ptr<Model> net0, std::shared_ptr<Model> net
 //   Q_p(h, a) replaces the unsampled actions' values (eq. 6-7): v~(a) = b(a) except the sampled one
 //   b(a) + (v_child - b(a)) / xi(a); advantage samples (I_p, t / own sample reach, v~ - sigma.v~) and
 //   expected-SARSA baseline targets (h, a, r + sigma(h').Q_p(h', .)).
-//   ESCHER (McAleer et al. 2023): value trajectories under sigma give (h, a, u_0) regression rows for
-//   the history value net; regret trajectories have the update player sample uniformly and the
-//   opponent play sigma, with regrets q(h, .) - sigma.q(h, .) read off the value net (no importance
-//   weights) and (I, t, sigma) rows for the average policy net.
+//   ESCHER (McAleer et al. 2023, as their reference code): value trajectories with both players on
+//   (1 - e) sigma + e uniform give (h, a, u_0 importance-weighted by sigma / sampling policy over the rest
+//   of the trajectory) regression rows for the history value net; regret trajectories have the update
+//   player sample uniformly and the opponent play sigma, with regrets q(h, .) - sigma.q(h, .) read off the
+//   value net (no importance weights) and (I, t, sigma) rows for the average policy net taken at the
+//   opponent's on-policy infosets (visited in proportion to its own reach, as in Deep CFR).
+// History input: seat 0's observation with obs[22] = the seat to act (seat 0's view would always say 0,
+// and networks reading only the aggregated bet features could not tell whose turn it is) + seat 1's cards.
 inline void history_observation(const Engine& e, float* out) {
   e.observation(0, out);
+  out[22] = float(e.current);
   const int a = std::min(e.hands[1][0], e.hands[1][1]), b = std::max(e.hands[1][0], e.hands[1][1]);
   out[OPP_CARDS_OFFSET + 0] = float(a % 13 + 1); out[OPP_CARDS_OFFSET + 1] = float(a / 13 + 1); out[OPP_CARDS_OFFSET + 2] = float(a + 1);
   out[OPP_CARDS_OFFSET + 3] = float(b % 13 + 1); out[OPP_CARDS_OFFSET + 4] = float(b / 13 + 1); out[OPP_CARDS_OFFSET + 5] = float(b + 1);
@@ -774,7 +779,7 @@ struct TrajectorySampler {
   const Model* nets[2];
   const Model* value = nullptr;  // DREAM: baseline Q_traverser(h, a); ESCHER: history value q(h, a) of seat 0
   int traverser = 0;
-  float t = 1.0f, epsilon = 0.5f;
+  float t = 1.0f, epsilon = 0.5f, value_epsilon = 0.01f;
   std::mt19937_64 rng;
   Memory adv, strat, val;  // val: history rows, t = action index, target[a] = regression target
   long nodes = 0;
@@ -837,27 +842,34 @@ struct TrajectorySampler {
   }
 
   // -- ESCHER -----------------------------------------------------------------------------
-  void escher_values(Engine& e) {  // one self-play trajectory under sigma: (h, a, u_0) rows
+  void escher_values(Engine& e) {  // one trajectory on (1 - e) sigma + e uniform: (h, a, IS-weighted u_0) rows
     std::vector<std::array<float, OBS_DIM_WITH_OPP>> hists;
     std::vector<int> acts;
+    std::vector<double> ratios;
     while (!e.done) {
-      float obs[OBS_DIM], sigma[MAX_ACTIONS];
+      const int n = e.num_actions();
+      float obs[OBS_DIM], sigma[MAX_ACTIONS], xi[MAX_ACTIONS];
       bool legal[MAX_ACTIONS];
       int twin[MAX_ACTIONS];
       sigma_at(e, obs, sigma, legal, twin);
       ++nodes;
+      int n_legal = 0;
+      for (int k = 0; k < n; ++k) n_legal += legal[k];
+      for (int k = 0; k < n; ++k) xi[k] = (1.0f - value_epsilon) * sigma[k] + (legal[k] ? value_epsilon / n_legal : 0.0f);
       std::array<float, OBS_DIM_WITH_OPP> h;
       history_observation(e, h.data());
-      const int a = sample(sigma, e.num_actions(), rng);
+      const int a = sample(xi, n, rng);
       hists.push_back(h);
       acts.push_back(a);
+      ratios.push_back(double(sigma[a]) / std::max(double(xi[a]), 1e-12));
       e.step(a);
     }
-    const float u0 = float(e.rewards[0]);
-    for (size_t i = 0; i < hists.size(); ++i) {
+    double ret = e.rewards[0];  // u_0 times the sigma / xi ratios of the actions after h a (unbiased for q_sigma(h, a))
+    for (size_t i = hists.size(); i-- > 0;) {
       float row[MAX_ACTIONS] = {};
-      row[acts[i]] = u0;
+      row[acts[i]] = float(ret);
       val.add(hists[i].data(), float(acts[i]), row);
+      ret *= ratios[i];
     }
   }
 
@@ -879,7 +891,6 @@ struct TrajectorySampler {
         for (int k = 0; k < n; ++k) v += legal[k] ? sigma[k] * sign * q[k] : 0.0f;
         for (int k = 0; k < n; ++k) target[k] = legal[k] ? sign * q[k] - v : 0.0f;
         adv.add(obs, t, target);
-        strat.add(obs, t, sigma);
         float row[MAX_ACTIONS] = {};
         row[0] = v;
         val.add(hist, -1.0f, row);  // the histories seen by the update player (tests / diagnostics)
@@ -891,6 +902,7 @@ struct TrajectorySampler {
         for (int k = 0; k < n; ++k)
           if (legal[k] && pick-- == 0) { a = k; break; }
       } else {
+        strat.add(obs, t, sigma);  // the opponent plays sigma: its infosets are visited in proportion to its own reach
         a = sample(sigma, n, rng);
       }
       e.step(a);
@@ -931,9 +943,11 @@ py::tuple run_dream(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, st
                         to_array(ts.val.obs, nv, OBS_DIM_WITH_OPP), to_array(ts.val.t, nv, 1), to_array(ts.val.target, nv, nact), ts.nodes);
 }
 
-py::tuple run_escher_values(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, int n_trajectories, uint64_t seed, EngineConfig cfg) {
+py::tuple run_escher_values(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, int n_trajectories, uint64_t seed, EngineConfig cfg,
+                            float value_epsilon) {
   TrajectorySampler ts;
   ts.nets[0] = net0.get(); ts.nets[1] = net1.get();
+  ts.value_epsilon = value_epsilon;
   ts.rng.seed(seed);
   ts.val.obs_dim = OBS_DIM_WITH_OPP;
   ts.val.num_actions = cfg.num_actions();
@@ -1116,14 +1130,16 @@ static const ComboCards COMBO_CARDS;
 // (0..5 known cards, the rest dealt uniformly: every runout when there are at most `max_exact`
 // of them, otherwise `samples` Monte-Carlo runouts).  Combos that overlap the hero's cards or
 // the board get -1.  Runouts that collide with a combo are skipped for that combo.
-void equity_vs_all(int c0, int c1, const int* board, int n_board, int samples, int max_exact, uint64_t seed, float* out) {
+// final_cards: the size of the showdown board (5; FHP: 3 - its showdown is on the flop)
+void equity_vs_all(int c0, int c1, const int* board, int n_board, int samples, int max_exact, uint64_t seed, float* out,
+                   int final_cards = 5) {
   bool used[NUM_CARDS] = {};
   used[c0] = used[c1] = true;
   for (int i = 0; i < n_board; ++i) used[board[i]] = true;
   int deck[NUM_CARDS], n_deck = 0;
   for (int c = 0; c < NUM_CARDS; ++c)
     if (!used[c]) deck[n_deck++] = c;
-  const int missing = 5 - n_board;
+  const int missing = final_cards - n_board;
   std::vector<double> win(NUM_COMBOS, 0.0), cnt(NUM_COMBOS, 0.0);
   std::vector<int> combo_a, combo_b;  // valid combos
   combo_a.reserve(NUM_COMBOS);
@@ -1141,12 +1157,12 @@ void equity_vs_all(int c0, int c1, const int* board, int n_board, int samples, i
     bool on_board[NUM_CARDS] = {};
     for (int i = 0; i < missing; ++i) on_board[extra[i]] = true;
     int mine[7] = {c0, c1, full[0], full[1], full[2], full[3], full[4]};
-    const int s_me = eval7(mine);
+    const int s_me = final_cards == 5 ? eval7(mine) : eval_best(mine, 2 + final_cards);
     for (size_t k = 0; k < combo_a.size(); ++k) {
       const int a = combo_a[k], b = combo_b[k];
       if (on_board[a] || on_board[b]) continue;
       int his[7] = {a, b, full[0], full[1], full[2], full[3], full[4]};
-      const int s = eval7(his);
+      const int s = final_cards == 5 ? eval7(his) : eval_best(his, 2 + final_cards);
       const int idx = combo_index(a, b);
       cnt[idx] += 1.0;
       if (s_me < s) win[idx] += 1.0;
@@ -1678,8 +1694,11 @@ struct PublicTree {
 // vectors out); terminal values in O(1326 + 52 * 51) per node via strength-sorted cumulative sums
 // with blocker corrections.  Chance is *public-chance sampled*: each iteration deals the unknown
 // board cards once; hands blocked by a newly dealt card leave the reach vectors at that street
-// transition and only hands compatible with the whole sampled board are updated, which makes every
-// hand's estimate unbiased (its updates average over the boards it is compatible with).  Infosets
+// transition and only hands compatible with the whole sampled board are updated.  A hand's update
+// averages over the boards compatible with it, where a card misses a given opponent hand with
+// probability (n - 4) / (n - 2) (n = cards off the board) instead of 1: the opponent's reach after each
+// dealt card is scaled by (n - 2) / (n - 4) (47/45 on the turn, 46/44 on the river; also for the cards
+// an all-in showdown deals), which makes every hand's estimate unbiased.  Infosets
 // of the root round are lossless (per hand); later rounds use `buckets` equity buckets per round
 // (Pluribus: lossless in the current round, 500 lossy buckets on later rounds; ours are equal-width
 // buckets of the hand's equity against a uniform range, not k-means over equity distributions).
@@ -1978,6 +1997,13 @@ struct VectorSolver {
     }
   };
 
+  // 1 / P(the cards dealt after `before` board cards up to `after` miss a given opponent hand | they miss mine)
+  static double deal_correction(int before, int after) {
+    double f = 1.0;
+    for (int i = before; i < after; ++i) f *= double(NUM_CARDS - i - 2) / double(NUM_CARDS - i - 4);
+    return f;
+  }
+
   void keys_of(int node, const Pass& ps, std::vector<int>& key) const {
     if (node_round[node] == root_round) {
       for (int h = 0; h < NUM_COMBOS; ++h) key[h] = h;
@@ -2003,9 +2029,10 @@ struct VectorSolver {
       for (int h = 0; h < NUM_COMBOS; ++h) out[h] *= sign * nd.stake;
       return;
     }
-    if (nd.kind == 2) {
+    if (nd.kind == 2) {  // (an all-in showdown before the last round also deals the rest of the board)
       ps.table->showdown_values(reach_q, out);
-      for (int h = 0; h < NUM_COMBOS; ++h) out[h] *= nd.stake;
+      const double f = nd.stake * deal_correction(BOARD_CARDS_BY_STAGE[node_round[node]], showdown_cards);
+      for (int h = 0; h < NUM_COMBOS; ++h) out[h] *= f;
       return;
     }
     Pass::Level& L = ps.level(depth);
@@ -2027,12 +2054,13 @@ struct VectorSolver {
         // street transition: the newly dealt card(s) block some hands of both players
         const int lo = BOARD_CARDS_BY_STAGE[round], hi = BOARD_CARDS_BY_STAGE[node_round[c]];
         std::vector<double> mp(rp), mq(rq);  // masked copies (a handful of transitions per iteration)
+        const double f = deal_correction(lo, hi);
         for (int h = 0; h < NUM_COMBOS; ++h) {
           int x, y;
           SubgameSolver::combo_cards(h, x, y);
           bool blocked = false;
           for (int i = lo; i < hi; ++i) blocked |= (ps.board[i] == x || ps.board[i] == y);
-          if (blocked) { mp[h] = 0.0; mq[h] = 0.0; }
+          if (blocked) { mp[h] = 0.0; mq[h] = 0.0; } else { mq[h] *= f; }
         }
         values(c, p, mp, mq, res, update, ps, depth + 1);
       } else {
@@ -2557,9 +2585,10 @@ struct TabularBlueprint {
     return b;
   }
 
-  // `own_reach`: the traverser's reach probability of the node (its own strategy along the path);
-  // with `dense_average` the average strategy is accumulated as own_reach * sigma at every visited
-  // own infoset (the standard external-sampling average) instead of Pluribus's sampled counters
+  // with `dense_average` the average strategy is accumulated as sigma at every sampled *opponent*
+  // infoset (external sampling's "simple" average: the opponent plays sigma, so its infosets are
+  // visited in proportion to its own reach) instead of Pluribus's sampled counters.  (Accumulating
+  // own_reach * sigma at the traverser's infosets weights the average by the opponent's reach.)
   bool dense_average = true;
 
   float traverse(int node, int p, Deal& d, float own_reach = 1.0f) {
@@ -2575,10 +2604,6 @@ struct TabularBlueprint {
       bool explored[MAX_ACTIONS] = {};
       float* R = regret.data() + info * n_actions;
       const bool last = round == cfg.num_rounds - 1;
-      if (dense_average && own_reach > 0.0f) {
-        float* S = phi.data() + info * n_actions;
-        for (int a = 0; a < n_actions; ++a) S[a] += own_reach * sigma[a];
-      }
       for (int a = 0; a < n_actions; ++a) {
         if (!nd.legal[a]) continue;
         const bool terminal_child = tree.nodes[nd.child[a]].kind != 0;
@@ -2590,6 +2615,10 @@ struct TabularBlueprint {
       for (int a = 0; a < n_actions; ++a)
         if (explored[a]) R[a] = std::max(float(regret_floor), R[a] + v[a] - value);
       return value;
+    }
+    if (dense_average) {
+      float* S = phi.data() + info * n_actions;
+      for (int a = 0; a < n_actions; ++a) S[a] += sigma[a];
     }
     std::uniform_real_distribution<float> u(0.0f, 1.0f);
     float x = u(*d.rng), acc = 0.0f;
@@ -2788,6 +2817,7 @@ PYBIND11_MODULE(headsup_cpp, m) {
              e.reset(deck.data());
            })
       .def("step", [](Engine& e, int a) {
+        if (e.done) throw std::runtime_error("the hand is over (reset first)");
         if (a < 0 || a >= e.num_actions()) throw std::runtime_error("invalid action");
         return e.step(a);
       })
@@ -2835,18 +2865,19 @@ PYBIND11_MODULE(headsup_cpp, m) {
 
   m.def(
       "equity_vs_all",
-      [](int c0, int c1, std::vector<int> board, int samples, int max_exact, uint64_t seed) {
-        if (board.size() > 5) throw std::runtime_error("board has at most 5 cards");
+      [](int c0, int c1, std::vector<int> board, int samples, int max_exact, uint64_t seed, int final_cards) {
+        if (final_cards < 3 || final_cards > 5 || int(board.size()) > final_cards)
+          throw std::runtime_error("the board has at most final_cards (3..5) cards");
         py::array_t<float> out(std::vector<ssize_t>{NUM_COMBOS});
         float* ptr = out.mutable_data();
         {
           py::gil_scoped_release release;
-          equity_vs_all(c0, c1, board.data(), int(board.size()), samples, max_exact, seed, ptr);
+          equity_vs_all(c0, c1, board.data(), int(board.size()), samples, max_exact, seed, ptr, final_cards);
         }
         return out;
       },
       py::arg("c0"), py::arg("c1"), py::arg("board"), py::arg("samples") = 200, py::arg("max_exact") = 1200,
-      py::arg("seed") = 0,
+      py::arg("seed") = 0, py::arg("final_cards") = 5,
       "P(win) + P(tie)/2 of (c0, c1) vs every opponent combo (index = combo_index(a, b), a < b); -1 = blocked");
   m.def("combo_index", &combo_index);
   m.attr("NUM_COMBOS") = NUM_COMBOS;
@@ -3152,7 +3183,8 @@ PYBIND11_MODULE(headsup_cpp, m) {
         py::arg("t"), py::arg("epsilon"), py::arg("seed"), py::arg("cfg") = EngineConfig(), py::arg("decks") = py::none(),
         "DREAM outcome-sampling traversals: (adv obs, adv weight, adv target, history obs, action, Q target, nodes)");
   m.def("run_escher_values", &run_escher_values, py::arg("net0"), py::arg("net1"), py::arg("n_trajectories"), py::arg("seed"),
-        py::arg("cfg") = EngineConfig(), "ESCHER value trajectories: (history obs, action, u_0 target, nodes)");
+        py::arg("cfg") = EngineConfig(), py::arg("value_epsilon") = 0.01f,
+        "ESCHER value trajectories on (1 - value_epsilon) sigma + value_epsilon uniform: (history obs, action, IS-weighted u_0 target, nodes)");
   m.def("run_escher_regrets", &run_escher_regrets, py::arg("net0"), py::arg("net1"), py::arg("vnet"), py::arg("traverser"),
         py::arg("n_trajectories"), py::arg("t"), py::arg("seed"), py::arg("cfg") = EngineConfig(),
         "ESCHER regret trajectories: (adv obs, t, target, strat obs, t, sigma, history obs, -1, value, nodes)");

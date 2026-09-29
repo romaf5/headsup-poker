@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 from headsup.cards import CARD_FEATURES, NUM_CARDS
-from headsup.engine import HeadsUpPoker
+from headsup.engine import BOARD_CARDS_BY_STAGE, HeadsUpPoker
 from headsup.enums import Action
 from headsup.game import action_label
 
@@ -209,6 +209,7 @@ class LocalBestResponse:
             self._pool.submit(
                 self._cpp.equity_vs_all, int(t.engine.hands[t.seat][0]), int(t.engine.hands[t.seat][1]),
                 [int(c) for c in t.engine.visible_board], self.mc_samples, self.max_exact, int(self.rng.integers(2**63)),
+                BOARD_CARDS_BY_STAGE[self.game.num_rounds - 1],  # the showdown board (FHP: the flop)
             )
             for t in tables
         ]
