@@ -16,21 +16,16 @@
     },
     "lbr_chips_per_hand": "1.33 +- 0.09 (30 000 duplicate pairs)",
     "ppo_exploiter_chips_per_hand": "0.01 +- 0.03 (best of 3 seeds x 1000 epochs)",
-    "best_response_exploitability": "3.24 chips/hand = 1620 mbb/g (headsup.algos.holdem_br, 12 boards)",
+    "best_response_exploitability": "not re-measured yet with the corrected estimator (the 2026-08 figure of 1620 mbb/g missed the board chance factor)",
     "head_to_head_vs_sdcfr_average": "-0.04 +- 0.05 chips/hand (tie)"
   },
   "blueprint_nlhe.pt": {
-    "trained": "2026-08-17 (runs/bp/nlhe_20m.pt), ~40 min on 24 threads",
-    "algorithm": "tabular Pluribus-style MCCFR-P blueprint (headsup.blueprint): Linear MCCFR with negative-regret pruning, 169 lossless preflop classes + 200 equal-mass EHS buckets per later round (Monte-Carlo EHS, 500 runouts), 20M iterations; play-only file (average-strategy counters, no regrets)",
+    "trained": "2026-09-29 (runs/bp/nlhe_20m_v2.pt), ~40 min on 24 threads",
+    "algorithm": "tabular Pluribus-style MCCFR-P blueprint (headsup.blueprint): Linear MCCFR with negative-regret pruning, 169 lossless preflop classes + 200 equal-mass EHS buckets per later round (Monte-Carlo EHS, 500 runouts), 20M iterations; average strategy accumulated at the sampled opponent infosets (the 2026-08-17 version weighted it by the opponent's reach); play-only file (average-strategy counters, no regrets)",
     "public_nodes": 8426,
     "infosets": 436366,
-    "chips_per_hand_vs": {
-      "random": 1.76,
-      "call": 2.53,
-      "allin": 0.85
-    },
-    "lbr_chips_per_hand": "0.67 +- 0.09 (30 000 duplicate pairs)",
-    "note": "an equilibrium approximation exploits fixed bots less than the DeepCFR nets do; use it with real-time search: python -m headsup.web --opponent pluribus",
-    "head_to_head": "+0.81 +- 0.04 chips/hand vs models/deepcfr_policy.pth, +0.82 +- 0.04 vs its SD-CFR average (300 000 hands each)"
+    "lbr_chips_per_hand": "0.60 +- 0.09 (30 000 duplicate pairs; previous version 0.67 +- 0.09)",
+    "head_to_head": "+0.87 +- 0.04 chips/hand vs models/deepcfr_policy.pth, +0.03 +- 0.03 vs the previous blueprint (300 000 hands each)",
+    "note": "an equilibrium approximation exploits fixed bots less than the DeepCFR nets do; use it with real-time search: python -m headsup.web --opponent pluribus"
   }
 }
