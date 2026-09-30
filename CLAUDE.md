@@ -71,6 +71,9 @@ python -m pytest tests -q                                    # ~115 tests, ~8 mi
 - GPU memory (24 GB): an FHP trainer keeps its reservoirs on the GPU (~263 B per sample: 20 M ~ 5 GB, plus
   ~1 GB overhead), a Leduc solver ~1.2 GB, the BR evaluator 1-3 GB (chunk 32). Two FHP trainers + four Leduc
   runs + a BR check went out of memory - add up the jobs before launching (`nvidia-smi`), keep ~4 GB free.
+- WSL: each CUDA process also costs ~5-7 GB of host RAM outside its RSS (GPU-mapped memory via dxgkrnl); a dozen small
+  GPU jobs exhausted the host and caused "CUDA out of memory" on an empty GPU (`dmesg`: dxgk create_allocation failed).
+  Run at most ~5 concurrent CUDA jobs, and check `free -g` (not just RSS) - the host is shared with other projects.
 - Use ~56 of 64 cores (`--workers 56`); `runs/` is git-ignored (clean it up after experiments).
 - Never drive `/api/*` of a web server a human is playing on; use another port.
 - `pgrep -f` / `pkill -f` match the launching shell too — wait on pid files / `kill -0 $PID`.
