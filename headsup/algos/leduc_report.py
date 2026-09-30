@@ -74,7 +74,7 @@ def sdcfr_table(curves, iterations=(30, 60, 120, 300, 510, 1000)):
     return "\n".join(lines)
 
 
-def dream_table(curves, nodes=(1e6, 3e6, 1e7, 1.5e7)):
+def dream_table(curves, nodes=(1e6, 3e6, 1e7, 1.4e7)):
     lines = ["| nodes touched | " + " | ".join(f"{n:.1e}" for n in nodes) + " | paper |", "|---|" + "---|" * (len(nodes) + 1)]
     for algo, name in (("sdcfr", "ES-SD-CFR (346 trav.)"), ("deepcfr", "Deep CFR (346 trav.)"), ("dream", "DREAM (900 trav.)"), ("escher", "ESCHER")):
         runs = curves.get(("dreamp", algo), {})

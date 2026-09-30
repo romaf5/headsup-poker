@@ -56,26 +56,40 @@ paper's hyperparameters; `python -m headsup.deepcfr.train -h` lists the network 
 
 ## Results
 
-NL abstraction (chips/hand, 1 chip = 500 mbb; ± standard errors):
+### Leduc: reproductions
 
-| strategy | BR exploitability | LBR | head-to-head |
-|---|---|---|---|
-| DeepCFR, paper features + net, 300 it. (`models/deepcfr_policy.pth`) | 3.24 | 1.33 ± 0.09 | ties its SD-CFR average (−0.04 ± 0.05) |
-| tabular blueprint, 20 M it., 40 min (`models/blueprint_nlhe.pt`) | 3.29 | 0.67 ± 0.09 | **+0.81 ± 0.04** vs the DeepCFR net |
-| Pluribus-mode search on the blueprint | – | −0.78 ± 0.39 | within noise of the blueprint |
+Exploitability of the average strategy in milli-antes per game (mean over seats, the papers' unit),
+mean ± sd over 3 seeds (`python -m headsup.algos.leduc_report runs/leduc_v4`):
 
-More DeepCFR training (1000 it. × 100 k traversals) does not lower LBR (1.44 ± 0.15); the paper's
-bet-history features beat aggregated ones (LBR 1.33 vs 1.62).
+| SD-CFR paper setup (by iteration) | 30 | 120 | 300 | 1000 |
+|---|---|---|---|---|
+| SD-CFR, ours | 282 ± 24 | 100 ± 9 | 89 ± 12 | **87 ± 20** |
+| SD-CFR, Steinberger (2019) Fig. 1a | 381 | 154 | 112 | 89 |
+| Deep CFR, ours | 297 ± 48 | 136 ± 26 | 132 ± 23 | **127 ± 4** |
+| Deep CFR, Steinberger (2019) Fig. 1a | 401 | 170 | 143 | 110 |
 
-Reproductions (exploitability; papers' hyperparameters, one seed):
+| DREAM paper setup (by nodes touched) | 3e6 | 1e7 | 1.4e7 | paper (plot read-off) |
+|---|---|---|---|---|
+| ES-SD-CFR, 346 traversals | 90 ± 12 | 58 ± 2 | **53 ± 8** | ≈40 at 1.5e7 |
+| DREAM, 900 traversals | 117 ± 16 | 85 ± 6 | **70 ± 4** | ≈56 at 1.2e7 |
 
-| game | algorithm | ours | paper |
-|---|---|---|---|
-| Leduc, 200 it. (mA/g) | DeepCFR / SD-CFR / DREAM / ESCHER | 307 / 270 / 385 / 528 | lower (under investigation) |
-| FHP, 450 it. (mbb/g) | DeepCFR | 243 | 37 |
+ESCHER's paper has no deep Leduc results. Its Leduc experiment is tabular with oracle history
+values (`python -m headsup.algos.oracle`, 500 trajectories per iteration). At 1000 iterations we
+measure NashConv 0.44 for OS-MCCFR (paper ≈0.44), 0.15 for DREAM (≈0.37) and 0.10 for ESCHER
+(≈0.54). The regret-estimator variance is 3.5 for ESCHER vs 132 for DREAM (paper: 5.3 vs 280).
+Tabular references: CFR+ 0.24, DCFR 0.15 mA/g at 1000 iterations.
 
-Tabular references on Leduc: CFR+ 35 mA/g at 1000 iterations; FHP equity-bucket blueprints plateau
-at ~380 mbb/g (the abstraction's floor).
+### NL abstraction (chips/hand, 1 chip = 500 mbb; ± standard errors)
+
+| strategy | LBR | head-to-head |
+|---|---|---|
+| DeepCFR, paper features + net, 300 it. (`models/deepcfr_policy.pth`) | 1.33 ± 0.09 | ties its SD-CFR average (−0.04 ± 0.05) |
+| tabular blueprint, 20 M it., 40 min (`models/blueprint_nlhe.pt`) | **0.60 ± 0.09** | **+0.87 ± 0.04** vs the DeepCFR net |
+| Pluribus-mode search on the blueprint | −0.78 ± 0.39 | within noise of the blueprint |
+
+Best-response exploitability of the NL strategies and the FHP reproduction (DeepCFR paper: 37 mbb/g
+total exploitability) are being re-measured: the earlier estimates missed the board chance factor
+and the FHP runs used the uniform regret-matching fallback and unscaled chip targets.
 
 ## Layout
 
