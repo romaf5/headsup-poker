@@ -205,13 +205,17 @@ class Leduc(Game):
     def action_names(self):
         return ["fold", "call", "raise"]
 
-    def make_model(self, hidden=64, layers=3, in_dim=None, arch="mlp"):
-        """``mlp``: ``layers`` fully-connected ReLU layers of ``hidden`` units (the SD-CFR paper's Leduc net);
-        ``deepcfr``: the Deep CFR paper's architecture with D = ``hidden`` (the DREAM paper's Leduc nets)."""
+    def make_model(self, hidden=64, layers=3, in_dim=None, arch="mlp", policy=False):
+        """``mlp``: ``layers`` fully-connected ReLU layers of ``hidden`` units (the SD-CFR paper's description);
+        ``deepcfr``: the Deep CFR paper's architecture with D = ``hidden`` (the DREAM paper's Leduc nets);
+        ``pokerrl``: the SD-CFR authors' code (PokerRL's FLAT module + dueling advantage head, or the
+        average-strategy head with ``policy``) - infostate inputs only, history nets fall back to ``mlp``."""
         import torch.nn as nn
 
         if arch == "deepcfr":
             return DeepCFRNet(in_dim or self.obs_dim, self.num_actions, self.obs_dim, hidden)
+        if arch == "pokerrl" and (in_dim or self.obs_dim) == self.obs_dim:
+            return PokerRLNet(self, hidden, policy)
         mods, d = [], (in_dim or self.obs_dim)
         for _ in range(layers):
             mods += [nn.Linear(d, hidden), nn.ReLU()]
@@ -274,5 +278,53 @@ def DeepCFRNet(in_dim, num_actions, obs_dim=34, dim=64):
             z = torch.relu(self.trunk[2](z)) + z
             z = (z - z.mean(dim=1, keepdim=True)) / (z.std(dim=1, keepdim=True) + 1e-5)
             return self.head(z)
+
+    return _Net()
+
+
+def legal_mask_from_info_state(game, x):
+    """(B, A) float legal-action mask recomputed from Leduc / Kuhn infostate features (torch): fold only when
+    the opponent has put more in this round, raise while the round's raises are below the cap."""
+    import torch
+
+    rnd = x[:, 6].round().long().clamp(0, game.num_rounds - 1)
+    base = 10 + 12 * rnd
+    raises = sum(x.gather(1, (base + 3 * k + 2)[:, None])[:, 0] for k in range(4))
+    cap = torch.as_tensor(game.max_raises, dtype=x.dtype, device=x.device)[rnd]
+    fold = (x[:, 8] > x[:, 7] + 1e-6).to(x.dtype)
+    return torch.stack([fold, torch.ones_like(fold), (raises < cap - 0.5).to(x.dtype)], dim=1)
+
+
+def PokerRLNet(game, dim=64, policy=False):
+    """The network of the SD-CFR paper's Leduc experiment as in the authors' code (Deep-CFR /
+    paper_experiment_leduc_exploitability.py: PokerRL MainPokerModuleFLAT without pre-layers, 64 units,
+    normalised last layer): h = relu(W1 x); h = relu(W2 h + h); h = (h - mean) / std.  Advantage nets
+    (DuelingQNet): out = (V(h) + A(h) - mean over legal actions of A(h)) * legal - illegal actions are
+    exactly 0.  Average-strategy nets (AvrgStrategyNet): logits relu(W h) -> linear, illegal -> -1e20."""
+    import torch
+    import torch.nn as nn
+
+    class _Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            A = game.num_actions
+            self.fc1, self.fc2 = nn.Linear(game.obs_dim, dim), nn.Linear(dim, dim)
+            if policy:
+                self.final, self.out = nn.Linear(dim, dim), nn.Linear(dim, A)
+            else:
+                self.adv_layer, self.adv = nn.Linear(dim, dim), nn.Linear(dim, A)
+                self.v_layer, self.v = nn.Linear(dim, dim), nn.Linear(dim, 1)
+
+        def forward(self, x):
+            legal = legal_mask_from_info_state(game, x)
+            h = torch.relu(self.fc1(x))
+            h = torch.relu(self.fc2(h) + h)
+            h = (h - h.mean(dim=-1, keepdim=True)) / (h.std(dim=-1, keepdim=True) + 1e-8)
+            if policy:
+                out = self.out(torch.relu(self.final(h)))
+                return torch.where(legal > 0, out, torch.full_like(out, -1e20))
+            y = self.adv(torch.relu(self.adv_layer(h))) * legal
+            y = (y - y.sum(dim=1, keepdim=True) / legal.sum(dim=1, keepdim=True)) * legal
+            return (self.v(torch.relu(self.v_layer(h))) + y) * legal
 
     return _Net()

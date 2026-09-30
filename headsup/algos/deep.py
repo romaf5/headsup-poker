@@ -141,9 +141,10 @@ def _fit(model, opt, xs, targets, weights, steps, batch, device, masks=None, gra
     return _optimise(model, opt, loss_fn, steps, grad_clip)
 
 
-def _fit_from_buffer(model, buffer, steps, batch, lr, device, loss="mse", weight_power=1.0):
-    """DeepCFR-style fit on a ReservoirBuffer (on ``device``): targets weighted by t^power; ``loss``
-    mse (advantages) or 'policy' (softmax(logits) vs stored probabilities)."""
+def _fit_from_buffer(model, buffer, steps, batch, lr, device, loss="mse", weight_power=1.0, weight_scale=1.0, grad_clip=1.0):
+    """DeepCFR-style fit on a ReservoirBuffer (on ``device``): targets weighted by t^power * ``weight_scale``
+    (the SD-CFR authors' code divides by the latest iteration, keeping the loss O(1)); ``loss`` mse
+    (advantages) or 'policy' (softmax(logits) vs stored probabilities)."""
     n = len(buffer)
     if n == 0:
         return model
@@ -154,9 +155,9 @@ def _fit_from_buffer(model, buffer, steps, batch, lr, device, loss="mse", weight
         pred = model(obs)
         if loss == "policy":
             pred = torch.softmax(pred, dim=-1)
-        return (buffer.t[idx].pow(weight_power)[:, None] * (pred - buffer.target[idx]).pow(2)).mean()
+        return (weight_scale * buffer.t[idx].pow(weight_power)[:, None] * (pred - buffer.target[idx]).pow(2)).mean()
 
-    _optimise(model, _adam(model, lr), loss_fn, steps)
+    _optimise(model, _adam(model, lr), loss_fn, steps, grad_clip)
     return model
 
 
@@ -216,7 +217,7 @@ class DeepSolver:
     def __init__(self, game, algo="deepcfr", traversals=1000, adv_capacity=2_000_000, strat_capacity=2_000_000,
                  adv_steps=3000, adv_batch=2048, policy_steps=4000, policy_batch=2048, q_steps=1000, q_batch=512,
                  q_capacity=200_000, value_traversals=None, epsilon=0.5, value_epsilon=0.01, lr=1e-3, device="cpu", seed=0,
-                 model_kwargs=None, rm_argmax=True, warm_start=False):
+                 model_kwargs=None, rm_argmax=True, warm_start=False, normalized_weights=False, grad_clip=1.0, mean_regret=False):
         assert algo in ALGOS
         self.game, self.algo = game, algo
         self.traversals = traversals
@@ -227,6 +228,9 @@ class DeepSolver:
         self.epsilon, self.value_epsilon, self.lr = epsilon, value_epsilon, lr
         self.rm_argmax = rm_argmax
         self.warm_start = warm_start  # SD-CFR paper (Leduc): each advantage net starts from the player's previous one
+        # the SD-CFR authors' code: loss weights t / t_latest (O(1) losses), gradient clipping at 10, and the
+        # sampled regrets divided by the number of legal actions (their multi-outcome sampler's mean)
+        self.normalized_weights, self.grad_clip, self.mean_regret = normalized_weights, grad_clip, mean_regret
         self.device = torch.device(device)
         self.rng = np.random.default_rng(seed)
         torch.manual_seed(seed)
@@ -308,8 +312,9 @@ class DeepSolver:
         self._v_tab = {k: out[i] for i, k in enumerate(self._hist_keys)}
 
     # -- helpers ----------------------------------------------------------------------------
-    def _new_model(self, in_dim=None):
-        m = self.game.make_model(**self.model_kwargs) if in_dim is None else self.game.make_model(in_dim=in_dim, **self.model_kwargs)
+    def _new_model(self, in_dim=None, policy=False):
+        kw = dict(self.model_kwargs, **({"policy": True} if policy and self.model_kwargs.get("arch") == "pokerrl" else {}))
+        m = self.game.make_model(**kw) if in_dim is None else self.game.make_model(in_dim=in_dim, **kw)
         return m.to(self.device).eval()
 
     @staticmethod
@@ -344,7 +349,8 @@ class DeepSolver:
         for a in np.flatnonzero(legal):
             values[a] = self._es(state.child(a), p, t, adv, strat)
         v = float(sigma @ values)
-        adv.append((state.info_state(p), t, np.where(legal, values - v, 0.0)))
+        r = np.where(legal, values - v, 0.0)
+        adv.append((state.info_state(p), t, r / legal.sum() if self.mean_regret else r))
         return v
 
     # -- outcome sampling with baselines (DREAM) --------------------------------------------------
@@ -483,7 +489,8 @@ class DeepSolver:
                 start = self._new_model()
                 if self.warm_start and self.iteration > 1:
                     start.load_state_dict(self.nets[p].state_dict())
-                self.nets[p] = _fit_from_buffer(start, self.adv_memory[p], self.adv_steps, self.adv_batch, self.lr, self.device)
+                self.nets[p] = _fit_from_buffer(start, self.adv_memory[p], self.adv_steps, self.adv_batch, self.lr, self.device,
+                                                weight_scale=1.0 / t if self.normalized_weights else 1.0, grad_clip=self.grad_clip)
                 self.iterates[p].append(self._cpu_state(self.nets[p]))
                 self._sigma_tab[p] = None
             self.stats = {"iteration": self.iteration, "seconds": time.perf_counter() - t0, "adv_samples": [len(m) for m in self.adv_memory],
@@ -498,7 +505,9 @@ class DeepSolver:
         """DeepCFR / ESCHER average-strategy net fitted on the strategy memory."""
         if len(self.strat_memory) == 0:
             raise ValueError("no strategy samples")
-        return _fit_from_buffer(self._new_model(), self.strat_memory, self.policy_steps, self.policy_batch, self.lr, self.device, loss="policy")
+        return _fit_from_buffer(self._new_model(policy=True), self.strat_memory, self.policy_steps, self.policy_batch, self.lr, self.device,
+                                loss="policy", weight_scale=1.0 / max(self.iteration, 1) if self.normalized_weights else 1.0,
+                                grad_clip=self.grad_clip)
 
     def average_policy(self):
         """Exact SD-CFR average: per infoset the reach-weighted (weight t * own reach) mixture of all
@@ -608,7 +617,11 @@ def main(argv=None):
     p.add_argument("--value-traversals", type=int, default=None, help="ESCHER: value trajectories per iteration (default --traversals)")
     p.add_argument("--epsilon", type=float, default=0.5, help="DREAM: traverser exploration")
     p.add_argument("--value-epsilon", type=float, default=0.01, help="ESCHER: exploration of the value trajectories")
-    p.add_argument("--arch", default="mlp", choices=["mlp", "deepcfr"], help="networks: 3 x 64 MLP (SD-CFR paper) or the Deep CFR architecture (DREAM paper)")
+    p.add_argument("--arch", default="mlp", choices=["mlp", "deepcfr", "pokerrl"],
+                   help="networks: 3 x 64 MLP, the Deep CFR architecture (DREAM paper) or the SD-CFR authors' PokerRL nets")
+    p.add_argument("--loss-weights", default="raw", choices=["raw", "normalized"], help="t, or t / t_latest (SD-CFR authors' code)")
+    p.add_argument("--grad-clip", type=float, default=1.0, help="gradient-norm clipping (Deep CFR paper 1; SD-CFR authors' code 10)")
+    p.add_argument("--mean-regret", action="store_true", help="divide sampled regrets by the number of legal actions (SD-CFR authors' sampler)")
     p.add_argument("--rm-fallback", default="argmax", choices=["argmax", "uniform"],
                    help="regret matching without a positive advantage: the best action (Deep CFR / DREAM / ESCHER) or uniform")
     p.add_argument("--eval-every", type=int, default=10)
@@ -623,7 +636,8 @@ def main(argv=None):
                         value_traversals=args.value_traversals, epsilon=args.epsilon, value_epsilon=args.value_epsilon,
                         device=args.device, seed=args.seed, rm_argmax=args.rm_fallback == "argmax", warm_start=args.warm_start,
                         adv_capacity=args.adv_capacity, strat_capacity=args.strat_capacity,
-                        model_kwargs={"arch": args.arch} if args.arch != "mlp" else None)
+                        model_kwargs={"arch": args.arch} if args.arch != "mlp" else None,
+                        normalized_weights=args.loss_weights == "normalized", grad_clip=args.grad_clip, mean_regret=args.mean_regret)
     curve, elapsed = [], 0.0
     if args.checkpoint and os.path.exists(args.checkpoint):
         saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)

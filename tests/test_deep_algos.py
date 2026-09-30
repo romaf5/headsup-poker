@@ -68,3 +68,45 @@ def test_deepcfr_architecture_for_the_small_games():
     s = DeepSolver(make_game("kuhn"), "sdcfr", traversals=20, adv_steps=10, adv_batch=64, seed=0, model_kwargs={"arch": "deepcfr"})
     s.iterate(2)
     assert 0 <= s.evaluate()["average"] < 1
+
+
+@pytest.mark.parametrize("name", ["kuhn", "leduc"])
+def test_legal_mask_from_info_state_matches_the_game(name):
+    import numpy as np
+    import torch
+
+    from headsup.games.leduc import legal_mask_from_info_state
+
+    g = make_game(name)
+    rows, masks = [], []
+
+    def walk(s):
+        if s.is_terminal():
+            return
+        if s.is_chance():
+            for a, _ in s.chance_outcomes():
+                walk(s.child(a))
+            return
+        rows.append(s.info_state(s.current_player))
+        masks.append(s.legal_mask())
+        for a in s.legal_actions():
+            walk(s.child(a))
+
+    walk(g.new_initial_state())
+    got = legal_mask_from_info_state(g, torch.as_tensor(np.stack(rows))).numpy() > 0
+    np.testing.assert_array_equal(got, np.stack(masks))
+
+
+def test_pokerrl_nets_mask_illegal_actions():
+    import torch
+
+    g = make_game("leduc")
+    s = DeepSolver(g, "deepcfr", traversals=20, adv_steps=5, adv_batch=64, policy_steps=5, policy_batch=64, seed=0,
+                   model_kwargs={"arch": "pokerrl"}, normalized_weights=True, grad_clip=10.0, mean_regret=True)
+    s.iterate(2)
+    x = torch.as_tensor(s._info_obs)
+    legal = torch.as_tensor(s._info_legal)
+    with torch.no_grad():
+        assert torch.all(s.nets[0](x)[~legal] == 0)  # dueling advantages: exactly 0 where illegal
+        assert torch.all(s._new_model(policy=True)(x)[~legal] < -1e19)
+    assert 0 <= s.evaluate()["average"] < 3
