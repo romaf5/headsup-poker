@@ -212,8 +212,10 @@ class Leduc(Game):
         average-strategy head with ``policy``) - infostate inputs only, history nets fall back to ``mlp``."""
         import torch.nn as nn
 
-        if arch == "deepcfr":
-            return DeepCFRNet(in_dim or self.obs_dim, self.num_actions, self.obs_dim, hidden)
+        if arch in ("deepcfr", "deepcfr_dueling"):
+            # deepcfr_dueling: the DREAM authors' nets (EricSteinberger/DREAM): Deep CFR body + DuelingQNet head
+            return DeepCFRNet(in_dim or self.obs_dim, self.num_actions, self.obs_dim, hidden,
+                              game=self if arch == "deepcfr_dueling" else None, policy=policy)
         if arch.startswith("pokerrl") and (in_dim or self.obs_dim) == self.obs_dim:
             # component ablations: pokerrl_nodueling / pokerrl_nonorm / pokerrl_nomask
             return PokerRLNet(self, hidden, policy, dueling="nodueling" not in arch, normalize="nonorm" not in arch, mask="nomask" not in arch)
@@ -245,12 +247,14 @@ class Kuhn(Leduc):
         return card
 
 
-def DeepCFRNet(in_dim, num_actions, obs_dim=34, dim=64):
+def DeepCFRNet(in_dim, num_actions, obs_dim=34, dim=64, game=None, policy=False):
     """Brown et al. (2019), Appendix C, for Leduc: a card branch (the per-group card embeddings are a linear
     map of the rank one-hots, then 3 layers), a bet branch (2 layers on the betting features), a trunk of 3
     layers with skip connections, per-sample normalisation of its output and a linear head (zero-initialised
     like the MLP).  Works on one infostate (``in_dim == obs_dim``) or on the concatenated infostates of both
-    players (history inputs of the DREAM baselines / ESCHER value nets)."""
+    players (history inputs of the DREAM baselines / ESCHER value nets).  With ``game``: the dueling head of the
+    DREAM authors' code - out = (V + A - mean over legal actions of A) * legal (average-strategy nets with ``policy``:
+    logits with illegal actions at -1e20); the legal mask is recomputed from the (acting player's) infostate."""
     import torch
     import torch.nn as nn
 
@@ -263,9 +267,15 @@ def DeepCFRNet(in_dim, num_actions, obs_dim=34, dim=64):
             self.card = nn.ModuleList([nn.Linear(len(cards), dim), nn.Linear(dim, dim), nn.Linear(dim, dim)])
             self.bet = nn.ModuleList([nn.Linear(in_dim - len(cards), dim), nn.Linear(dim, dim)])
             self.trunk = nn.ModuleList([nn.Linear(2 * dim, dim), nn.Linear(dim, dim), nn.Linear(dim, dim)])
-            self.head = nn.Linear(dim, num_actions)
-            nn.init.zeros_(self.head.weight)
-            nn.init.zeros_(self.head.bias)
+            if game is None:
+                self.head = nn.Linear(dim, num_actions)
+                nn.init.zeros_(self.head.weight)
+                nn.init.zeros_(self.head.bias)
+            else:
+                self.register_buffer("caps", torch.tensor(game.max_raises, dtype=torch.float32))
+                self.adv_layer, self.adv = nn.Linear(dim, dim), nn.Linear(dim, num_actions)
+                if not policy:
+                    self.v_layer, self.v = nn.Linear(dim, dim), nn.Linear(dim, 1)
 
         def forward(self, x):
             c = x.index_select(1, self.card_idx)
@@ -278,9 +288,34 @@ def DeepCFRNet(in_dim, num_actions, obs_dim=34, dim=64):
             z = torch.relu(self.trunk[1](z)) + z
             z = torch.relu(self.trunk[2](z)) + z
             z = (z - z.mean(dim=1, keepdim=True)) / (z.std(dim=1, keepdim=True) + 1e-5)
-            return self.head(z)
+            if game is None:
+                return self.head(z)
+            legal = (legal_mask_from_info_state(game, x, self.caps) if in_dim == obs_dim
+                     else legal_mask_from_history(game, x, obs_dim, self.caps))
+            y = self.adv(torch.relu(self.adv_layer(z)))
+            if policy:
+                return torch.where(legal > 0, y, torch.full_like(y, -1e20))
+            y = y * legal
+            y = (y - y.sum(dim=1, keepdim=True) / legal.sum(dim=1, keepdim=True)) * legal
+            return (self.v(torch.relu(self.v_layer(z))) + y) * legal
 
     return _Net()
+
+
+def legal_mask_from_history(game, x, obs_dim, caps=None):
+    """Legal mask of the player to act from a history input (player 0's infostate, then player 1's): the actor
+    alternates within a round starting with player 0, so the round's action count says whose turn it is."""
+    import torch
+
+    rnd = x[:, 6].round().long().clamp(0, game.num_rounds - 1)
+    base = 10 + 12 * rnd
+    n_actions = sum(x.gather(1, (base + 3 * k + j)[:, None])[:, 0] for k in range(4) for j in range(3))
+    actor = (n_actions.round().long() % 2).to(x.dtype)  # 1: player 1 to act
+    own = x[:, 7] * (1 - actor) + x[:, 8] * actor  # player 0's view: [7] own bets, [8] the opponent's
+    opp = x[:, 8] * (1 - actor) + x[:, 7] * actor
+    view = x[:, :obs_dim].clone()
+    view[:, 7], view[:, 8] = own, opp
+    return legal_mask_from_info_state(game, view, caps)
 
 
 def legal_mask_from_info_state(game, x, caps=None):

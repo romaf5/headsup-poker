@@ -119,3 +119,36 @@ def test_pokerrl_nets_train_inside_cuda_graphs():
                    device="cuda", seed=0, model_kwargs={"arch": "pokerrl"})
     s.iterate(2)
     assert 0 <= s.evaluate()["average"] < 3
+
+
+def test_legal_mask_from_history_matches_the_game():
+    """The DREAM baselines' dueling head masks with the actor's legal actions, recomputed from the two-player history input."""
+    import numpy as np
+    import torch
+
+    from headsup.games.leduc import legal_mask_from_history
+
+    g = make_game("leduc")
+    rows, masks = [], []
+
+    def walk(s):
+        if s.is_terminal():
+            return
+        if s.is_chance():
+            for a, _ in s.chance_outcomes():
+                walk(s.child(a))
+            return
+        rows.append(np.concatenate([s.info_state(0), s.info_state(1)]))
+        masks.append(s.legal_mask())
+        for a in s.legal_actions():
+            walk(s.child(a))
+
+    walk(g.new_initial_state())
+    got = legal_mask_from_history(g, torch.as_tensor(np.stack(rows)), g.obs_dim).numpy() > 0
+    np.testing.assert_array_equal(got, np.stack(masks))
+    for in_dim in (g.obs_dim, 2 * g.obs_dim):
+        m = g.make_model(arch="deepcfr_dueling", in_dim=in_dim)
+        x = torch.as_tensor(np.stack(rows)[:, :in_dim])
+        legal = torch.as_tensor(np.stack(masks))
+        with torch.no_grad():
+            assert torch.all(m(x)[~legal] == 0)
