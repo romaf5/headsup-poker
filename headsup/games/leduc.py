@@ -214,8 +214,9 @@ class Leduc(Game):
 
         if arch == "deepcfr":
             return DeepCFRNet(in_dim or self.obs_dim, self.num_actions, self.obs_dim, hidden)
-        if arch == "pokerrl" and (in_dim or self.obs_dim) == self.obs_dim:
-            return PokerRLNet(self, hidden, policy)
+        if arch.startswith("pokerrl") and (in_dim or self.obs_dim) == self.obs_dim:
+            # component ablations: pokerrl_nodueling / pokerrl_nonorm / pokerrl_nomask
+            return PokerRLNet(self, hidden, policy, dueling="nodueling" not in arch, normalize="nonorm" not in arch, mask="nomask" not in arch)
         mods, d = [], (in_dim or self.obs_dim)
         for _ in range(layers):
             mods += [nn.Linear(d, hidden), nn.ReLU()]
@@ -298,7 +299,7 @@ def legal_mask_from_info_state(game, x, caps=None):
     return torch.stack([fold, torch.ones_like(fold), (raises < cap - 0.5).to(x.dtype)], dim=1)
 
 
-def PokerRLNet(game, dim=64, policy=False):
+def PokerRLNet(game, dim=64, policy=False, dueling=True, normalize=True, mask=True):
     """The network of the SD-CFR paper's Leduc experiment as in the authors' code (Deep-CFR /
     paper_experiment_leduc_exploitability.py: PokerRL MainPokerModuleFLAT without pre-layers, 64 units,
     normalised last layer): h = relu(W1 x); h = relu(W2 h + h); h = (h - mean) / std.  Advantage nets
@@ -313,7 +314,7 @@ def PokerRLNet(game, dim=64, policy=False):
             A = game.num_actions
             self.register_buffer("caps", torch.tensor(game.max_raises, dtype=torch.float32))
             self.fc1, self.fc2 = nn.Linear(game.obs_dim, dim), nn.Linear(dim, dim)
-            if policy:
+            if policy or not dueling:
                 self.final, self.out = nn.Linear(dim, dim), nn.Linear(dim, A)
             else:
                 self.adv_layer, self.adv = nn.Linear(dim, dim), nn.Linear(dim, A)
@@ -323,10 +324,16 @@ def PokerRLNet(game, dim=64, policy=False):
             legal = legal_mask_from_info_state(game, x, self.caps)
             h = torch.relu(self.fc1(x))
             h = torch.relu(self.fc2(h) + h)
-            h = (h - h.mean(dim=-1, keepdim=True)) / (h.std(dim=-1, keepdim=True) + 1e-8)
+            if normalize:
+                h = (h - h.mean(dim=-1, keepdim=True)) / (h.std(dim=-1, keepdim=True) + 1e-8)
             if policy:
                 out = self.out(torch.relu(self.final(h)))
-                return torch.where(legal > 0, out, torch.full_like(out, -1e20))
+                return torch.where(legal > 0, out, torch.full_like(out, -1e20)) if mask else out
+            if not dueling:
+                out = self.out(torch.relu(self.final(h)))
+                return out * legal if mask else out
+            if not mask:
+                legal = torch.ones_like(legal)
             y = self.adv(torch.relu(self.adv_layer(h))) * legal
             y = (y - y.sum(dim=1, keepdim=True) / legal.sum(dim=1, keepdim=True)) * legal
             return (self.v(torch.relu(self.v_layer(h))) + y) * legal

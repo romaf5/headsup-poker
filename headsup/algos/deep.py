@@ -313,7 +313,7 @@ class DeepSolver:
 
     # -- helpers ----------------------------------------------------------------------------
     def _new_model(self, in_dim=None, policy=False):
-        kw = dict(self.model_kwargs, **({"policy": True} if policy and self.model_kwargs.get("arch") == "pokerrl" else {}))
+        kw = dict(self.model_kwargs, **({"policy": True} if policy and str(self.model_kwargs.get("arch", "")).startswith("pokerrl") else {}))
         m = self.game.make_model(**kw) if in_dim is None else self.game.make_model(in_dim=in_dim, **kw)
         return m.to(self.device).eval()
 
@@ -617,7 +617,7 @@ def main(argv=None):
     p.add_argument("--value-traversals", type=int, default=None, help="ESCHER: value trajectories per iteration (default --traversals)")
     p.add_argument("--epsilon", type=float, default=0.5, help="DREAM: traverser exploration")
     p.add_argument("--value-epsilon", type=float, default=0.01, help="ESCHER: exploration of the value trajectories")
-    p.add_argument("--arch", default="mlp", choices=["mlp", "deepcfr", "pokerrl"],
+    p.add_argument("--arch", default="mlp", choices=["mlp", "deepcfr", "pokerrl", "pokerrl_nodueling", "pokerrl_nonorm", "pokerrl_nomask"],
                    help="networks: 3 x 64 MLP, the Deep CFR architecture (DREAM paper) or the SD-CFR authors' PokerRL nets")
     p.add_argument("--loss-weights", default="raw", choices=["raw", "normalized"], help="t, or t / t_latest (SD-CFR authors' code)")
     p.add_argument("--grad-clip", type=float, default=1.0, help="gradient-norm clipping (Deep CFR paper 1; SD-CFR authors' code 10)")
