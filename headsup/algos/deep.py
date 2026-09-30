@@ -141,7 +141,7 @@ def _fit(model, opt, xs, targets, weights, steps, batch, device, masks=None, gra
     return _optimise(model, opt, loss_fn, steps, grad_clip)
 
 
-def _fit_from_buffer(model, buffer, steps, batch, lr, device, loss="mse", weight_power=1.0, weight_scale=1.0, grad_clip=1.0):
+def _fit_from_buffer(model, buffer, steps, batch, lr, device, loss="mse", weight_power=1.0, weight_scale=1.0, grad_clip=1.0, legal_fn=None):
     """DeepCFR-style fit on a ReservoirBuffer (on ``device``): targets weighted by t^power * ``weight_scale``
     (the SD-CFR authors' code divides by the latest iteration, keeping the loss O(1)); ``loss`` mse
     (advantages) or 'policy' (softmax(logits) vs stored probabilities)."""
@@ -155,7 +155,10 @@ def _fit_from_buffer(model, buffer, steps, batch, lr, device, loss="mse", weight
         pred = model(obs)
         if loss == "policy":
             pred = torch.softmax(pred, dim=-1)
-        return (weight_scale * buffer.t[idx].pow(weight_power)[:, None] * (pred - buffer.target[idx]).pow(2)).mean()
+        err = (pred - buffer.target[idx]).pow(2)
+        if legal_fn is not None:  # the loss on legal actions only (illegal outputs are never used)
+            err = err * legal_fn(obs)
+        return (weight_scale * buffer.t[idx].pow(weight_power)[:, None] * err).mean()
 
     _optimise(model, _adam(model, lr), loss_fn, steps, grad_clip)
     return model
@@ -217,7 +220,8 @@ class DeepSolver:
     def __init__(self, game, algo="deepcfr", traversals=1000, adv_capacity=2_000_000, strat_capacity=2_000_000,
                  adv_steps=3000, adv_batch=2048, policy_steps=4000, policy_batch=2048, q_steps=1000, q_batch=512,
                  q_capacity=200_000, value_traversals=None, epsilon=0.5, value_epsilon=0.01, lr=1e-3, device="cpu", seed=0,
-                 model_kwargs=None, rm_argmax=True, warm_start=False, normalized_weights=False, grad_clip=1.0, mean_regret=False):
+                 model_kwargs=None, rm_argmax=True, warm_start=False, normalized_weights=False, grad_clip=1.0, mean_regret=False,
+                 masked_loss=False):
         assert algo in ALGOS
         self.game, self.algo = game, algo
         self.traversals = traversals
@@ -232,6 +236,13 @@ class DeepSolver:
         # sampled regrets divided by the number of legal actions (their multi-outcome sampler's mean)
         self.normalized_weights, self.grad_clip, self.mean_regret = normalized_weights, grad_clip, mean_regret
         self.device = torch.device(device)
+        # the advantage loss on legal actions only - what the authors' masked network outputs amount to in training
+        self._legal_fn = None
+        if masked_loss:
+            from headsup.games.leduc import legal_mask_from_info_state
+
+            caps = torch.tensor(game.max_raises, dtype=torch.float32, device=self.device)
+            self._legal_fn = lambda x: legal_mask_from_info_state(game, x, caps)
         self.rng = np.random.default_rng(seed)
         torch.manual_seed(seed)
         self.model_kwargs = model_kwargs or {}
@@ -491,7 +502,8 @@ class DeepSolver:
                 if self.warm_start and self.iteration > 1:
                     start.load_state_dict(self.nets[p].state_dict())
                 self.nets[p] = _fit_from_buffer(start, self.adv_memory[p], self.adv_steps, self.adv_batch, self.lr, self.device,
-                                                weight_scale=1.0 / t if self.normalized_weights else 1.0, grad_clip=self.grad_clip)
+                                                weight_scale=1.0 / t if self.normalized_weights else 1.0, grad_clip=self.grad_clip,
+                                                legal_fn=self._legal_fn)
                 self.iterates[p].append(self._cpu_state(self.nets[p]))
                 self._sigma_tab[p] = None
             self.stats = {"iteration": self.iteration, "seconds": time.perf_counter() - t0, "adv_samples": [len(m) for m in self.adv_memory],
@@ -623,6 +635,7 @@ def main(argv=None):
     p.add_argument("--loss-weights", default="raw", choices=["raw", "normalized"], help="t, or t / t_latest (SD-CFR authors' code)")
     p.add_argument("--grad-clip", type=float, default=1.0, help="gradient-norm clipping (Deep CFR paper 1; SD-CFR authors' code 10)")
     p.add_argument("--mean-regret", action="store_true", help="divide sampled regrets by the number of legal actions (SD-CFR authors' sampler)")
+    p.add_argument("--masked-loss", action="store_true", help="advantage loss on legal actions only (what masked network outputs do)")
     p.add_argument("--rm-fallback", default="argmax", choices=["argmax", "uniform"],
                    help="regret matching without a positive advantage: the best action (Deep CFR / DREAM / ESCHER) or uniform")
     p.add_argument("--eval-every", type=int, default=10)
@@ -638,7 +651,8 @@ def main(argv=None):
                         device=args.device, seed=args.seed, rm_argmax=args.rm_fallback == "argmax", warm_start=args.warm_start,
                         adv_capacity=args.adv_capacity, strat_capacity=args.strat_capacity,
                         model_kwargs={"arch": args.arch} if args.arch != "mlp" else None,
-                        normalized_weights=args.loss_weights == "normalized", grad_clip=args.grad_clip, mean_regret=args.mean_regret)
+                        normalized_weights=args.loss_weights == "normalized", grad_clip=args.grad_clip, mean_regret=args.mean_regret,
+                        masked_loss=args.masked_loss)
     curve, elapsed = [], 0.0
     if args.checkpoint and os.path.exists(args.checkpoint):
         saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
