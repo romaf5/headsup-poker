@@ -282,15 +282,18 @@ def DeepCFRNet(in_dim, num_actions, obs_dim=34, dim=64):
     return _Net()
 
 
-def legal_mask_from_info_state(game, x):
+def legal_mask_from_info_state(game, x, caps=None):
     """(B, A) float legal-action mask recomputed from Leduc / Kuhn infostate features (torch): fold only when
-    the opponent has put more in this round, raise while the round's raises are below the cap."""
+    the opponent has put more in this round, raise while the round's raises are below the cap.  ``caps``:
+    the per-round raise caps as a tensor on x's device (pass it inside CUDA graphs: no host copies there)."""
     import torch
 
     rnd = x[:, 6].round().long().clamp(0, game.num_rounds - 1)
     base = 10 + 12 * rnd
     raises = sum(x.gather(1, (base + 3 * k + 2)[:, None])[:, 0] for k in range(4))
-    cap = torch.as_tensor(game.max_raises, dtype=x.dtype, device=x.device)[rnd]
+    if caps is None:
+        caps = torch.as_tensor(game.max_raises, dtype=x.dtype, device=x.device)
+    cap = caps[rnd]
     fold = (x[:, 8] > x[:, 7] + 1e-6).to(x.dtype)
     return torch.stack([fold, torch.ones_like(fold), (raises < cap - 0.5).to(x.dtype)], dim=1)
 
@@ -308,6 +311,7 @@ def PokerRLNet(game, dim=64, policy=False):
         def __init__(self):
             super().__init__()
             A = game.num_actions
+            self.register_buffer("caps", torch.tensor(game.max_raises, dtype=torch.float32))
             self.fc1, self.fc2 = nn.Linear(game.obs_dim, dim), nn.Linear(dim, dim)
             if policy:
                 self.final, self.out = nn.Linear(dim, dim), nn.Linear(dim, A)
@@ -316,7 +320,7 @@ def PokerRLNet(game, dim=64, policy=False):
                 self.v_layer, self.v = nn.Linear(dim, dim), nn.Linear(dim, 1)
 
         def forward(self, x):
-            legal = legal_mask_from_info_state(game, x)
+            legal = legal_mask_from_info_state(game, x, self.caps)
             h = torch.relu(self.fc1(x))
             h = torch.relu(self.fc2(h) + h)
             h = (h - h.mean(dim=-1, keepdim=True)) / (h.std(dim=-1, keepdim=True) + 1e-8)

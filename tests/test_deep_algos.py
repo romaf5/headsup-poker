@@ -110,3 +110,12 @@ def test_pokerrl_nets_mask_illegal_actions():
         assert torch.all(s.nets[0](x)[~legal] == 0)  # dueling advantages: exactly 0 where illegal
         assert torch.all(s._new_model(policy=True)(x)[~legal] < -1e19)
     assert 0 <= s.evaluate()["average"] < 3
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="needs CUDA")
+def test_pokerrl_nets_train_inside_cuda_graphs():
+    """The legal-action mask is recomputed inside the network: no host-to-device copies during capture."""
+    s = DeepSolver(make_game("leduc"), "deepcfr", traversals=20, adv_steps=8, adv_batch=64, policy_steps=8, policy_batch=64,
+                   device="cuda", seed=0, model_kwargs={"arch": "pokerrl"})
+    s.iterate(2)
+    assert 0 <= s.evaluate()["average"] < 3
