@@ -31,9 +31,12 @@ from headsup.algos.tabular import MCCFR, regret_matching
 
 
 class OracleSampler:
-    def __init__(self, game, algo="escher", trajectories=500, epsilon=0.5, seed=0):
-        assert algo in ("escher", "dream")
-        self.game, self.algo, self.k, self.epsilon = game, algo, trajectories, epsilon
+    def __init__(self, game, algo="escher", trajectories=500, epsilon=0.5, seed=0, average="exact"):
+        """``average``: "exact" (pi_i(I) sigma(I) at every infoset, full tree walk) or "sampled" (sigma(I)
+        added at the opponent's infosets the trajectories visit - it plays sigma, so visits follow its
+        own reach, as ESCHER's code fills its average-policy buffer; noisier)."""
+        assert algo in ("escher", "dream") and average in ("exact", "sampled")
+        self.game, self.algo, self.k, self.epsilon, self.average = game, algo, trajectories, epsilon, average
         self.rng = np.random.default_rng(seed)
         self.regret, self.strategy_sum = {}, {}
         self.iteration = 0
@@ -76,6 +79,7 @@ class OracleSampler:
                 acc.setdefault(state.info_key(p), []).append(r)
                 a = int(self.rng.choice(np.flatnonzero(legal)))  # the fixed (uniform) sampling policy
             else:
+                self._sampled_average(state, sig)
                 a = int(self.rng.choice(len(sig), p=sig))
             state = state.child(a)
 
@@ -87,6 +91,8 @@ class OracleSampler:
             return self._dream(state.child(state.sample_chance(self.rng)), p, own_reach, q_tab, acc)
         legal = state.legal_mask()
         sig = self.sigma(state)
+        if state.current_player != p:
+            self._sampled_average(state, sig)
         xi = self.epsilon * legal / legal.sum() + (1 - self.epsilon) * sig if state.current_player == p else sig
         a = int(self.rng.choice(len(xi), p=xi / xi.sum()))
         b = np.where(legal, q_tab[state.history_key()] * (1.0 if p == 0 else -1.0), 0.0)
@@ -97,6 +103,15 @@ class OracleSampler:
         if state.current_player == p:
             acc.setdefault(state.info_key(p), []).append(np.where(legal, va - v, 0.0) / own_reach)
         return v
+
+    def _sampled_average(self, state, sig):
+        if self.average != "sampled":
+            return
+        key = state.info_key(state.current_player)
+        s = self.strategy_sum.get(key)
+        if s is None:
+            s = self.strategy_sum[key] = np.zeros(self.game.num_actions)
+        s += sig
 
     # -- iterations -------------------------------------------------------------------------------
     def _accumulate_average(self, state, p, reach):
@@ -122,8 +137,9 @@ class OracleSampler:
     def iterate(self, n=1):
         for _ in range(n):
             self.iteration += 1
-            for p in (0, 1):
-                self._accumulate_average(self.game.new_initial_state(), p, 1.0)
+            if self.average == "exact":
+                for p in (0, 1):
+                    self._accumulate_average(self.game.new_initial_state(), p, 1.0)
             var = []
             for p in (0, 1):  # alternating: player 1 sees player 0's updated strategy (and fresh oracle values)
                 q_tab = {}
@@ -160,6 +176,7 @@ def main(argv=None):
     p.add_argument("--trajectories", type=int, default=500, help="sampled trajectories per player and iteration")
     p.add_argument("--epsilon", type=float, default=0.5, help="DREAM / OS: exploration of the update player")
     p.add_argument("--eval", default="1,2,5,10,20,50,100,200,500,1000")
+    p.add_argument("--average", default="exact", choices=["exact", "sampled"])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", default=None)
     args = p.parse_args(argv)
@@ -169,7 +186,7 @@ def main(argv=None):
         solver = MCCFR(game, "outcome", seed=args.seed, linear=False, epsilon=args.epsilon)
         step = lambda n: solver.iterate(n * args.trajectories)  # MCCFR: one trajectory per player per call
     else:
-        solver = OracleSampler(game, args.algo, args.trajectories, args.epsilon, args.seed)
+        solver = OracleSampler(game, args.algo, args.trajectories, args.epsilon, args.seed, args.average)
         step = solver.iterate
     curve, done, t0 = [], 0, time.perf_counter()
     for it in points:

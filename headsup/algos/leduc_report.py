@@ -62,7 +62,7 @@ def _fmt(vals):
     return f"{np.mean(vals):.0f}" + (f" ± {np.std(vals, ddof=1):.0f}" if len(vals) > 1 else "")
 
 
-def sdcfr_table(curves, iterations=(30, 60, 120, 300, 510, 1020)):
+def sdcfr_table(curves, iterations=(30, 60, 120, 300, 510, 1000)):
     lines = ["| iteration | " + " | ".join(str(i) for i in iterations) + " |", "|---|" + "---|" * len(iterations)]
     for algo, col in (("sdcfr", 0), ("deepcfr", 1)):
         runs = curves.get(("sdcfrp", algo), {})
