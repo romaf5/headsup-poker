@@ -608,6 +608,7 @@ def main(argv=None):
     p.add_argument("--value-traversals", type=int, default=None, help="ESCHER: value trajectories per iteration (default --traversals)")
     p.add_argument("--epsilon", type=float, default=0.5, help="DREAM: traverser exploration")
     p.add_argument("--value-epsilon", type=float, default=0.01, help="ESCHER: exploration of the value trajectories")
+    p.add_argument("--arch", default="mlp", choices=["mlp", "deepcfr"], help="networks: 3 x 64 MLP (SD-CFR paper) or the Deep CFR architecture (DREAM paper)")
     p.add_argument("--rm-fallback", default="argmax", choices=["argmax", "uniform"],
                    help="regret matching without a positive advantage: the best action (Deep CFR / DREAM / ESCHER) or uniform")
     p.add_argument("--eval-every", type=int, default=10)
@@ -621,7 +622,8 @@ def main(argv=None):
                         policy_steps=args.policy_steps, policy_batch=args.policy_batch, q_steps=args.q_steps, q_batch=args.q_batch,
                         value_traversals=args.value_traversals, epsilon=args.epsilon, value_epsilon=args.value_epsilon,
                         device=args.device, seed=args.seed, rm_argmax=args.rm_fallback == "argmax", warm_start=args.warm_start,
-                        adv_capacity=args.adv_capacity, strat_capacity=args.strat_capacity)
+                        adv_capacity=args.adv_capacity, strat_capacity=args.strat_capacity,
+                        model_kwargs={"arch": args.arch} if args.arch != "mlp" else None)
     curve, elapsed = [], 0.0
     if args.checkpoint and os.path.exists(args.checkpoint):
         saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)

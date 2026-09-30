@@ -205,9 +205,13 @@ class Leduc(Game):
     def action_names(self):
         return ["fold", "call", "raise"]
 
-    def make_model(self, hidden=64, layers=3, in_dim=None):
+    def make_model(self, hidden=64, layers=3, in_dim=None, arch="mlp"):
+        """``mlp``: ``layers`` fully-connected ReLU layers of ``hidden`` units (the SD-CFR paper's Leduc net);
+        ``deepcfr``: the Deep CFR paper's architecture with D = ``hidden`` (the DREAM paper's Leduc nets)."""
         import torch.nn as nn
 
+        if arch == "deepcfr":
+            return DeepCFRNet(in_dim or self.obs_dim, self.num_actions, self.obs_dim, hidden)
         mods, d = [], (in_dim or self.obs_dim)
         for _ in range(layers):
             mods += [nn.Linear(d, hidden), nn.ReLU()]
@@ -234,3 +238,41 @@ class Kuhn(Leduc):
 
     def hand_value(self, card, board):
         return card
+
+
+def DeepCFRNet(in_dim, num_actions, obs_dim=34, dim=64):
+    """Brown et al. (2019), Appendix C, for Leduc: a card branch (the per-group card embeddings are a linear
+    map of the rank one-hots, then 3 layers), a bet branch (2 layers on the betting features), a trunk of 3
+    layers with skip connections, per-sample normalisation of its output and a linear head (zero-initialised
+    like the MLP).  Works on one infostate (``in_dim == obs_dim``) or on the concatenated infostates of both
+    players (history inputs of the DREAM baselines / ESCHER value nets)."""
+    import torch
+    import torch.nn as nn
+
+    class _Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            cards = [i for off in range(0, in_dim, obs_dim) for i in range(off, off + 6)]  # private + public rank one-hots
+            self.register_buffer("card_idx", torch.tensor(cards))
+            self.register_buffer("bet_idx", torch.tensor([i for i in range(in_dim) if i not in set(cards)]))
+            self.card = nn.ModuleList([nn.Linear(len(cards), dim), nn.Linear(dim, dim), nn.Linear(dim, dim)])
+            self.bet = nn.ModuleList([nn.Linear(in_dim - len(cards), dim), nn.Linear(dim, dim)])
+            self.trunk = nn.ModuleList([nn.Linear(2 * dim, dim), nn.Linear(dim, dim), nn.Linear(dim, dim)])
+            self.head = nn.Linear(dim, num_actions)
+            nn.init.zeros_(self.head.weight)
+            nn.init.zeros_(self.head.bias)
+
+        def forward(self, x):
+            c = x.index_select(1, self.card_idx)
+            for layer in self.card:
+                c = torch.relu(layer(c))
+            b = x.index_select(1, self.bet_idx)
+            for layer in self.bet:
+                b = torch.relu(layer(b))
+            z = torch.relu(self.trunk[0](torch.cat([c, b], dim=1)))
+            z = torch.relu(self.trunk[1](z)) + z
+            z = torch.relu(self.trunk[2](z)) + z
+            z = (z - z.mean(dim=1, keepdim=True)) / (z.std(dim=1, keepdim=True) + 1e-5)
+            return self.head(z)
+
+    return _Net()

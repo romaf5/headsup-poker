@@ -55,3 +55,16 @@ def test_checkpoint_resume_continues_the_run(tmp_path):
 
     curve = json.load(open(tmp_path / "c.json"))["curve"]
     assert [c["iteration"] for c in curve] == [2, 4]
+
+
+def test_deepcfr_architecture_for_the_small_games():
+    import torch
+
+    g = make_game("leduc")
+    for in_dim in (g.obs_dim, 2 * g.obs_dim):  # one infostate / both players' (history nets)
+        m = g.make_model(arch="deepcfr", in_dim=in_dim)
+        out = m(torch.randn(7, in_dim))
+        assert out.shape == (7, g.num_actions) and torch.all(out == 0)  # zero-initialised head: uniform start
+    s = DeepSolver(make_game("kuhn"), "sdcfr", traversals=20, adv_steps=10, adv_batch=64, seed=0, model_kwargs={"arch": "deepcfr"})
+    s.iterate(2)
+    assert 0 <= s.evaluate()["average"] < 1
