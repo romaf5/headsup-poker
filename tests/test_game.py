@@ -151,6 +151,8 @@ def test_cpp_traversal_matches_python_multi_size(game):
         np.testing.assert_allclose(pa.target, out[2], atol=1e-4)
         np.testing.assert_allclose(ps.target, out[5], atol=1e-5)
         assert np.all(ps.target[ps.obs[:, 23] <= 0, 0] == 0)
+        assert out[7].shape == pa.target.shape and not out[7].all()  # masked-loss legal masks: some duplicate raises
+        np.testing.assert_array_equal(pa.legal, out[7])
 
 
 @pytest.mark.parametrize("game", [POT_GAME])

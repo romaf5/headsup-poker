@@ -11,6 +11,8 @@ costs 55 + 20 bytes instead of 144 (a 79-feature one 247 + 20).  ``sample`` retu
 observations exactly equal to the stored ones, on ``sample_device`` (defaults to the storage
 device; memories too big for the GPU can live in host RAM with ``device="cpu"`` and be sampled
 straight to the training device - see ``prefetch`` for overlapping that with the fit).
+With ``legal_dim`` the buffer also keeps each sample's legal-action mask (uint8; ``with_legal`` adds it to
+sampled batches) for fits whose loss covers the legal actions only.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -26,7 +28,8 @@ OBS_INT_MAX = torch.tensor([13, 4, 52] * 7 + [3, 1], dtype=torch.uint8)  # valid
 
 
 class ReservoirBuffer:
-    def __init__(self, capacity, device, obs_dim=OBS_DIM, target_dim=NUM_ACTIONS, seed=None, sample_device=None, int_dim=OBS_INT_DIM):
+    def __init__(self, capacity, device, obs_dim=OBS_DIM, target_dim=NUM_ACTIONS, seed=None, sample_device=None, int_dim=OBS_INT_DIM,
+                 legal_dim=0):
         self.capacity = int(capacity)
         self.device = torch.device(device)
         self.sample_device = torch.device(sample_device) if sample_device is not None else self.device
@@ -36,6 +39,7 @@ class ReservoirBuffer:
         self.obs_float = torch.zeros((self.capacity, self.obs_dim - self.int_dim), dtype=torch.float32, device=self.device)
         self.t = torch.zeros((self.capacity,), dtype=torch.float32, device=self.device)
         self.target = torch.zeros((self.capacity, target_dim), dtype=torch.float32, device=self.device)
+        self.legal = torch.ones((self.capacity, legal_dim), dtype=torch.uint8, device=self.device) if legal_dim else None
         self.size = 0
         self.seen = 0
         self.rng = np.random.default_rng(seed)
@@ -43,18 +47,21 @@ class ReservoirBuffer:
     def __len__(self):
         return self.size
 
-    def _write(self, rows, obs, t, target):
+    def _write(self, rows, obs, t, target, legal=None):
         rows = torch.as_tensor(rows, dtype=torch.long, device=self.device)
         obs = torch.as_tensor(obs, dtype=torch.float32)
         self.obs_int[rows] = obs[:, : self.int_dim].to(torch.uint8).to(self.device)
         self.obs_float[rows] = obs[:, self.int_dim :].to(self.device)
         self.t[rows] = torch.as_tensor(t, dtype=torch.float32).to(self.device)
         self.target[rows] = torch.as_tensor(target, dtype=torch.float32).to(self.device)
+        if self.legal is not None:
+            self.legal[rows] = 1 if legal is None else torch.as_tensor(legal, dtype=torch.uint8).to(self.device)
 
-    def add(self, obs, t, target):
+    def add(self, obs, t, target, legal=None):
         obs = np.asarray(obs, dtype=np.float32)
         t = np.asarray(t, dtype=np.float32).reshape(-1)
         target = np.asarray(target, dtype=np.float32)
+        legal = np.asarray(legal, dtype=np.uint8) if legal is not None else None
         n = len(t)
         if n == 0:
             return
@@ -64,7 +71,7 @@ class ReservoirBuffer:
         k = min(self.capacity - self.size, n)  # fills empty slots first
         if k > 0:
             rows = np.arange(self.size, self.size + k)
-            self._write(rows, obs[:k], t[:k], target[:k])
+            self._write(rows, obs[:k], t[:k], target[:k], None if legal is None else legal[:k])
             self.size += k
         if n > k:
             # item with 1-based global index m is kept with prob capacity / m at a uniform slot
@@ -74,22 +81,31 @@ class ReservoirBuffer:
             if keep.any():
                 slots = r[keep].astype(np.int64)
                 sel = np.flatnonzero(keep) + k
-                self._write(slots, obs[sel], t[sel], target[sel])
+                self._write(slots, obs[sel], t[sel], target[sel], None if legal is None else legal[sel])
         self.seen += n
 
-    def sample(self, batch_size, generator=None, staging=None):
+    def sample(self, batch_size, generator=None, staging=None, with_legal=False):
+        """(obs, t, target) float32 batches on the sample device; with ``with_legal`` also the float legal masks."""
+        if with_legal and self.legal is None:
+            raise ValueError("this buffer stores no legal masks (legal_dim=0)")
         if self.sample_device == self.device:
             idx = torch.randint(0, self.size, (batch_size,), device=self.device, generator=generator)
             obs = torch.cat([self.obs_int[idx].to(torch.float32), self.obs_float[idx]], dim=1)
+            if with_legal:
+                return obs, self.t[idx], self.target[idx], self.legal[idx].to(torch.float32)
             return obs, self.t[idx], self.target[idx]
         # host-resident storage: gather straight into pinned staging buffers, async copies to the
         # device, and the uint8 -> float32 conversion + concatenation happen there
         idx = torch.from_numpy(self.rng.integers(0, self.size, batch_size))
         parts = staging if staging is not None else self._staging(batch_size)
-        for src, dst in zip((self.obs_int, self.obs_float, self.t, self.target), parts):
+        srcs = (self.obs_int, self.obs_float, self.t, self.target) + ((self.legal,) if self.legal is not None else ())
+        for src, dst in zip(srcs, parts):
             torch.index_select(src, 0, idx, out=dst)
-        obs_int, obs_float, t, target = (x.to(self.sample_device, non_blocking=True) for x in parts)
-        return torch.cat([obs_int.to(torch.float32), obs_float], dim=1), t, target
+        obs_int, obs_float, t, target, *legal = (x.to(self.sample_device, non_blocking=True) for x in parts)
+        obs = torch.cat([obs_int.to(torch.float32), obs_float], dim=1)
+        if with_legal:
+            return obs, t, target, legal[0].to(torch.float32)
+        return obs, t, target
 
     def _staging(self, batch_size):
         """Host staging buffers for one batch (pinned when the device is CUDA; pageable if pinning
@@ -97,6 +113,8 @@ class ReservoirBuffer:
         pin = self.sample_device.type == "cuda" and not getattr(self, "_no_pin", False)
         shapes = ((batch_size, self.int_dim), (batch_size, self.obs_dim - self.int_dim), (batch_size,), (batch_size, self.target.shape[1]))
         dtypes = (torch.uint8, torch.float32, torch.float32, torch.float32)
+        if self.legal is not None:
+            shapes, dtypes = shapes + ((batch_size, self.legal.shape[1]),), dtypes + (torch.uint8,)
         try:
             return tuple(torch.empty(sh, dtype=dt, pin_memory=pin) for sh, dt in zip(shapes, dtypes))
         except RuntimeError as exc:  # pinned allocation failed
@@ -116,20 +134,20 @@ class ReservoirBuffer:
             cache[key] = [self._staging(batch_size) for _ in range(n_buf)]
         return cache[key]
 
-    def prefetch(self, batch_size, steps):
+    def prefetch(self, batch_size, steps, with_legal=False):
         """Iterate over ``steps`` batches; when the storage is not on the sample device the next
         batch is gathered in a background thread (into alternating pinned staging buffers) while
         the current one is being used."""
         if self.sample_device == self.device:
             for _ in range(steps):
-                yield self.sample(batch_size)
+                yield self.sample(batch_size, with_legal=with_legal)
             return
         n_buf = 3  # a staging buffer is reused only after its device copy has completed (CUDA event)
         staging = self._staging_set(batch_size, n_buf)
         cuda = self.sample_device.type == "cuda"
         events = [torch.cuda.Event() for _ in range(n_buf)] if cuda else [None] * n_buf
         with ThreadPoolExecutor(1) as pool:
-            fut = pool.submit(self.sample, batch_size, None, staging[0])
+            fut = pool.submit(self.sample, batch_size, None, staging[0], with_legal)
             for step in range(steps):
                 batch = fut.result()
                 k = step % n_buf
@@ -138,7 +156,7 @@ class ReservoirBuffer:
                 nxt = (step + 1) % n_buf
                 if cuda and step + 1 >= n_buf:
                     events[nxt].synchronize()  # the copy that read staging[nxt] n_buf - 1 steps ago is done
-                fut = pool.submit(self.sample, batch_size, None, staging[nxt])
+                fut = pool.submit(self.sample, batch_size, None, staging[nxt], with_legal)
                 yield batch
 
     @property
@@ -152,6 +170,7 @@ class ReservoirBuffer:
             "obs_float": self.obs_float[: self.size].cpu(),
             "t": self.t[: self.size].cpu(),
             "target": self.target[: self.size].cpu(),
+            **({"legal": self.legal[: self.size].cpu()} if self.legal is not None else {}),
             "capacity": self.capacity,
             "obs_dim": self.obs_dim,
             "size": self.size,
@@ -173,6 +192,8 @@ class ReservoirBuffer:
         self.obs_float[:size] = state["obs_float"].to(self.device)
         self.t[:size] = state["t"].to(self.device)
         self.target[:size] = state["target"].to(self.device)
+        if self.legal is not None:  # memories saved without masks count as all-legal
+            self.legal[:size] = state["legal"].to(self.device) if "legal" in state else 1
         self.size = size
         self.seen = int(state["seen"])
 

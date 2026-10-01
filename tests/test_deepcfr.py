@@ -140,6 +140,8 @@ def test_cpp_traversal_matches_python_reference(config):
         np.testing.assert_array_equal(pa.obs, out[0])
         np.testing.assert_allclose(pa.target, out[2], atol=1e-4)
         np.testing.assert_allclose(ps.target, out[5], atol=1e-5)
+        np.testing.assert_array_equal(pa.legal, out[7])
+        np.testing.assert_array_equal(out[7][:, 0], pa.obs[:, 23] > 0)  # fold is legal exactly when facing a bet
 
 
 def test_train_advantage_and_policy_smoke():
@@ -183,6 +185,8 @@ def test_cpp_dream_sampler_matches_python_reference():
         np.testing.assert_array_equal(pa.obs, out[0])
         np.testing.assert_allclose(pa.t, np.ravel(out[1]), rtol=1e-5)  # t / own sample reach (= t: xi one-hot along the path)
         np.testing.assert_allclose(pa.target, out[2], atol=1e-3)
+        np.testing.assert_array_equal(pa.legal, out[7])
+        assert not np.any(out[2][~out[7]])  # DREAM: illegal actions' regret targets are 0
         np.testing.assert_array_equal(pv.obs, out[3])
         np.testing.assert_array_equal(pv.t, np.ravel(out[4]))  # the action taken at each history
         np.testing.assert_allclose(pv.target, out[5], atol=1e-3)
@@ -225,7 +229,8 @@ def test_cpp_escher_samplers():
         # regrets at the update player's (seat 1) infosets, average-policy rows at the opponent's (seat 0)
         assert np.all(adv.obs[:, 22] == 1.0) and np.all(strat.obs[:, 22] == 0.0)
         q = -NumpyModel(vw)(hist.obs)  # player 1's values
-        legal = adv.target != 0  # (illegal / duplicate actions have target 0; so may a legal one, rarely)
+        legal = adv.legal
+        assert legal.shape == adv.target.shape and not np.any(adv.target[~legal])
         v = hist.target[:, 0]
         expected = np.where(legal, q - v[:, None], 0.0)
         np.testing.assert_allclose(adv.target[legal], expected[legal], atol=1e-3)
@@ -250,3 +255,73 @@ def test_advantage_fit_scales_large_targets():
     with torch.no_grad():
         np.testing.assert_allclose(scaled(obs).mean(0).numpy(), [300.0, -300.0, 0.0, 0.0], atol=30.0)
         assert raw(obs)[:, 0].mean().item() < 150.0
+
+
+def _bits(i, width=4):
+    return (np.asarray(i)[:, None] >> np.arange(width)) & 1
+
+
+def test_reservoir_keeps_legal_masks_with_their_rows(tmp_path):
+    """Legal masks follow their samples through reservoir replacement, sampling (also via host staging) and save / load."""
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    buf = ReservoirBuffer(300, "cpu", obs_dim=31, legal_dim=4, seed=0, sample_device=dev)
+    for chunk in range(5):
+        i = np.arange(chunk * 200, (chunk + 1) * 200)
+        buf.add(np.zeros((200, 31), np.float32), i.astype(np.float32), np.zeros((200, 4), np.float32), _bits(i % 16))
+    assert len(buf) == 300 and buf.seen == 1000 and buf.t.max() >= 300  # rows were replaced
+    np.testing.assert_array_equal(buf.legal.numpy(), _bits(buf.t.long().numpy() % 16))
+    for obs, t, target, legal in buf.prefetch(64, 3, with_legal=True):
+        np.testing.assert_array_equal(legal.cpu().numpy(), _bits(t.long().cpu().numpy() % 16))
+    assert len(buf.sample(8)) == 3  # without with_legal: the usual triple
+    buf.save(tmp_path / "buf.pt")
+    other = ReservoirBuffer(300, "cpu", obs_dim=31, legal_dim=4).load(tmp_path / "buf.pt")
+    assert torch.equal(other.legal, buf.legal)
+    plain = ReservoirBuffer(300, "cpu", obs_dim=31, seed=0)
+    plain.add(np.zeros((50, 31), np.float32), np.ones(50, np.float32), np.zeros((50, 4), np.float32))
+    plain.save(tmp_path / "plain.pt")
+    old = ReservoirBuffer(300, "cpu", obs_dim=31, legal_dim=4).load(tmp_path / "plain.pt")  # saved without masks: all legal
+    assert old.legal[:50].all()
+    with pytest.raises(ValueError):
+        plain.sample(4, with_legal=True)
+
+
+def test_masked_advantage_fit_ignores_illegal_targets():
+    """With the masked loss the targets of illegal actions do not influence the fit at all."""
+    from headsup.deepcfr.train import train_advantage_net
+
+    rng = np.random.default_rng(0)
+    obs = rng.random((500, 31), dtype=np.float32)
+    obs[:, :23] = rng.integers(0, 3, (500, 23))
+    t = rng.integers(1, 10, 500).astype(np.float32)
+    target = rng.normal(size=(500, 4)).astype(np.float32)
+    legal = rng.random((500, 4)) < 0.7
+    legal[:, 1] = True
+    garbage = np.where(legal, target, 1000.0).astype(np.float32)
+    fits = {}
+    for name, tg in (("clean", target), ("garbage", garbage)):
+        for masked in (True, False):
+            buf = ReservoirBuffer(1000, "cpu", obs_dim=31, legal_dim=4, seed=0)
+            buf.add(obs, t, tg, legal)
+            torch.manual_seed(0)
+            net, _ = train_advantage_net(buf, "cpu", steps=20, batch_size=64, compile=False, masked=masked)
+            fits[name, masked] = net(torch.as_tensor(obs)).detach()
+    torch.testing.assert_close(fits["clean", True], fits["garbage", True])
+    assert not torch.allclose(fits["clean", False], fits["garbage", False])
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_trainer_masked_loss_fhp_stores_masks_and_resumes(tmp_path):
+    from headsup.deepcfr.train import main as train_main
+
+    common = ["--workers", "2", "--device", "cpu", "--no-compile", "--traversals", "30", "--value-steps", "3", "--batch-size", "64",
+              "--eval-hands", "0", "--eval-every", "0", "--policy-eval-every", "0", "--lbr-every", "0", "--lbr-final-hands", "0",
+              "--no-tensorboard", "--checkpoint-every", "1", "--out", str(tmp_path)]
+    train_main(["--game", "fhp", "--algo", "sdcfr", "--masked-loss", "--features", "history", "--net", "paper",
+                "--adv-capacity", "20000", "--iterations", "2"] + common)
+    state = torch.load(tmp_path / "checkpoint.pt", map_location="cpu", weights_only=True)
+    assert state["args"]["masked_loss"]
+    legal = state["adv_memory"][0]["legal"]
+    assert legal.shape[1] == 3 and legal[:, 1].all() and not legal[:, 0].all()  # call always legal, fold only facing a bet
+    train_main(["--resume", str(tmp_path / "checkpoint.pt"), "--iterations", "3"] + common)
+    state = torch.load(tmp_path / "checkpoint.pt", map_location="cpu", weights_only=True)
+    assert state["iteration"] == 3 and len(state["adv_memory"][1]["legal"]) == len(state["adv_memory"][1]["t"])

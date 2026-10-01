@@ -50,6 +50,7 @@ class Samples:
     obs: np.ndarray
     t: np.ndarray
     target: np.ndarray
+    legal: np.ndarray | None = None  # advantage samples: bool[N, num_actions] legal-action masks
 
     def __len__(self):
         return len(self.t)
@@ -69,18 +70,21 @@ class Samples:
             np.concatenate([s.obs for s in items]),
             np.concatenate([s.t for s in items]),
             np.concatenate([s.target for s in items]),
+            np.concatenate([s.legal for s in items]) if all(s.legal is not None for s in items) else None,
         )
 
 
 class _Memory:
     def __init__(self, obs_dim=OBS_DIM, num_actions=DEFAULT_GAME.num_actions):
         self.obs_dim, self.num_actions = obs_dim, num_actions
-        self.obs, self.t, self.target = [], [], []
+        self.obs, self.t, self.target, self.legal = [], [], [], []
 
-    def add(self, obs, t, target):
+    def add(self, obs, t, target, legal=None):
         self.obs.append(obs[: self.obs_dim])
         self.t.append(t)
         self.target.append(target)
+        if legal is not None:
+            self.legal.append(np.asarray(legal, dtype=bool))
 
     def to_samples(self):
         if not self.t:
@@ -89,6 +93,7 @@ class _Memory:
             np.stack(self.obs).astype(np.float32),
             np.asarray(self.t, dtype=np.float32),
             np.stack(self.target).astype(np.float32),
+            np.stack(self.legal) if len(self.legal) == len(self.t) else None,
         )
 
 
@@ -115,7 +120,7 @@ def traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats=None):
             if not legal[a]:
                 values[a] = values[twin[a]]
         mean = float(np.dot(sigma, values))
-        adv_mem.add(obs, t, values - mean)
+        adv_mem.add(obs, t, values - mean, legal)
         return mean
     strat_mem.add(obs, t, sigma)
     a = int(np.searchsorted(np.cumsum(sigma), rng.random(), side="right"))
@@ -158,7 +163,7 @@ def dream_trajectory(engine, traverser, nets, baseline, t, epsilon, rng, own_rea
     va[a] = b[a] + (v_child - b[a]) / max(xi[a], 1e-12)
     v = float(np.dot(sigma, va))
     if p == traverser:
-        adv_mem.add(obs, t / max(own_reach, 1e-12), np.where(legal, va - v, 0.0))
+        adv_mem.add(obs, t / max(own_reach, 1e-12), np.where(legal, va - v, 0.0), legal)
     if child.done:
         q_target = float(child.rewards[traverser])
     else:
@@ -257,7 +262,7 @@ class TraversalRunner:
                 for k, s in zip(chunks, seeds)
             ]
             outs = [f.result() for f in futs]
-            adv = Samples.concat([Samples(o[0], o[1], o[2]) for o in outs])
+            adv = Samples.concat([Samples(o[0], o[1], o[2], o[7]) for o in outs])
             strat = Samples.concat([Samples(o[3], o[4], o[5]) for o in outs])
             nodes = sum(o[6] for o in outs)
         else:
@@ -293,7 +298,7 @@ class TraversalRunner:
         nets = self._cpp_models(weights[0], weights[1], baseline_weights)
         outs = self._fan_out(lambda k, s: self._cpp.run_dream(nets[0], nets[1], nets[2], traverser, k, float(t), float(epsilon), s, self._cfg),
                              n_traversals, seed)
-        return (Samples.concat([Samples(o[0], o[1], o[2]) for o in outs]), Samples.concat([Samples(o[3], o[4], o[5]) for o in outs]),
+        return (Samples.concat([Samples(o[0], o[1], o[2], o[7]) for o in outs]), Samples.concat([Samples(o[3], o[4], o[5]) for o in outs]),
                 sum(o[6] for o in outs))
 
     def collect_escher_values(self, weights, n_trajectories, seed, value_epsilon=0.01):
@@ -312,5 +317,5 @@ class TraversalRunner:
         nets = self._cpp_models(weights[0], weights[1], value_weights)
         outs = self._fan_out(lambda k, s: self._cpp.run_escher_regrets(nets[0], nets[1], nets[2], traverser, k, float(t), s, self._cfg),
                              n_trajectories, seed)
-        return (Samples.concat([Samples(o[0], o[1], o[2]) for o in outs]), Samples.concat([Samples(o[3], o[4], o[5]) for o in outs]),
+        return (Samples.concat([Samples(o[0], o[1], o[2], o[10]) for o in outs]), Samples.concat([Samples(o[3], o[4], o[5]) for o in outs]),
                 Samples.concat([Samples(o[6], o[7], o[8]) for o in outs]), sum(o[9] for o in outs))

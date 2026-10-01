@@ -59,9 +59,9 @@ def maybe_compile(model, enabled=True):
         return model
 
 
-def _run_step(fwd, model, opt, obs, t, target, loss_fn, grad_clip):
+def _run_step(fwd, model, opt, obs, t, target, loss_fn, grad_clip, legal=None):
     pred = fwd(obs)
-    loss = loss_fn(pred, t, target)
+    loss = loss_fn(pred, t, target) if legal is None else loss_fn(pred, t, target, legal)
     opt.zero_grad(set_to_none=True)
     loss.backward()
     if grad_clip:
@@ -74,8 +74,11 @@ def _weighted_mse(pred, t, target):
     return (t[:, None] * (pred - target).pow(2)).mean()
 
 
-def _power_weighted_mse(power):
-    """Sample weight t^power instead of t (linear CFR); DCFR uses alpha = 1.5 for regrets."""
+def _power_weighted_mse(power, masked=False):
+    """Sample weight t^power instead of t (linear CFR); DCFR uses alpha = 1.5 for regrets.  ``masked``: the loss
+    takes a 4th argument, the legal masks, and covers the legal actions only."""
+    if masked:
+        return lambda pred, t, target, legal: (t.pow(power)[:, None] * legal * (pred - target).pow(2)).mean()
     if power == 1.0:
         return _weighted_mse
     return lambda pred, t, target: (t.pow(power)[:, None] * (pred - target).pow(2)).mean()
@@ -83,7 +86,7 @@ def _power_weighted_mse(power):
 
 def train_advantage_net(
     buffer, device, steps, batch_size, lr=1e-3, grad_clip=1.0, log=None, tag="", compile=True, log_step_offset=0, log_every=100,
-    model_config=None, weight_power=1.0, target_scale="auto",
+    model_config=None, weight_power=1.0, target_scale="auto", masked=False,
 ):
     """Fresh network fitted to (obs -> regrets) with iteration-weighted MSE (weight t^weight_power).
 
@@ -94,14 +97,19 @@ def train_advantage_net(
     does); regret matching is scale-free, so only the fit quality changes.  ``"auto"`` = the RMS of
     the memory's targets, ``None`` / 1 = raw chips.
 
+    ``masked``: the loss covers each sample's legal actions only (the buffer's legal masks).  Otherwise the
+    outputs of illegal actions are fitted to their twins' regrets (fold = check when nothing is to be called),
+    which the network never uses; the SD-CFR / DREAM / ESCHER authors' networks multiply them by 0.
+
     Returns ``(model, final_loss)`` (the loss in scaled units).  Per-step losses are logged at
     ``log_step_offset + step`` so successive fits form one continuous curve in TensorBoard.
     """
     if target_scale == "auto":
         target_scale = 1.0
         if len(buffer):
-            _, _, sample = buffer.sample(min(65536, len(buffer)))
-            target_scale = max(float(sample.pow(2).mean().sqrt()), 1e-6)
+            _, _, sample, *legal = buffer.sample(min(65536, len(buffer)), with_legal=masked)
+            sq = sample.pow(2) * legal[0] if masked else sample.pow(2)
+            target_scale = max(float((sq.sum() / (legal[0].sum() if masked else sq.numel())).sqrt()), 1e-6)
     scale = float(target_scale or 1.0)
     model = BaseModel(config=model_config).to(device)
     if len(buffer) == 0:  # no samples yet (e.g. the opponent folds every hand before this seat acts): uniform net
@@ -109,19 +117,20 @@ def train_advantage_net(
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     model.train()
     fwd = maybe_compile(model, compile)
-    loss_fn = _power_weighted_mse(weight_power)
+    loss_fn = _power_weighted_mse(weight_power, masked)
     loss = None
-    for step, (obs, t, target) in enumerate(buffer.prefetch(batch_size, steps)):
+    for step, (obs, t, target, *legal) in enumerate(buffer.prefetch(batch_size, steps, with_legal=masked)):
+        legal = legal[0] if legal else None
         if scale != 1.0:
             target = target / scale
         try:
-            loss = _run_step(fwd, model, opt, obs, t, target, loss_fn, grad_clip)
+            loss = _run_step(fwd, model, opt, obs, t, target, loss_fn, grad_clip, legal)
         except Exception as exc:
             if fwd is model:
                 raise
             print(f"compiled step failed ({type(exc).__name__}); falling back to eager")
             fwd = model
-            loss = _run_step(fwd, model, opt, obs, t, target, loss_fn, grad_clip)
+            loss = _run_step(fwd, model, opt, obs, t, target, loss_fn, grad_clip, legal)
         if log is not None and step % log_every == 0:
             log(f"advantage{tag}/loss", loss.item(), log_step_offset + step)
     model.eval()
@@ -221,8 +230,10 @@ class DeepCFRTrainer:
         self.nets = [BaseModel(config=self.model_config).to(self.device).eval() for _ in range(2)]
         obs_dim, num_actions = self.nets[0].obs_dim, self.nets[0].num_actions
         mem_dev = torch.device(args.memory_device) if args.memory_device else self.device
+        self.masked_loss = bool(getattr(args, "masked_loss", False))
         self.adv_memory = [
-            ReservoirBuffer(args.adv_capacity, mem_dev, obs_dim=obs_dim, target_dim=num_actions, seed=args.seed + i, sample_device=self.device)
+            ReservoirBuffer(args.adv_capacity, mem_dev, obs_dim=obs_dim, target_dim=num_actions, seed=args.seed + i, sample_device=self.device,
+                            legal_dim=num_actions if self.masked_loss else 0)
             for i in range(2)
         ]
         self.strat_memory = (
@@ -412,7 +423,9 @@ class DeepCFRTrainer:
             t0 = time.perf_counter()
             adv, strat, nodes = self._sample_seat(seat, weights, t)
             t_trav = time.perf_counter() - t0
-            self.adv_memory[seat].add(adv.obs, adv.t, adv.target)
+            if self.masked_loss and len(adv) and adv.legal is None:
+                raise RuntimeError("--masked-loss: the traversal returned no legal masks")
+            self.adv_memory[seat].add(adv.obs, adv.t, adv.target, adv.legal if self.masked_loss else None)
             if self.strat_memory is not None and strat is not None:
                 self.strat_memory.add(strat.obs, strat.t, strat.target)
 
@@ -430,6 +443,7 @@ class DeepCFRTrainer:
                 model_config=self.model_config,
                 weight_power=a.regret_power,
                 target_scale=None if a.target_scale == "none" else ("auto" if a.target_scale == "auto" else float(a.target_scale)),
+                masked=self.masked_loss,
             )
             weights[seat] = self.nets[seat].numpy_weights()
             if self.iterates is not None:
@@ -669,6 +683,8 @@ def build_parser():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--target-scale", default="auto",
                    help="advantage-net fits: divide the regrets by this (auto = their RMS) and scale the output layer back; 'none' = raw chips")
+    p.add_argument("--masked-loss", action="store_true",
+                   help="advantage-net loss on legal actions only (the SD-CFR / DREAM / ESCHER authors' nets zero illegal outputs)")
     p.add_argument("--regret-power", type=float, default=1.0,
                    help="advantage samples of iteration t weigh t^power in the fit (1 = linear CFR; DCFR-style alpha = 1.5)")
     p.add_argument("--strategy-power", type=float, default=1.0,
@@ -732,7 +748,7 @@ def resolve_args(args):
 RESUME_INHERITED = ("algo", "traversals", "adv_capacity", "strat_capacity", "value_steps", "batch_size", "policy_epochs",
                     "policy_steps", "policy_batch_size", "regret_power", "strategy_power", "epsilon", "q_steps", "q_batch",
                     "q_capacity", "value_trajectories", "eval_hands", "eval_every", "policy_eval_every", "lbr_every", "lbr_hands",
-                    "lbr_final_hands", "lbr_tables", "lbr_model_iterates", "seed", "lr", "target_scale", "value_epsilon")
+                    "lbr_final_hands", "lbr_tables", "lbr_model_iterates", "seed", "lr", "target_scale", "value_epsilon", "masked_loss")
 
 
 def main(argv=None):

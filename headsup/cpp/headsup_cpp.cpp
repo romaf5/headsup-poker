@@ -647,10 +647,13 @@ struct Memory {
   int obs_dim = OBS_DIM;  // width stored per sample (= the networks' input width)
   int num_actions = 4;
   std::vector<float> obs, t, target;
-  void add(const float* o, float tt, const float* tg) {
+  std::vector<uint8_t> legal;  // advantage samples: the legal-action mask (for fits on legal actions only)
+  void add(const float* o, float tt, const float* tg, const bool* lg = nullptr) {
     obs.insert(obs.end(), o, o + obs_dim);
     t.push_back(tt);
     target.insert(target.end(), tg, tg + num_actions);
+    if (lg)
+      for (int a = 0; a < num_actions; ++a) legal.push_back(lg[a] ? 1 : 0);
   }
   size_t size() const { return t.size(); }
 };
@@ -692,7 +695,7 @@ struct Traverser {
       float mean = 0.0f;
       for (int a = 0; a < n; ++a) mean += sigma[a] * va[a];
       for (int a = 0; a < n; ++a) va[a] -= mean;
-      adv.add(obs, t, va);
+      adv.add(obs, t, va, legal);
       return mean;
     }
     strat.add(obs, t, sigma);
@@ -707,6 +710,12 @@ py::array_t<float> to_array(std::vector<float>& v, ssize_t rows, ssize_t cols) {
   if (cols == 1)
     return py::array_t<float>({rows}, {sizeof(float)}, holder->data(), free_when_done);
   return py::array_t<float>({rows, cols}, {sizeof(float) * cols, sizeof(float)}, holder->data(), free_when_done);
+}
+
+py::array_t<bool> to_bool_array(std::vector<uint8_t>& v, ssize_t rows, ssize_t cols) {
+  py::array_t<bool> out({rows, cols});
+  std::copy(v.begin(), v.end(), reinterpret_cast<uint8_t*>(out.mutable_data()));
+  return out;
 }
 
 py::tuple run_traversals(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, int traverser, int n_traversals,
@@ -747,7 +756,8 @@ py::tuple run_traversals(std::shared_ptr<Model> net0, std::shared_ptr<Model> net
   const ssize_t od = tr.adv.obs_dim, nact = cfg.num_actions();
   return py::make_tuple(to_array(tr.adv.obs, na, od), to_array(tr.adv.t, na, 1),
                         to_array(tr.adv.target, na, nact), to_array(tr.strat.obs, ns, od),
-                        to_array(tr.strat.t, ns, 1), to_array(tr.strat.target, ns, nact), tr.nodes);
+                        to_array(tr.strat.t, ns, 1), to_array(tr.strat.target, ns, nact), tr.nodes,
+                        to_bool_array(tr.adv.legal, na, nact));
 }
 
 
@@ -819,7 +829,7 @@ struct TrajectorySampler {
     if (p == traverser) {
       float target[MAX_ACTIONS];
       for (int k = 0; k < n; ++k) target[k] = legal[k] ? va[k] - v : 0.0f;
-      adv.add(obs, float(t / std::max(own_reach, 1e-12)), target);
+      adv.add(obs, float(t / std::max(own_reach, 1e-12)), target, legal);
     }
     // expected-SARSA target for Q_traverser(h, a)
     float q_target;
@@ -890,7 +900,7 @@ struct TrajectorySampler {
         float v = 0.0f;
         for (int k = 0; k < n; ++k) v += legal[k] ? sigma[k] * sign * q[k] : 0.0f;
         for (int k = 0; k < n; ++k) target[k] = legal[k] ? sign * q[k] - v : 0.0f;
-        adv.add(obs, t, target);
+        adv.add(obs, t, target, legal);
         float row[MAX_ACTIONS] = {};
         row[0] = v;
         val.add(hist, -1.0f, row);  // the histories seen by the update player (tests / diagnostics)
@@ -940,7 +950,8 @@ py::tuple run_dream(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, st
   }
   const ssize_t na = ssize_t(ts.adv.size()), nv = ssize_t(ts.val.size()), nact = cfg.num_actions();
   return py::make_tuple(to_array(ts.adv.obs, na, ts.adv.obs_dim), to_array(ts.adv.t, na, 1), to_array(ts.adv.target, na, nact),
-                        to_array(ts.val.obs, nv, OBS_DIM_WITH_OPP), to_array(ts.val.t, nv, 1), to_array(ts.val.target, nv, nact), ts.nodes);
+                        to_array(ts.val.obs, nv, OBS_DIM_WITH_OPP), to_array(ts.val.t, nv, 1), to_array(ts.val.target, nv, nact), ts.nodes,
+                        to_bool_array(ts.adv.legal, na, nact));
 }
 
 py::tuple run_escher_values(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, int n_trajectories, uint64_t seed, EngineConfig cfg,
@@ -984,7 +995,8 @@ py::tuple run_escher_regrets(std::shared_ptr<Model> net0, std::shared_ptr<Model>
   const ssize_t na = ssize_t(ts.adv.size()), ns = ssize_t(ts.strat.size()), nv = ssize_t(ts.val.size()), nact = cfg.num_actions();
   return py::make_tuple(to_array(ts.adv.obs, na, ts.adv.obs_dim), to_array(ts.adv.t, na, 1), to_array(ts.adv.target, na, nact),
                         to_array(ts.strat.obs, ns, ts.strat.obs_dim), to_array(ts.strat.t, ns, 1), to_array(ts.strat.target, ns, nact),
-                        to_array(ts.val.obs, nv, OBS_DIM_WITH_OPP), to_array(ts.val.t, nv, 1), to_array(ts.val.target, nv, nact), ts.nodes);
+                        to_array(ts.val.obs, nv, OBS_DIM_WITH_OPP), to_array(ts.val.t, nv, 1), to_array(ts.val.target, nv, nact), ts.nodes,
+                        to_bool_array(ts.adv.legal, na, nact));
 }
 
 // ------------------------------------------------------------------ vectorised env
