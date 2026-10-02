@@ -221,7 +221,7 @@ class DeepSolver:
                  adv_steps=3000, adv_batch=2048, policy_steps=4000, policy_batch=2048, q_steps=1000, q_batch=512,
                  q_capacity=200_000, value_traversals=None, epsilon=0.5, value_epsilon=0.01, lr=1e-3, device="cpu", seed=0,
                  model_kwargs=None, rm_argmax=True, warm_start=False, normalized_weights=False, grad_clip=1.0, mean_regret=False,
-                 masked_loss=False):
+                 masked_loss=False, shared_baseline=False, bootstrap_chance=False):
         assert algo in ALGOS
         self.game, self.algo = game, algo
         self.traversals = traversals
@@ -253,10 +253,16 @@ class DeepSolver:
         # the average-strategy memory is only needed where a policy net is fitted (SD-CFR / DREAM average the iterates)
         self.strat_memory = ReservoirBuffer(strat_capacity if algo in ("deepcfr", "escher") else 1, self.device, obs_dim=D, target_dim=A,
                                             seed=seed + 2, int_dim=0)
-        if algo == "dream":  # baseline Q_i(s*(h), a) per player, expected-SARSA targets
-            self.q_nets = [self._new_model(2 * D) for _ in range(2)]
+        # DREAM's baseline: Q_i(s*(h), a) per player, expected-SARSA targets; with ``shared_baseline`` one net of player 0's
+        # values (negated for player 1) trained once per iteration on both traversers' data (the DREAM authors' code);
+        # with ``bootstrap_chance`` the target of a transition followed by a deal bootstraps from the baseline after the
+        # sampled deal (their env deals inside step) instead of using the sampled, importance-weighted continuation
+        self.shared_baseline, self.bootstrap_chance = shared_baseline, bootstrap_chance
+        if algo == "dream":
+            n_q = 1 if shared_baseline else 2
+            self.q_nets = [self._new_model(2 * D) for _ in range(n_q)]
             self.q_opts = [_adam(n, lr) for n in self.q_nets]
-            self.q_memory = [CircularBuffer(q_capacity, 2 * D, A) for _ in range(2)]
+            self.q_memory = [CircularBuffer(q_capacity, 2 * D, A) for _ in range(n_q)]
         if algo == "escher":  # history value q(h, a): player 0's expected return per action
             self.v_net = self._new_model(2 * D)
         self.iteration = 0
@@ -367,9 +373,11 @@ class DeepSolver:
 
     # -- outcome sampling with baselines (DREAM) --------------------------------------------------
     def _q(self, p, state):
-        if self._q_tab[p] is None:
-            self._refresh_q(p)
-        return self._q_tab[p][state.history_key()]
+        i = 0 if self.shared_baseline else p
+        if self._q_tab[i] is None:
+            self._refresh_q(i)
+        q = self._q_tab[i][state.history_key()]
+        return -q if self.shared_baseline and p == 1 else q
 
     def _os_dream(self, state, p, t, own_sample_reach, adv, q_data):
         """Returns the baseline-corrected sampled value of ``state`` for player p (DREAM eq. 6-7)."""
@@ -389,6 +397,9 @@ class DeepSolver:
         hist = self._history(state)
         b = self._q(p, state)  # baseline for every action of the actor at h
         child = state.child(a)
+        while self.bootstrap_chance and child.is_chance():  # the deal belongs to this transition (counted as before)
+            self.nodes_touched += 1
+            child = child.child(child.sample_chance(self.rng))
         v_child = self._os_dream(child, p, t, own_sample_reach * (xi[a] if cur == p else 1.0), adv, q_data)
         va = np.where(legal, b, 0.0)
         va[a] = b[a] + (v_child - b[a]) / xi[a]
@@ -406,7 +417,7 @@ class DeepSolver:
         row_mask = np.zeros(self.game.num_actions, np.float32)
         row_mask[a] = 1.0
         row_target = np.zeros(self.game.num_actions, np.float32)
-        row_target[a] = target
+        row_target[a] = -target if self.shared_baseline and p == 1 else target  # shared: player 0's values
         q_data.append((hist, row_target, row_mask))
         return v
 
@@ -490,7 +501,9 @@ class DeepSolver:
                     self.adv_memory[p].add(np.stack([a[0] for a in adv]), np.array([a[1] for a in adv], np.float32), np.stack([a[2] for a in adv]))
                 if strat and self.algo in ("deepcfr", "escher"):
                     self.strat_memory.add(np.stack([s[0] for s in strat]), np.array([s[1] for s in strat], np.float32), np.stack([s[2] for s in strat]))
-                if self.algo == "dream" and q_data:
+                if self.algo == "dream" and q_data and self.shared_baseline:
+                    self.q_memory[0].add(*(np.stack([d[i] for d in q_data]).astype(np.float32) for i in range(3)))
+                elif self.algo == "dream" and q_data:
                     self.q_memory[p].add(*(np.stack([d[i] for d in q_data]).astype(np.float32) for i in range(3)))
                     xs, tgs, mks = self.q_memory[p].sample(min(self.q_memory[p].size, 200_000), self.rng)
                     self.q_nets[p].train()
@@ -506,6 +519,12 @@ class DeepSolver:
                                                 legal_fn=self._legal_fn)
                 self.iterates[p].append(self._cpu_state(self.nets[p]))
                 self._sigma_tab[p] = None
+            if self.algo == "dream" and self.shared_baseline and self.q_memory[0].size:  # once, after both players
+                xs, tgs, mks = self.q_memory[0].sample(min(self.q_memory[0].size, 200_000), self.rng)
+                self.q_nets[0].train()
+                _fit(self.q_nets[0], self.q_opts[0], xs, tgs, np.ones(len(xs), np.float32), self.q_steps, self.q_batch, self.device, masks=mks)
+                self.q_nets[0].eval()
+                self._q_tab[0] = None
             self.stats = {"iteration": self.iteration, "seconds": time.perf_counter() - t0, "adv_samples": [len(m) for m in self.adv_memory],
                           "strat_samples": len(self.strat_memory), "nodes_touched": self.nodes_touched}
         return self
@@ -635,6 +654,10 @@ def main(argv=None):
     p.add_argument("--loss-weights", default="raw", choices=["raw", "normalized"], help="t, or t / t_latest (SD-CFR authors' code)")
     p.add_argument("--grad-clip", type=float, default=1.0, help="gradient-norm clipping (Deep CFR paper 1; SD-CFR authors' code 10)")
     p.add_argument("--mean-regret", action="store_true", help="divide sampled regrets by the number of legal actions (SD-CFR authors' sampler)")
+    p.add_argument("--shared-baseline", action="store_true",
+                   help="DREAM: one baseline net (player 0's values) trained once per iteration on both traversers' data (authors' code)")
+    p.add_argument("--bootstrap-chance", action="store_true",
+                   help="DREAM: expected-SARSA targets bootstrap from the baseline after a sampled deal (authors' code)")
     p.add_argument("--masked-loss", action="store_true", help="advantage loss on legal actions only (what masked network outputs do)")
     p.add_argument("--rm-fallback", default="argmax", choices=["argmax", "uniform"],
                    help="regret matching without a positive advantage: the best action (Deep CFR / DREAM / ESCHER) or uniform")
@@ -652,7 +675,7 @@ def main(argv=None):
                         adv_capacity=args.adv_capacity, strat_capacity=args.strat_capacity,
                         model_kwargs={"arch": args.arch} if args.arch != "mlp" else None,
                         normalized_weights=args.loss_weights == "normalized", grad_clip=args.grad_clip, mean_regret=args.mean_regret,
-                        masked_loss=args.masked_loss)
+                        masked_loss=args.masked_loss, shared_baseline=args.shared_baseline, bootstrap_chance=args.bootstrap_chance)
     curve, elapsed = [], 0.0
     if args.checkpoint and os.path.exists(args.checkpoint):
         saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)

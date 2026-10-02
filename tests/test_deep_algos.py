@@ -152,3 +152,45 @@ def test_legal_mask_from_history_matches_the_game():
         legal = torch.as_tensor(np.stack(masks))
         with torch.no_grad():
             assert torch.all(m(x)[~legal] == 0)
+
+
+def test_dream_bootstrap_chance_only_changes_the_baseline_targets():
+    """Same seed, same nets: the deal is sampled in the same order, so trajectories, regrets and node counts are identical;
+    only the expected-SARSA targets of transitions into a deal change (bootstrapped after the deal instead of sampled)."""
+    import numpy as np
+
+    g = make_game("leduc")
+    out = {}
+    for flag in (False, True):
+        s = DeepSolver(g, "dream", traversals=50, adv_steps=5, q_steps=5, seed=0, bootstrap_chance=flag)
+        s.rng = np.random.default_rng(7)
+        adv, q = [], []
+        for _ in range(200):
+            s._os_dream(g.new_initial_state(), 0, 1, 1.0, adv, q)
+        out[flag] = (adv, q, s.nodes_touched)
+    (a0, q0, n0), (a1, q1, n1) = out[False], out[True]
+    assert n0 == n1 and len(a0) == len(a1) and len(q0) == len(q1)
+    for x, y in zip(a0, a1):
+        np.testing.assert_array_equal(x[2], y[2])
+    changed = sum(not np.array_equal(x[1], y[1]) for x, y in zip(q0, q1))
+    assert 0 < changed < len(q0)  # only the round-1 transitions that end the round
+
+
+def test_dream_shared_baseline_is_zero_sum_and_resumes(tmp_path):
+    import numpy as np
+    import torch
+
+    g = make_game("leduc")
+    s = DeepSolver(g, "dream", traversals=30, adv_steps=5, q_steps=20, seed=0, shared_baseline=True, bootstrap_chance=True)
+    s.iterate()
+    assert len(s.q_nets) == 1 and s.q_memory[0].size > 0
+    state = g.new_initial_state()
+    while state.is_chance():
+        state = state.child(state.sample_chance(np.random.default_rng(0)))
+    np.testing.assert_allclose(s._q(1, state), -s._q(0, state))
+    torch.save(s.state_dict(), tmp_path / "ck.pt")
+    t = DeepSolver(g, "dream", traversals=30, adv_steps=5, q_steps=20, seed=0, shared_baseline=True, bootstrap_chance=True)
+    t.load_state_dict(torch.load(tmp_path / "ck.pt", weights_only=False))
+    np.testing.assert_allclose(t._q(0, state), s._q(0, state))
+    t.iterate()
+    assert t.iteration == 2
