@@ -1,17 +1,18 @@
 """Leduc reproduction tables: our deep CFR curves next to the papers' published ones.
 
-Reads the logs (or ``--json`` curves) written by ``headsup.algos.deep`` into one directory, named
-``<protocol>_<algo>_s<seed>.log``: ``sdcfrp`` = the SD-CFR paper's Leduc setup (x-axis: iterations),
-``dreamp`` = the DREAM paper's (x-axis: nodes touched).  Values are the exploitability of the
-average strategy in milli-antes per game (mean over the two seats, the unit of both papers' Leduc
-plots), mean ± sd over seeds.
+    python -m headsup.algos.leduc_report                     # the runs of runs/scripts/leduc_v*.sh (README "Results")
+    python -m headsup.algos.leduc_report --row "dreamp,dream,DREAM (mine),runs/x/dream_s*.json"
 
-    python -m headsup.algos.leduc_report runs/leduc_v4
+A row is ``setup,algo,label,glob`` over ``--json`` curves (or logs) of ``headsup.algos.deep``: ``sdcfrp`` = the SD-CFR
+paper's Leduc setup (x-axis: iterations), ``dreamp`` = the DREAM paper's (x-axis: nodes touched, as the DREAM code
+counts them).  Values are the exploitability of the average strategy in milli-antes per game (mean over the two seats,
+both papers' unit), mean ± sd over seeds of each run's mean over the evaluations within ±10 % of x (the deep curves
+fluctuate by ±10-20 % between evaluations).
 """
 
 import argparse
 import glob
-import os
+import json
 import re
 
 import numpy as np
@@ -19,40 +20,53 @@ import numpy as np
 # Steinberger (2019), Fig. 1a (read off the vector plot; 5 runs): iteration -> (SD-CFR, Deep CFR)
 SDCFR_PAPER = {30: (381, 401), 60: (227, 230), 90: (186, 199), 120: (154, 170), 210: (139, 155), 300: (112, 143),
                510: (95, 115), 1020: (89, 110), 2010: (69, 93), 3000: (67, 86), 4980: (59, 80)}
-# Steinberger, Lerer & Brown (2020), Leduc figure (raster read-off, approximate): nodes touched -> value
-DREAM_PAPER = {"sdcfr": {1.5e7: 40}, "dream": {1.15e7: 56}}
+# Steinberger, Lerer & Brown (2020), Fig. 2 top-left: 3-seed mean curves read off the raster (log axes), up to where
+# all seeds' bands end (single-seed tails beyond are excluded): nodes touched -> mA/g
+DREAM_PAPER = {"sdcfr": {1e6: 123, 1.84e6: 85, 2.55e6: 67, 3.5e6: 57, 4.86e6: 53, 6.7e6: 49, 1e7: 46},
+               "dream": {1.84e6: 88, 2.55e6: 78, 3.5e6: 67, 4.86e6: 60, 6.7e6: 62, 1e7: 57, 1.28e7: 56}}
+# our nodes_touched / the DREAM code's "States Seen": it counts decision and terminal nodes (deals happen inside
+# env.step) and its learned-baseline sampler skips terminals reached by a traverser action; measured on trained
+# Leduc policies with each sampler's own rules
+NODE_RATIO = {"sdcfr": 1.23, "deepcfr": 1.23, "dream": 1.64}
+
+DEFAULT_ROWS = [
+    ("sdcfrp", "sdcfr", "SD-CFR, authors' net (`--arch pokerrl`)", "runs/leduc_v6/reffull_sdcfr_s*.json"),
+    ("sdcfrp", "sdcfr", "SD-CFR, MLP + `--masked-loss`", "runs/leduc_v6/mlpmasked_sdcfr_s*.json"),
+    ("sdcfrp", "sdcfr", "SD-CFR, plain MLP", "runs/leduc_v5/sdcfrp_sdcfr_s*.json"),
+    ("sdcfrp", "deepcfr", "Deep CFR, authors' net", "runs/leduc_v6/reffull_deepcfr_s*.json"),
+    ("sdcfrp", "deepcfr", "Deep CFR, plain MLP", "runs/leduc_v5/sdcfrp_deepcfr_s*.json"),
+    ("dreamp", "sdcfr", "ES-SD-CFR, DREAM-code settings", "runs/leduc_v10/exact_sdcfr_s*.json"),
+    ("dreamp", "sdcfr", "ES-SD-CFR, plain MLP", "runs/leduc_v4/dreamp_sdcfr_s*.json"),
+    ("dreamp", "dream", "DREAM, DREAM-code settings + shared baseline", "runs/leduc_v11/repobase_dream_s*.json"),
+    ("dreamp", "dream", "DREAM, DREAM-code settings, per-player baselines", "runs/leduc_v10/exact_dream_s*.json"),
+    ("dreamp", "dream", "DREAM, plain MLP", "runs/leduc_v4/dreamp_dream_s*.json"),
+]
 
 _LINE = re.compile(r"it (\d+): exploitability current ([\d.]+) average ([\d.]+)\s+nodes ([\d.e+]+)")
 
 
-def load_curves(directory):
-    """{(protocol, algo): {seed: [(iteration, average mA/g, current mA/g, nodes)]}} from the logs."""
-    out = {}
-    for path in sorted(glob.glob(os.path.join(directory, "*_s*.log"))):
-        m = re.match(r"(\w+?)_(\w+)_s(\d+)\.log$", os.path.basename(path))
-        if not m:
-            continue
-        rows = [(int(a), 1000 * float(c), 1000 * float(b), float(n)) for a, b, c, n in _LINE.findall(open(path).read())]
-        if rows:
-            out.setdefault((m.group(1), m.group(2)), {})[int(m.group(3))] = rows
-    return out
+def load_run(path):
+    """[(iteration, average mA/g, nodes touched)] of one run (a --json curve or a log)."""
+    if path.endswith(".json"):
+        return [(c["iteration"], 1000 * c["average"], c["nodes_touched"]) for c in json.load(open(path))["curve"]]
+    rows = {int(i): (int(i), 1000 * float(a), float(n)) for i, _, a, n in _LINE.findall(open(path).read())}
+    return [rows[k] for k in sorted(rows)]
 
 
-def _interp(points, x, log=True):
+def _interp(points, x):
+    """Log-x interpolation of a paper curve (None outside it; the last point covers x up to 2 % beyond)."""
     xs = sorted(points)
+    if xs[-1] < x <= 1.02 * xs[-1]:
+        x = xs[-1]
     if x < xs[0] or x > xs[-1]:
         return None
-    ys = [points[k] for k in xs]
-    return float(np.interp(np.log(x) if log else x, np.log(xs) if log else xs, ys))
+    return float(np.interp(np.log(x), np.log(xs), [points[k] for k in xs]))
 
 
-def _at(rows, key, x):
-    """Linear interpolation of a run's average exploitability at iteration / nodes ``x`` (None if outside)."""
-    xs = np.array([r[key] for r in rows], dtype=float)
-    ys = np.array([r[1] for r in rows])
-    if len(xs) == 0 or x < xs[0] or x > xs[-1]:
-        return None
-    return float(np.interp(x, xs, ys))
+def _at(rows, key, x, scale=1.0, window=0.1):
+    """Mean of a run's evaluations whose x (iteration, or nodes / scale) lies within ±window of x."""
+    vals = [r[1] for r in rows if (1 - window) * x <= r[key] / scale <= (1 + window) * x]
+    return float(np.mean(vals)) if vals else None
 
 
 def _fmt(vals):
@@ -62,40 +76,43 @@ def _fmt(vals):
     return f"{np.mean(vals):.0f}" + (f" ± {np.std(vals, ddof=1):.0f}" if len(vals) > 1 else "")
 
 
-def sdcfr_table(curves, iterations=(30, 60, 120, 300, 510, 1000)):
-    lines = ["| iteration | " + " | ".join(str(i) for i in iterations) + " |", "|---|" + "---|" * len(iterations)]
-    for algo, col in (("sdcfr", 0), ("deepcfr", 1)):
-        runs = curves.get(("sdcfrp", algo), {})
-        ours = [_fmt([_at(r, 0, i) for r in runs.values()]) for i in iterations]
-        paper = [f"{_interp({k: v[col] for k, v in SDCFR_PAPER.items()}, i):.0f}" for i in iterations]
-        name = "SD-CFR" if algo == "sdcfr" else "Deep CFR"
-        lines.append(f"| {name}, ours ({len(runs)} seeds) | " + " | ".join(ours) + " |")
-        lines.append(f"| {name}, paper | " + " | ".join(paper) + " |")
-    return "\n".join(lines)
-
-
-def dream_table(curves, nodes=(1e6, 3e6, 1e7, 1.4e7)):
-    lines = ["| nodes touched | " + " | ".join(f"{n:.1e}" for n in nodes) + " | paper |", "|---|" + "---|" * (len(nodes) + 1)]
-    for algo, name in (("sdcfr", "ES-SD-CFR (346 trav.)"), ("deepcfr", "Deep CFR (346 trav.)"), ("dream", "DREAM (900 trav.)"), ("escher", "ESCHER")):
-        runs = curves.get(("dreamp", algo), {})
-        if not runs:
+def table(rows, setup, xs):
+    """Markdown table: one line per row of ``setup`` and per algorithm the paper's line."""
+    head = "iteration" if setup == "sdcfrp" else "nodes touched (DREAM code's count)"
+    out = [f"| {head} | " + " | ".join(f"{x:g}" if setup == "sdcfrp" else f"{x:.2g}".replace("e+0", "e") for x in xs) + " |",
+           "|---|" + "---|" * len(xs)]
+    done = set()
+    for st, algo, label, pattern in rows:
+        if st != setup:
             continue
-        ours = [_fmt([_at(r, 3, n) for r in runs.values()]) for n in nodes]
-        paper = DREAM_PAPER.get(algo, {})
-        ref = ", ".join(f"≈{v} @ {k:.2g}" for k, v in paper.items()) or "–"
-        lines.append(f"| {name}, ours ({len(runs)} seeds) | " + " | ".join(ours) + f" | {ref} |")
-    return "\n".join(lines)
+        runs = [load_run(p) for p in sorted(glob.glob(pattern))]
+        runs = [r for r in runs if r]
+        if setup == "sdcfrp":
+            cells = [_fmt([_at(r, 0, x) for r in runs]) for x in xs]
+        else:
+            cells = [_fmt([_at(r, 2, x, NODE_RATIO[algo]) for r in runs]) for x in xs]
+        out.append(f"| {label} ({len(runs)}) | " + " | ".join(cells) + " |")
+        if algo not in done:
+            done.add(algo)
+            if setup == "sdcfrp":
+                col = 0 if algo == "sdcfr" else 1
+                paper = [_interp({k: v[col] for k, v in SDCFR_PAPER.items()}, x) for x in xs]
+            else:
+                paper = [_interp(DREAM_PAPER[algo], x) if algo in DREAM_PAPER else None for x in xs]
+            name = {"sdcfr": "SD-CFR" if setup == "sdcfrp" else "ES-SD-CFR", "deepcfr": "Deep CFR", "dream": "DREAM"}[algo]
+            out.insert(len(out) - 1, f"| **{name}, paper** | " + " | ".join("–" if v is None else f"**{v:.0f}**" for v in paper) + " |")
+    return "\n".join(out)
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("directory")
+    p.add_argument("--row", action="append", default=None, help="setup,algo,label,glob (repeatable; default: DEFAULT_ROWS)")
     args = p.parse_args(argv)
-    curves = load_curves(args.directory)
-    print("SD-CFR paper protocol (1500 traversals, 750 warm-started updates, 1M buffers), mA/g:\n")
-    print(sdcfr_table(curves))
-    print("\nDREAM paper protocol (advantage nets 3000 x 2048 from scratch, 2M buffers), mA/g by nodes touched:\n")
-    print(dream_table(curves))
+    rows = [tuple(r.split(",", 3)) for r in args.row] if args.row else DEFAULT_ROWS
+    print("SD-CFR paper setup (1500 traversals, 750 warm-started updates, 1M buffers), mA/g by iteration:\n")
+    print(table(rows, "sdcfrp", (500, 1000, 2000, 3000, 5000)))
+    print("\nDREAM paper setup (346 ES / 900 OS traversals, 3000 x 2048 fits from scratch, 2M buffers), mA/g by nodes touched:\n")
+    print(table(rows, "dreamp", (2.55e6, 3.5e6, 6.7e6, 1e7, 1.28e7)))
 
 
 if __name__ == "__main__":

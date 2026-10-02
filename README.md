@@ -58,20 +58,47 @@ paper's hyperparameters; `python -m headsup.deepcfr.train -h` lists the network 
 
 ### Leduc: reproductions
 
-Exploitability of the average strategy in milli-antes per game (mean over seats, the papers' unit),
-mean ± sd over 3 seeds (`python -m headsup.algos.leduc_report runs/leduc_v4`):
+Exploitability of the average strategy in milli-antes per game (mean over seats, the papers' unit), mean ± sd over
+seeds (`python -m headsup.algos.leduc_report`):
 
-| SD-CFR paper setup (by iteration) | 30 | 120 | 300 | 1000 |
-|---|---|---|---|---|
-| SD-CFR, ours | 282 ± 24 | 100 ± 9 | 89 ± 12 | **87 ± 20** |
-| SD-CFR, Steinberger (2019) Fig. 1a | 381 | 154 | 112 | 89 |
-| Deep CFR, ours | 297 ± 48 | 136 ± 26 | 132 ± 23 | **127 ± 4** |
-| Deep CFR, Steinberger (2019) Fig. 1a | 401 | 170 | 143 | 110 |
+| SD-CFR paper setup, by iteration | 500 | 1000 | 2000 | 3000 | 5000 |
+|---|---|---|---|---|---|
+| **SD-CFR, Steinberger (2019) Fig. 1a** | **96** | **89** | **69** | **67** | **59** |
+| SD-CFR, authors' net (3 seeds) | 90 ± 16 | 81 ± 7 | 58 ± 4 | 58 ± 7 | 60 ± 5 |
+| SD-CFR, plain MLP + `--masked-loss` (2) | 78 ± 4 | 74 ± 7 | 68 ± 4 | – | – |
+| SD-CFR, plain MLP (3) | 76 ± 11 | 78 ± 9 | 105 ± 20 | 80 ± 8 | 80 ± 17 |
+| **Deep CFR, Steinberger (2019) Fig. 1a** | **116** | **110** | **93** | **86** | **80** |
+| Deep CFR, authors' net (1) | 109 | 110 | 94 | 90 | 101 |
+| Deep CFR, plain MLP (3) | 135 ± 28 | 154 ± 14 | 148 ± 17 | 158 ± 6 | 143 ± 10 |
 
-| DREAM paper setup (by nodes touched) | 3e6 | 1e7 | 1.4e7 | paper (plot read-off) |
-|---|---|---|---|---|
-| ES-SD-CFR, 346 traversals | 90 ± 12 | 58 ± 2 | **53 ± 8** | ≈40 at 1.5e7 |
-| DREAM, 900 traversals | 117 ± 16 | 85 ± 6 | **70 ± 4** | ≈56 at 1.2e7 |
+| DREAM paper setup, by nodes touched | 2.6e6 | 3.5e6 | 6.7e6 | 1e7 | 1.3e7 |
+|---|---|---|---|---|---|
+| **ES-SD-CFR, Steinberger et al. (2020) Fig. 2** | **67** | **57** | **49** | **46** | – |
+| ES-SD-CFR, DREAM-code settings (3) | 69 ± 1 | 61 ± 3 | 51 ± 5 | 48 ± 3 | 44 ± 5 |
+| ES-SD-CFR, plain MLP (3) | 87 ± 16 | 69 ± 6 | 60 ± 3 | 57 ± 2 | 51 ± 3 |
+| **DREAM, Steinberger et al. (2020) Fig. 2** | **78** | **67** | **62** | **57** | **56** |
+| DREAM, DREAM-code settings (3) | 90 ± 10 | 74 ± 3 | 71 ± 2 | 60 ± 6 | 56 ± 5 |
+| DREAM, plain MLP (3) | 110 ± 15 | 96 ± 9 | 79 ± 8 | – | – |
+
+```bash
+# SD-CFR paper setup (Deep CFR: --algo deepcfr --strat-capacity 1000000 --policy-steps 5000)
+python -m headsup.algos.deep --game leduc --algo sdcfr --iterations 5000 --traversals 1500 --adv-steps 750 --adv-batch 2048 \
+  --warm-start --adv-capacity 1000000 --arch pokerrl --loss-weights normalized --grad-clip 10 --mean-regret --device cuda
+# DREAM paper setup (ES-SD-CFR: --algo sdcfr --traversals 346 without the DREAM-only flags)
+python -m headsup.algos.deep --game leduc --algo dream --iterations 1500 --traversals 900 --epsilon 0.5 --q-steps 1000 \
+  --q-batch 512 --shared-baseline --bootstrap-chance --adv-steps 3000 --adv-batch 2048 --arch deepcfr_dueling \
+  --loss-weights normalized --grad-clip 1 --device cuda
+```
+
+What it took, beyond the papers' text (all taken from the authors' code):
+- **No fitting of illegal actions' outputs.** The SD-CFR / DREAM / ESCHER networks multiply them by the legal mask; a
+  plain MLP fitted to zeros there stalls at ~80 mA/g (`--masked-loss` alone fixes it; dueling head and normalisation
+  do not matter).
+- **The DREAM code's settings differ from the SD-CFR code's:** gradient clipping 1 (not 10), ES regrets not divided by
+  the number of legal actions, one baseline net for both players trained once per iteration, with expected-SARSA
+  targets bootstrapped after deals.
+- **The DREAM plot's x-axis** counts decision and terminal nodes only (ours / 1.23 for ES, / 1.64 for DREAM's
+  sampler); the paper values are its 3-seed means (single-seed tails excluded).
 
 ESCHER's paper has no deep Leduc results. Its Leduc experiment is tabular with oracle history
 values (`python -m headsup.algos.oracle`, 500 trajectories per iteration). At 1000 iterations we
@@ -87,9 +114,10 @@ Tabular references: CFR+ 0.24, DCFR 0.15 mA/g at 1000 iterations.
 | tabular blueprint, 20 M it., 40 min (`models/blueprint_nlhe.pt`) | **0.60 ± 0.09** | **+0.87 ± 0.04** vs the DeepCFR net |
 | Pluribus-mode search on the blueprint | −0.78 ± 0.39 | within noise of the blueprint |
 
-Best-response exploitability of the NL strategies and the FHP reproduction (DeepCFR paper: 37 mbb/g
-total exploitability) are being re-measured: the earlier estimates missed the board chance factor
-and the FHP runs used the uniform regret-matching fallback and unscaled chip targets.
+FHP (DeepCFR paper: 37 mbb/g total exploitability at ~3e8 nodes touched): our Deep CFR policy after 450 iterations
+(1.1e8 nodes) is at 80 mbb/g total (exact best response over all flops); the curve flattens there. Masked outputs
+and the paper's parameter count make no difference; longer runs are in progress. Best-response exploitability of
+the NL strategies is being re-measured (the earlier estimates missed the board chance factor).
 
 ## Layout
 
