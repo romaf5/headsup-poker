@@ -106,3 +106,21 @@ def test_best_response_to_always_call_matches_the_closed_form():
     policy = mixture_policy(make_player("call", game=FHP), "cpu")
     res = _fixed_flops(VectorBestResponse(policy, FHP, cards=len(flops), chunk=3), flops).run()
     assert res["br_values"] == pytest.approx([br0, br1], rel=1e-5)
+
+
+def test_fhp_cfr_flop_classes_and_hand_permutations():
+    """Suit isomorphism of the exact FHP solver: 1755 flop classes whose orbits cover all 22 100 flops once, and
+    24 hand permutations that are bijections commuting with card incidence."""
+    import numpy as np
+
+    from headsup.algos.fhp_cfr import canonical_flops, hand_permutations
+    from headsup.lbr import COMBOS
+
+    reps, w = canonical_flops()
+    assert len(reps) == 1755 and w.sum() == 22100 and set(np.unique(w)) <= {4, 6, 12, 24}
+    perms = hand_permutations()
+    assert perms.shape == (24, 1326) and all(len(set(p)) == 1326 for p in perms)
+    assert (perms[0] == np.arange(1326)).all()  # identity first
+    combos = np.asarray(COMBOS)
+    for p in perms[[5, 17]]:  # sigma(h) keeps ranks, maps suits consistently
+        np.testing.assert_array_equal(np.sort(combos[p] % 13, 1), np.sort(combos % 13, 1))

@@ -300,11 +300,14 @@ def parse_cards(text):
 
 
 class VectorBestResponse:
-    def __init__(self, policy, game, cards="all", chunk=32, seed=0, allin_boards=2000):
+    def __init__(self, policy, game, cards="all", chunk=32, seed=0, allin_boards=2000, br_stages=None):
         """``cards``: "all" to enumerate every street's cards, k = cards sampled per public state and
         street (the flop: k flops; turn / river: k cards each, nested), or a tuple per street;
-        ``chunk``: boards per batch; ``allin_boards``: sampled boards for pre-flop all-in equities."""
+        ``chunk``: boards per batch; ``allin_boards``: sampled boards for pre-flop all-in equities;
+        ``br_stages``: the streets (0 = pre-flop, ...) on which the responder deviates - elsewhere it plays the
+        policy, so the result splits the exploitability by street (None = all streets, the best response)."""
         self.policy, self.game = policy, game
+        self.br_stages = None if br_stages is None else set(br_stages)
         self.dev = policy.device
         self.cards = cards
         self.chunk = chunk
@@ -425,9 +428,12 @@ class VectorBestResponse:
                 else:
                     kids = list(nd.children.values())
                     if nd.player == p:
-                        br[i] = torch.stack([br[c] for c in kids]).amax(0)
                         rp = real[p][i]
                         onp[i] = sum(torch.where(rp > 0, real[p][c] / rp.clamp(min=1e-30), 0.0) * onp[c] for c in kids)
+                        if self.br_stages is None or nd.stage in self.br_stages:
+                            br[i] = torch.stack([br[c] for c in kids]).amax(0)
+                        else:  # the responder follows the policy here
+                            br[i] = sum(torch.where(rp > 0, real[p][c] / rp.clamp(min=1e-30), 0.0) * br[c] for c in kids)
                     else:
                         br[i] = sum(br[c] for c in kids)
                         onp[i] = sum(onp[c] for c in kids)
@@ -535,6 +541,8 @@ def main(argv=None):
     p.add_argument("--chunk", type=int, default=32, help="boards per batch")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None)
+    p.add_argument("--br-streets", default=None,
+                   help="streets on which the responder deviates, e.g. 0 (pre-flop) or 1 (flop); default all = the best response")
     p.add_argument("--json", default=None)
     args = p.parse_args(argv)
     device = get_device(args.device)
@@ -543,7 +551,8 @@ def main(argv=None):
     cards = parse_cards(args.cards)
     t0 = time.perf_counter()
     res = VectorBestResponse(mixture_policy(player, device, game), game, cards=cards, chunk=args.chunk, seed=args.seed,
-                             allin_boards=args.allin_boards).run()
+                             allin_boards=args.allin_boards,
+                             br_stages=None if args.br_streets is None else [int(x) for x in args.br_streets.split(",") if x != ""]).run()
     res["seconds"] = time.perf_counter() - t0
     res["policy"] = args.policy
     print(f"{args.policy}: exploitability {res['exploitability_mbb']:.1f} mbb/g (total {res['total_exploitability_mbb']:.1f}; "
