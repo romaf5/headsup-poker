@@ -191,7 +191,8 @@ def test_pre_river_subgame_needs_and_uses_continuations():
     np.testing.assert_allclose(st2.sum(1), 1.0, atol=1e-5)
     with pytest.raises(RuntimeError):
         sv2.set_leaf_choices(5)
-    assert parse_search_spec("cfr:x.pth@k4@it100") == ("cfr:x.pth", {"leaf_choices": 4, "iterations": 100})
+    assert parse_search_spec("cfr:x.pth@leaf4@it100") == ("cfr:x.pth", {"leaf_choices": 4, "iterations": 100})
+    assert parse_search_spec("sdcfr:x/it.pt@k64@it100") == ("sdcfr:x/it.pt@k64", {"iterations": 100})  # bank thinning
 
 
 def test_search_spec_and_player_bookkeeping(tmp_path):

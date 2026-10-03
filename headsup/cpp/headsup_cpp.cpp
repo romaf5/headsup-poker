@@ -713,6 +713,9 @@ py::array_t<float> to_array(std::vector<float>& v, ssize_t rows, ssize_t cols) {
 }
 
 py::array_t<bool> to_bool_array(std::vector<uint8_t>& v, ssize_t rows, ssize_t cols) {
+  // every advantage sample must carry its legal mask (Memory::add with a mask pointer)
+  if (ssize_t(v.size()) != rows * cols) throw std::runtime_error("legal masks: " + std::to_string(v.size()) + " values for " +
+                                                                 std::to_string(rows) + " x " + std::to_string(cols));
   py::array_t<bool> out({rows, cols});
   std::copy(v.begin(), v.end(), reinterpret_cast<uint8_t*>(out.mutable_data()));
   return out;

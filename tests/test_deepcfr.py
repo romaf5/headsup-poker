@@ -325,3 +325,39 @@ def test_trainer_masked_loss_fhp_stores_masks_and_resumes(tmp_path):
     train_main(["--resume", str(tmp_path / "checkpoint.pt"), "--iterations", "3"] + common)
     state = torch.load(tmp_path / "checkpoint.pt", map_location="cpu", weights_only=True)
     assert state["iteration"] == 3 and len(state["adv_memory"][1]["legal"]) == len(state["adv_memory"][1]["t"])
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_reservoir_replacement_matches_sequential_algorithm_r(device):
+    """Duplicate slots within one add: the result equals item-by-item Algorithm R with the same draws (the last item
+    drawn for a slot stays), and every stored row keeps its own fields together (CUDA's indexed writes with duplicate
+    indices pick an arbitrary winner per tensor)."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("no CUDA")
+    cap, n = 50, 2000
+    buf = ReservoirBuffer(cap, device, obs_dim=31, legal_dim=4, seed=3)
+    ref_rng = np.random.default_rng(3)
+    ids = np.arange(n, dtype=np.float32)
+    obs = np.zeros((n, 31), np.float32)
+    obs[:, 30] = ids
+    buf.add(obs, ids, np.repeat(ids[:, None], 4, 1), _bits(np.arange(n) % 16))
+    ref = list(range(cap))
+    m = np.arange(cap, n) + 1  # what add() draws: one uniform per item beyond the empty slots
+    r = ref_rng.random(n - cap) * m
+    for item, ri in zip(range(cap, n), r):
+        if ri < cap:
+            ref[int(ri)] = item
+    t = buf.t.cpu().numpy()
+    np.testing.assert_array_equal(t, np.array(ref, np.float32))
+    np.testing.assert_array_equal(buf.obs[:, 30].cpu().numpy(), t)
+    np.testing.assert_array_equal(buf.target.cpu().numpy(), np.repeat(t[:, None], 4, 1))
+    np.testing.assert_array_equal(buf.legal.cpu().numpy(), _bits(t.astype(np.int64) % 16))
+
+
+def test_masked_loss_can_be_switched_off_on_resume():
+    from headsup.deepcfr.train import build_parser
+
+    p = build_parser()
+    assert p.parse_args(["--masked-loss"]).masked_loss and not p.parse_args(["--no-masked-loss"]).masked_loss
+    dest = {a.dest for a in p._actions if "--no-masked-loss" in a.option_strings}
+    assert dest == {"masked_loss"}  # main() detects it as given, so the checkpoint's value is not inherited

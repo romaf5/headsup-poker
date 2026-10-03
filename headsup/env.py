@@ -315,7 +315,8 @@ class NativeVecEnv:
         pass
 
 
-def make_vec_env(num_envs, opponent, seat_mode="alternate", seed=None, backend="auto", deterministic=False, game=None, **engine_kwargs):
+def make_vec_env(num_envs, opponent, seat_mode="alternate", seed=None, backend="auto", deterministic=False, game=None, device=None,
+                 **engine_kwargs):
     """Create a vectorised env.
 
     ``opponent`` may be a player spec string understood by :func:`headsup.players.make_player`
@@ -340,7 +341,7 @@ def make_vec_env(num_envs, opponent, seat_mode="alternate", seed=None, backend="
     if isinstance(opponent, str):
         from headsup.players import make_player
 
-        opponent = make_player(opponent, deterministic=deterministic, seed=seed, game=resolve_game(game, **engine_kwargs))
+        opponent = make_player(opponent, deterministic=deterministic, seed=seed, game=resolve_game(game, **engine_kwargs), device=device)
     elif hasattr(opponent, "numpy_weights"):
         from headsup.players import TorchPolicyPlayer
 

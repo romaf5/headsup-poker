@@ -194,3 +194,24 @@ def test_dream_shared_baseline_is_zero_sum_and_resumes(tmp_path):
     np.testing.assert_allclose(t._q(0, state), s._q(0, state))
     t.iterate()
     assert t.iteration == 2
+
+
+def test_dream_checkpoint_baseline_layout_must_match():
+    import torch
+
+    g = make_game("kuhn")
+    s = DeepSolver(g, "dream", traversals=10, adv_steps=2, q_steps=2, seed=0, shared_baseline=True)
+    s.iterate()
+    with pytest.raises(ValueError, match="shared-baseline"):
+        DeepSolver(g, "dream", traversals=10, adv_steps=2, q_steps=2, seed=0).load_state_dict(s.state_dict())
+
+
+def test_leduc_report_rows_and_unknown_algorithms(tmp_path):
+    import json
+
+    from headsup.algos.leduc_report import _parse_row, table
+
+    assert _parse_row("dreamp,dream,DREAM, mine (v2),runs/x/*.json") == ("dreamp", "dream", "DREAM, mine (v2)", "runs/x/*.json")
+    (tmp_path / "e_s0.json").write_text(json.dumps({"curve": [{"iteration": 10, "average": 0.1, "nodes_touched": 1e6}]}))
+    with pytest.raises(ValueError, match="escher"):
+        table([("dreamp", "escher", "ESCHER", str(tmp_path / "e_s*.json"))], "dreamp", (1e6,))

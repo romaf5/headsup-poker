@@ -32,7 +32,7 @@ at the start of a round come from Bayes' rule with the previous round's solve (i
 strategy, for both players - "nested unsafe search"), preflop with the blueprint.
 
 Player spec: ``search:<blueprint spec>[@it<N>][@rit<N>][@rv<variant>][@focus<f>][@cont<policy|iterate|bank>][@thin<K>]``,
-e.g. ``search:cfr:runs/x/policy.pth@it20000@rit200`` (``@k4``: Pluribus's four biased continuation
+e.g. ``search:cfr:runs/x/policy.pth@it20000@rit200`` (``@leaf4``: Pluribus's four biased continuation
 strategies chosen by both players at the depth-limited leaves instead of one sampled continuation);
 Pluribus mode ``search:<blueprint>@pluribus[@it<N>][@b<buckets>][@th<threads>][@avg][@pfsearch]``.
 """
@@ -489,7 +489,9 @@ class SearchPlayer:
             out[i] = root[hh]
         if blueprint:
             rows = np.concatenate([jobs[t][5].pop("blueprint_rows") for _, t, _ in blueprint])
-            bids = np.concatenate([t * NUM_COMBOS + np.arange(NUM_COMBOS) for _, t, _ in blueprint])
+            # the hero's id space of the range updates ((2 t + 1) * 1326 + combo): a stateful blueprint keeps one
+            # reach per (table, seat), and t * 1326 would alias another table's villain ids
+            bids = np.concatenate([(2 * t + 1) * NUM_COMBOS + np.arange(NUM_COMBOS) for _, t, _ in blueprint])
             probs = np.asarray(self.model.probs(rows, bids), dtype=np.float32).reshape(len(blueprint), NUM_COMBOS, -1)
             for (i, t, hh), sig in zip(blueprint, probs):
                 out[i] = sig[hh]
@@ -514,7 +516,8 @@ class SearchPlayer:
 
 def parse_search_spec(arg):
     """``<blueprint spec>[@it<N>][@rit<N>][@rv<variant>][@focus<f>][@cont<policy|iterate|bank>][@thin<K>]``
-    ``[@pluribus][@b<buckets>][@th<threads>][@avg][@pfsearch][@k<leaf choices>]`` -> kwargs."""
+    ``[@pluribus][@b<buckets>][@th<threads>][@avg][@pfsearch][@leaf<leaf choices>]`` -> kwargs (``@k<K>`` stays with
+    an SD-CFR blueprint: its bank thinning)."""
     parts = arg.split("@")
     # the blueprint spec itself may contain '@' options (sdcfr:...@g2): the search options are the
     # trailing ones that parse as ours; when an option repeats, the rightmost wins
@@ -545,8 +548,8 @@ def parse_search_spec(arg):
             kw.setdefault("play", "average")
         elif o == "pfsearch":
             kw.setdefault("preflop", "search")
-        elif o.startswith("k") and o[1:].isdigit():
-            kw.setdefault("leaf_choices", int(o[1:]))
+        elif o.startswith("leaf") and o[4:].isdigit():
+            kw.setdefault("leaf_choices", int(o[4:]))
         else:
             break
         parts.pop()

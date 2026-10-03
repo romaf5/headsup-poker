@@ -615,6 +615,9 @@ class DeepSolver:
             self.strat_memory.load_state_dict(state["strat_memory"])
             self.strat_memory.rng.bit_generator.state = state["strat_rng"]
         if self.algo == "dream":
+            if len(state["q_nets"]) != len(self.q_nets):
+                raise ValueError(f"checkpoint has {len(state['q_nets'])} baseline net(s), this solver {len(self.q_nets)}: "
+                                 "resume with the same --shared-baseline setting")
             for net, opt, sd, osd in zip(self.q_nets, self.q_opts, state["q_nets"], state["q_opts"]):
                 net.load_state_dict(sd)
                 opt.load_state_dict(osd)

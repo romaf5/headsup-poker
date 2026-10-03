@@ -89,6 +89,23 @@ def build_street_tree(engine):
     return nodes
 
 
+def card_incidence(device):
+    """(1326, 52) card incidence of the hands and (1326, 1326) bool: hand pairs without a shared card."""
+    combos = torch.as_tensor(np.asarray(COMBOS), device=device)
+    incid = torch.zeros(NUM_COMBOS, NUM_CARDS, device=device)
+    incid[torch.arange(NUM_COMBOS), combos[:, 0]] = 1.0
+    incid[torch.arange(NUM_COMBOS), combos[:, 1]] = 1.0
+    return incid, (incid @ incid.T) == 0
+
+
+def showdown_signs(strength, disjoint):
+    """(B, h, h') +1 / -1 / 0 when h beats / loses to / ties h' given (B, 1326) treys strengths (lower is
+    stronger; hands blocked by the board carry INT32_MAX); 0 for hands sharing a card with each other or the board."""
+    s = strength.clamp(max=1 << 20).to(torch.int32)  # blocked hands: INT32_MAX -> 2^20
+    ok = s < (1 << 20)
+    return torch.sign((s[:, None, :] - s[:, :, None]).float()) * (disjoint & ok[:, :, None] & ok[:, None, :])
+
+
 def chance_factor(revealed_before, revealed_after):
     """P(the board cards revealed between the two counts are compatible with a fixed pair of hands)
     when the board is drawn uniformly: the same for every hand pair (4 blocked cards), which is
@@ -305,7 +322,9 @@ class VectorBestResponse:
         street (the flop: k flops; turn / river: k cards each, nested), or a tuple per street;
         ``chunk``: boards per batch; ``allin_boards``: sampled boards for pre-flop all-in equities;
         ``br_stages``: the streets (0 = pre-flop, ...) on which the responder deviates - elsewhere it plays the
-        policy, so the result splits the exploitability by street (None = all streets, the best response)."""
+        policy, so the result splits the exploitability by street (None = all streets, the best response).  Off the
+        policy's own path (after a deviation to an action it never takes) the responder plays the policy's strategy
+        there - for a mixture the weight-averaged component strategies (its realisation weights are 0 there)."""
         self.policy, self.game = policy, game
         self.br_stages = None if br_stages is None else set(br_stages)
         self.dev = policy.device
@@ -316,12 +335,7 @@ class VectorBestResponse:
         self.final_cards = BOARD_CARDS_BY_STAGE[game.num_rounds - 1]
         self.combo_feat = torch.as_tensor(COMBO_FEATURES, device=self.dev)
         self.card_feat = torch.as_tensor(CARD_FEATURES, device=self.dev)
-        combos = torch.as_tensor(COMBOS, device=self.dev)
-        incid = torch.zeros(NUM_COMBOS, NUM_CARDS, device=self.dev)
-        incid[torch.arange(NUM_COMBOS), combos[:, 0]] = 1.0
-        incid[torch.arange(NUM_COMBOS), combos[:, 1]] = 1.0
-        self.incid = incid  # (1326, 52) card incidence
-        self.disjoint = (incid @ incid.T) == 0  # (1326, 1326) hands without a shared card
+        self.incid, self.disjoint = card_incidence(self.dev)  # (1326, 52) card incidence, (1326, 1326) hands without a shared card
         self.trees = {}
         self.queries = 0
         self._sd_boards = self._sd_sign = None
@@ -389,6 +403,7 @@ class VectorBestResponse:
         W = w.sum()
         B = len(boards)
         real = [dict(), dict()]  # realisation weight per node: (B, 1326) per seat
+        behaviour = {}  # with br_stages: the policy's strategy per decision node, for the responder off its path
         pending = {0: rho}
         leaf_values = {}
         for i, nd in enumerate(nodes):
@@ -401,6 +416,8 @@ class VectorBestResponse:
                 sig = self.policy.strategies(seat, self._obs(nd.engine, seat, boards), legal)
                 self.queries += 1
                 sig = sig.reshape(self.policy.T, B, NUM_COMBOS, -1)
+                if self.br_stages is not None:
+                    behaviour[i] = torch.einsum("t,tbha->bha", w, sig) / W
                 for a, c in nd.children.items():
                     child = [r[0], r[1]]
                     child[seat] = r[seat] * sig[..., a]
@@ -432,8 +449,9 @@ class VectorBestResponse:
                         onp[i] = sum(torch.where(rp > 0, real[p][c] / rp.clamp(min=1e-30), 0.0) * onp[c] for c in kids)
                         if self.br_stages is None or nd.stage in self.br_stages:
                             br[i] = torch.stack([br[c] for c in kids]).amax(0)
-                        else:  # the responder follows the policy here
-                            br[i] = sum(torch.where(rp > 0, real[p][c] / rp.clamp(min=1e-30), 0.0) * br[c] for c in kids)
+                        else:  # the responder follows the policy here (its behaviour strategy where its own reach is 0)
+                            br[i] = sum(torch.where(rp > 0, real[p][c] / rp.clamp(min=1e-30), behaviour[i][..., a]) * br[c]
+                                        for a, c in nd.children.items())
                     else:
                         br[i] = sum(br[c] for c in kids)
                         onp[i] = sum(onp[c] for c in kids)
@@ -447,9 +465,7 @@ class VectorBestResponse:
     def _sign(self, boards):
         """(B, h, h') +1 / -1 / 0 when h beats / loses to / ties h' on the complete ``boards``; 0 for
         hands sharing a card with each other or with the board."""
-        s = self._strengths(boards).clamp(max=1 << 20).to(torch.int32)  # blocked hands: INT32_MAX -> 2^20
-        ok = s < (1 << 20)
-        return torch.sign((s[:, None, :] - s[:, :, None]).float()) * (self.disjoint & ok[:, :, None] & ok[:, None, :])
+        return showdown_signs(self._strengths(boards), self.disjoint)
 
     def _showdown(self, boards, reach):
         """u[b, h] = sum_h' reach[b, h'] * E[+1 if h beats h', -1 if it loses] over compatible h'; before

@@ -21,8 +21,9 @@ import numpy as np
 import torch
 
 from headsup import native
-from headsup.algos.holdem_br import _HAND_PAIRS, build_street_tree, chance_factor
+from headsup.algos.holdem_br import _HAND_PAIRS, build_street_tree, card_incidence, chance_factor, showdown_signs
 from headsup.cards import NUM_CARDS
+from headsup.device import get_device
 from headsup.engine import HeadsUpPoker
 from headsup.game import FHP
 from headsup.lbr import COMBOS, NUM_COMBOS
@@ -52,8 +53,10 @@ def hand_permutations():
 
 
 class FHPCFR:
-    def __init__(self, device="cuda:0", chunk=64, game=FHP):
-        self.dev = torch.device(device)
+    def __init__(self, device=None, chunk=64, game=FHP):
+        if not (game.limit and game.num_rounds == 2 and not game.all_in):
+            raise ValueError("FHPCFR solves two-round limit games without all-ins (FHP): pre-flop + flop only")
+        self.dev = get_device(device) if device is None or isinstance(device, str) else device
         self.chunk = chunk
         e = HeadsUpPoker(game=game)
         e.reset()
@@ -66,17 +69,14 @@ class FHPCFR:
         self.flop_w = torch.as_tensor(w, dtype=torch.float32, device=self.dev)
         self.F = len(flops)
         self.hperm = torch.as_tensor(hand_permutations(), device=self.dev)
-        combos = torch.as_tensor(np.asarray(COMBOS), device=self.dev)
-        incid = torch.zeros(NUM_COMBOS, NUM_CARDS, device=self.dev)
-        incid[torch.arange(NUM_COMBOS), combos[:, 0]] = 1.0
-        incid[torch.arange(NUM_COMBOS), combos[:, 1]] = 1.0
-        self.incid = incid
-        self.disjoint = ((incid @ incid.T) == 0).float()
+        incid, disjoint = card_incidence(self.dev)
+        self.disjoint_bool = disjoint
+        self.disjoint = disjoint.float()
         on = torch.zeros(self.F, NUM_CARDS, device=self.dev)
         on.scatter_(1, self.flops, 1.0)
         self.ok = ((on @ incid.T) == 0).float()  # (F, 1326) hands missing the flop
         strength = np.stack([np.asarray(native.module().BoardTable(list(map(int, f)), 3).strength) for f in flops])
-        self.strength = torch.as_tensor(strength.astype(np.int64), device=self.dev).clamp(max=1 << 20).to(torch.int32)
+        self.strength = torch.as_tensor(strength.astype(np.int64), device=self.dev)
         self.norm = len(list(itertools.combinations(range(NUM_CARDS), 3))) * chance_factor(0, 3)  # 17 296 flops per hand pair
         A = game.num_actions
         z = lambda *s: torch.zeros(*s, A, device=self.dev)  # noqa: E731
@@ -154,10 +154,7 @@ class FHPCFR:
         return vals[0] * self.ok[sl]
 
     def _sign(self, sl):
-        s = self.strength[sl]
-        ok = s < (1 << 20)
-        dis = self.disjoint.bool()
-        return torch.sign((s[:, None, :] - s[:, :, None]).float()) * (dis & ok[:, :, None] & ok[:, None, :])
+        return showdown_signs(self.strength[sl], self.disjoint_bool)
 
     def _pass(self, p, mode, t=0.0):
         """One pass for player p over the whole game; returns p's root values (1326)."""
@@ -224,7 +221,7 @@ def main(argv=None):
     p.add_argument("--iterations", type=int, default=50)
     p.add_argument("--eval-at", default="1,2,5,10,20,30,50")
     p.add_argument("--chunk", type=int, default=64, help="flops per batch")
-    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--device", default=None)
     p.add_argument("--json", default=None)
     args = p.parse_args(argv)
     t0 = time.perf_counter()

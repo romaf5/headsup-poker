@@ -81,6 +81,12 @@ class ReservoirBuffer:
             if keep.any():
                 slots = r[keep].astype(np.int64)
                 sel = np.flatnonzero(keep) + k
+                # Algorithm R is sequential: of several items drawn for the same slot the last one stays.  An indexed
+                # write with duplicate slots leaves each tensor's winner unspecified (CUDA, multithreaded CPU), which
+                # could pair one item's observation with another's target - keep only the last item per slot.
+                _, last = np.unique(slots[::-1], return_index=True)
+                last = len(slots) - 1 - last
+                slots, sel = slots[last], sel[last]
                 self._write(slots, obs[sel], t[sel], target[sel], None if legal is None else legal[sel])
         self.seen += n
 

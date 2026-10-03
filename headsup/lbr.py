@@ -246,7 +246,11 @@ class LocalBestResponse:
         for i, t in enumerate(tables):
             e, seat, p, eq = t.engine, t.seat, t.range, eqs[i]
             p = np.where(eq >= 0, p, 0.0)  # blocked combos (new board cards) carry no mass
-            p = p / p.sum() if p.sum() > 0 else valid_combos(list(e.hands[seat]) + list(e.visible_board)) / 1.0
+            if p.sum() > 0:
+                p = p / p.sum()
+            else:  # the board blocks the whole modelled range: uniform over the compatible combos
+                p = valid_combos(list(e.hands[seat]) + list(e.visible_board)).astype(np.float64)
+                p /= p.sum()
             eq = np.where(eq >= 0, eq, 0.5)
             values = np.full(self.num_actions, -np.inf)
             if e.fold_allowed:

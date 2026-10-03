@@ -124,3 +124,39 @@ def test_fhp_cfr_flop_classes_and_hand_permutations():
     combos = np.asarray(COMBOS)
     for p in perms[[5, 17]]:  # sigma(h) keeps ranks, maps suits consistently
         np.testing.assert_array_equal(np.sort(combos[p] % 13, 1), np.sort(combos % 13, 1))
+
+
+def test_br_streets_follows_the_policy_off_its_own_path():
+    """--br-streets 0 against always-call on 3 fixed flops has a closed form: the responder chooses fold / call /
+    raise pre-flop and then checks down like the policy; a raise (probability 0 under the policy) must keep the
+    check-down value (it was 0 when the off-path continuation used the policy's reach ratio)."""
+    import numpy as np
+    import torch
+
+    from headsup.algos.holdem_br import _HAND_PAIRS, VectorBestResponse, chance_factor, mixture_policy
+    from headsup.game import FHP
+    from headsup.players import make_player
+
+    flops = torch.tensor([[0, 14, 27], [5, 18, 44], [12, 25, 38]])
+    pol = mixture_policy(make_player("call", game=FHP), torch.device("cpu"), FHP)
+    out = {}
+    for stages in ([0], None):
+        vbr = VectorBestResponse(pol, FHP, cards=3, chunk=8, br_stages=stages)
+        vbr._next_cards = lambda boards, k: (flops.repeat(len(boards), 1), torch.arange(len(boards)).repeat_interleave(len(flops)))
+        out[stages is None] = vbr.run()["br_values"]
+        signs = vbr._sign(flops)
+    S = (signs.sum(2).sum(0) / (len(flops) * chance_factor(0, 3))).numpy()  # E[showdown sign] x opponent mass
+    sb = np.maximum.reduce([np.full_like(S, -50 * 1225.0), 100 * S, 200 * S]).sum() / _HAND_PAIRS
+    bb = np.maximum(100 * S, 200 * S).sum() / _HAND_PAIRS
+    np.testing.assert_allclose(out[False], [sb, bb], rtol=1e-5)
+    assert out[True][0] >= out[False][0] - 1e-6 and out[True][1] >= out[False][1] - 1e-6  # the full BR is at least as good
+
+
+def test_fhp_cfr_rejects_other_games():
+    import pytest
+
+    from headsup.algos.fhp_cfr import FHPCFR
+    from headsup.games.holdem import make_holdem
+
+    with pytest.raises(ValueError, match="FHP"):
+        FHPCFR("cpu", game=make_holdem("hulh"))

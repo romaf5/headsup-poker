@@ -468,14 +468,16 @@ class DeepCFRTrainer:
                                    strat=len(strat) if strat is not None else 0)
 
     def _advantage_fit_quality(self, seat, n=65536):
-        """Unweighted MSE of the freshly fitted net on a memory sample, and the target scale."""
+        """Unweighted MSE of the freshly fitted net on a memory sample, and the target scale (over the fitted
+        outputs: the legal actions with --masked-loss)."""
         if len(self.adv_memory[seat]) == 0:
             return float("nan"), float("nan")
-        obs, _, target = self.adv_memory[seat].sample(min(n, len(self.adv_memory[seat])))
+        obs, _, target, *legal = self.adv_memory[seat].sample(min(n, len(self.adv_memory[seat])), with_legal=self.masked_loss)
+        m = legal[0] if legal else torch.ones_like(target)
         with torch.no_grad():
             pred = self.nets[seat](obs)
-            mse = (pred - target).pow(2).mean().item()
-            rms = target.pow(2).mean().sqrt().item()
+            mse = ((pred - target).pow(2) * m).sum().item() / m.sum().item()
+            rms = (target.pow(2) * m).sum().div(m.sum()).sqrt().item()
         return mse, rms
 
     def evaluate_iterate(self):
@@ -683,7 +685,7 @@ def build_parser():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--target-scale", default="auto",
                    help="advantage-net fits: divide the regrets by this (auto = their RMS) and scale the output layer back; 'none' = raw chips")
-    p.add_argument("--masked-loss", action="store_true",
+    p.add_argument("--masked-loss", action=argparse.BooleanOptionalAction, default=False,
                    help="advantage-net loss on legal actions only (the SD-CFR / DREAM / ESCHER authors' nets zero illegal outputs)")
     p.add_argument("--regret-power", type=float, default=1.0,
                    help="advantage samples of iteration t weigh t^power in the fit (1 = linear CFR; DCFR-style alpha = 1.5)")

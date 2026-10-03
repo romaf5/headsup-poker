@@ -40,7 +40,8 @@ class HeadsUpPokerRLGames(SingleAgentEnv):
 
 def create_vec_env(config_name, num_actors, **kwargs):
     opponent, deterministic, seed, seat_mode, device, engine_kwargs = _split_config(kwargs)
-    return make_vec_env(num_actors, opponent, seat_mode=seat_mode, seed=seed, deterministic=deterministic, **engine_kwargs)
+    return make_vec_env(num_actors, opponent, seat_mode=seat_mode, seed=seed, deterministic=deterministic, device=device or "cpu",
+                        **engine_kwargs)
 
 
 def enable_mps_compat():

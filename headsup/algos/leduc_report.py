@@ -90,6 +90,8 @@ def table(rows, setup, xs):
         if setup == "sdcfrp":
             cells = [_fmt([_at(r, 0, x) for r in runs]) for x in xs]
         else:
+            if algo not in NODE_RATIO:
+                raise ValueError(f"no DREAM-code node count ratio for {algo!r} (known: {sorted(NODE_RATIO)})")
             cells = [_fmt([_at(r, 2, x, NODE_RATIO[algo]) for r in runs]) for x in xs]
         out.append(f"| {label} ({len(runs)}) | " + " | ".join(cells) + " |")
         if algo not in done:
@@ -99,16 +101,23 @@ def table(rows, setup, xs):
                 paper = [_interp({k: v[col] for k, v in SDCFR_PAPER.items()}, x) for x in xs]
             else:
                 paper = [_interp(DREAM_PAPER[algo], x) if algo in DREAM_PAPER else None for x in xs]
-            name = {"sdcfr": "SD-CFR" if setup == "sdcfrp" else "ES-SD-CFR", "deepcfr": "Deep CFR", "dream": "DREAM"}[algo]
+            name = {"sdcfr": "SD-CFR" if setup == "sdcfrp" else "ES-SD-CFR", "deepcfr": "Deep CFR", "dream": "DREAM"}.get(algo, algo)
             out.insert(len(out) - 1, f"| **{name}, paper** | " + " | ".join("–" if v is None else f"**{v:.0f}**" for v in paper) + " |")
     return "\n".join(out)
+
+
+def _parse_row(text):
+    """"setup,algo,label,glob" - the label may contain commas (the glob is everything after the last one)."""
+    setup, algo, rest = text.split(",", 2)
+    label, pattern = rest.rsplit(",", 1)
+    return setup, algo, label, pattern
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--row", action="append", default=None, help="setup,algo,label,glob (repeatable; default: DEFAULT_ROWS)")
     args = p.parse_args(argv)
-    rows = [tuple(r.split(",", 3)) for r in args.row] if args.row else DEFAULT_ROWS
+    rows = [_parse_row(r) for r in args.row] if args.row else DEFAULT_ROWS
     print("SD-CFR paper setup (1500 traversals, 750 warm-started updates, 1M buffers), mA/g by iteration:\n")
     print(table(rows, "sdcfrp", (500, 1000, 2000, 3000, 5000)))
     print("\nDREAM paper setup (346 ES / 900 OS traversals, 3000 x 2048 fits from scratch, 2M buffers), mA/g by nodes touched:\n")
