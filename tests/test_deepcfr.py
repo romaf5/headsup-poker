@@ -411,3 +411,34 @@ def test_circular_buffer_loads_a_wrapped_fifo_in_order():
     same.load_state_dict(state)
     same.add(*rows(25, 27))
     assert sorted(same.target[:10].tolist()) == list(range(17, 27))
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_interrupt_inside_an_iteration_keeps_the_checkpoint_consistent(tmp_path, monkeypatch):
+    """Ctrl-C between the two seats' fits: the checkpoint and the SD-CFR bank must describe the last COMPLETE
+    iteration (it saved an advanced counter and one more iterate for seat 0; every later evaluation / resume crashed)."""
+    import headsup.deepcfr.train as train
+
+    real, calls = train.train_advantage_net, []
+
+    def interrupting(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 6:  # iteration 3, seat 1 (two fits per iteration)
+            raise KeyboardInterrupt
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(train, "train_advantage_net", interrupting)
+    common = ["--algo", "both", "--workers", "2", "--device", "cpu", "--no-compile", "--traversals", "30", "--value-steps", "3",
+              "--batch-size", "64", "--policy-epochs", "1", "--eval-hands", "0", "--eval-every", "0", "--policy-eval-every", "0",
+              "--lbr-every", "0", "--lbr-final-hands", "0", "--no-tensorboard", "--adv-capacity", "20000", "--strat-capacity", "20000",
+              "--checkpoint-every", "1", "--out", str(tmp_path)]
+    train.main(["--iterations", "5"] + common)
+    state = torch.load(tmp_path / "checkpoint.pt", map_location="cpu", weights_only=True)
+    assert state["iteration"] == 2
+    assert [next(iter(d.values())).shape[0] for _, d in sorted(state["iterates"].items())] == [3, 3]  # untrained + 2 iterations each
+    bank = torch.load(tmp_path / "iterates.pt", map_location="cpu", weights_only=True)
+    assert bank["T"] == 3
+    monkeypatch.setattr(train, "train_advantage_net", real)
+    train.main(["--resume", str(tmp_path / "checkpoint.pt"), "--iterations", "4"] + common)
+    state = torch.load(tmp_path / "checkpoint.pt", map_location="cpu", weights_only=True)
+    assert state["iteration"] == 4 and torch.load(tmp_path / "iterates.pt", map_location="cpu", weights_only=True)["T"] == 5

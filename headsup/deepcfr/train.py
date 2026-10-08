@@ -406,6 +406,8 @@ class DeepCFRTrainer:
 
     def cfr_iteration(self):
         a = self.args
+        # what an interrupt inside this iteration has to restore (see _rollback)
+        self._undo = (self.iteration, list(self.nets), [len(it) for it in self.iterates] if self.iterates is not None else None)
         self.iteration += 1
         t = float(self.iteration)  # linear CFR weight
         weights = [n.numpy_weights() for n in self.nets]
@@ -466,6 +468,19 @@ class DeepCFRTrainer:
                 self.log("memory/strat", len(self.strat_memory), it)
             self.last_stats = dict(trav=t_trav, train=t_train, nodes=nodes / a.traversals, adv=len(adv),
                                    strat=len(strat) if strat is not None else 0)
+        self._undo = None
+
+    def _rollback(self):
+        """After an interrupt inside an iteration: back to the last complete one - the counter, the current nets and
+        the iterate bank (seat 0 may already have its new net).  The interrupted iteration's samples stay in the
+        memories (reservoir replacement cannot be undone); a resumed run repeats that iteration."""
+        if getattr(self, "_undo", None) is None:
+            return
+        self.iteration, self.nets, lengths = self._undo
+        if lengths is not None:
+            for bank, n in zip(self.iterates, lengths):
+                del bank[n:]
+        self._undo = None
 
     def _advantage_fit_quality(self, seat, n=65536):
         """Unweighted MSE of the freshly fitted net on a memory sample, and the target scale (over the fitted
@@ -591,7 +606,8 @@ class DeepCFRTrainer:
                     self.save_checkpoint()
         except KeyboardInterrupt:
             interrupted = True
-            print("\ninterrupted - training the policy on the samples collected so far")
+            self._rollback()
+            print(f"\ninterrupted - back at iteration {self.iteration}; training the policy on the samples collected so far")
         finally:
             bar.close()
             self.runner.close()
