@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from headsup.algos.best_response import expected_value, exploitability
-from headsup.algos.pdcfr import CHANCE, DECISION, TERMINAL, Tree, discount, mlp, strategy_rows
+from headsup.algos.pdcfr import CHANCE, DECISION, TERMINAL, Tree, discount, mlp, sample_episodes, strategy_rows
 from headsup.games import UniformPolicy, make_game
 
 
@@ -78,3 +78,86 @@ def test_tree_advantages_are_counterfactual_gains():
     eq = CFR(g, "cfr+").iterate(2000).average_policy()
     table = np.stack([eq.table[k] for k in t.info_keys])
     assert max(t.advantages(table, 0).max(), t.advantages(table, 1).max()) < 0.02  # (near-)equilibrium: nothing to gain
+
+
+def _random_profile(tree, rng, floor=0.25):
+    s = np.where(tree.info_legal, rng.random(tree.info_legal.shape), 0.0)
+    s /= s.sum(1, keepdims=True)
+    return floor * tree.info_legal / tree.info_legal.sum(1, keepdims=True) + (1 - floor) * s
+
+
+@pytest.mark.parametrize("baseline", [False, True])
+def test_sampled_advantages_are_unbiased_with_any_baseline(baseline):
+    """E[sampled advantage | infoset visited] is the exact advantage of the current strategy - with no baseline
+    and with an arbitrary one (the baseline only changes the variance)."""
+    g = make_game("kuhn")
+    tree = Tree(g)
+    rng = np.random.default_rng(1)
+    sigma = _random_profile(tree, rng)
+    q = rng.normal(scale=0.5, size=(tree.num_decisions, 3)) if baseline else np.zeros((tree.num_decisions, 3))
+    for p in (0, 1):
+        data = sample_episodes(tree, sigma, q, p, 400_000, 0.6, rng, scale=tree.max_utility)
+        total = np.zeros((tree.num_infosets, 3))
+        np.add.at(total, data["adv_info"], data["adv"])
+        count = np.bincount(data["adv_info"], minlength=tree.num_infosets)
+        mine = tree.info_player == p
+        assert count[mine].min() > 5000 and not count[~mine].any()
+        exact = tree.advantages(sigma, p) / tree.max_utility
+        np.testing.assert_allclose(total[mine] / count[mine][:, None], exact[mine], atol=0.03)
+        assert not data["adv"][~tree.info_legal[data["adv_info"]]].any()  # illegal actions carry no advantage
+        assert (tree.info_player[data["strat_info"]] == 1 - p).all()
+
+
+def test_sampler_transitions_and_counts():
+    g = make_game("leduc")
+    tree = Tree(g)
+    rng = np.random.default_rng(0)
+    sigma = _random_profile(tree, rng)
+    n = 2000
+    data = sample_episodes(tree, sigma, np.zeros((tree.num_decisions, 3)), 0, n, 0.6, rng, scale=13.0)
+    j = len(data["q_node"])
+    assert j == len(data["adv_info"]) + len(data["strat_info"])  # one transition per decision
+    assert int(data["q_done"].sum()) == n  # every episode ends exactly once
+    done = data["q_done"] > 0
+    assert not data["q_reward"][~done].any() and np.abs(data["q_reward"]).max() <= 1.0
+    assert (data["q_next"][done] == 0).all() and (data["q_next_info"][done] == 0).all()
+    assert tree.legal[np.flatnonzero(tree.dec >= 0)[data["q_node"]], data["q_action"]].all()  # only legal actions are taken
+    chance_per_episode = 3  # two private cards, one public card (when round 2 is reached)
+    assert n * 2 + j + n <= data["nodes"] <= n * chance_per_episode + j + n
+    assert (data["adv_reach"] > 0).all() and (data["adv_reach"] <= 1.0).all()
+
+
+def test_sampler_never_takes_a_zero_probability_action():
+    """One-hot strategies (iteration 1: every network outputs zero) and no exploration: every sampled action has
+    probability one, values stay finite."""
+    g = make_game("leduc")
+    tree = Tree(g)
+    last = tree.num_actions - 1 - np.argmax(tree.info_legal[:, ::-1], axis=1)  # the last legal action of each infoset
+    sigma = np.zeros(tree.info_legal.shape)
+    sigma[np.arange(tree.num_infosets), last] = 1.0
+    data = sample_episodes(tree, sigma, np.zeros((tree.num_decisions, 3)), 1, 20_000, 0.0, np.random.default_rng(3), scale=13.0)
+    node = np.flatnonzero(tree.dec >= 0)[data["q_node"]]
+    assert (data["q_action"] == last[tree.info[node]]).all()
+    assert np.isfinite(data["adv"]).all() and np.abs(data["adv"]).max() <= 2.0
+
+
+def test_exact_baseline_removes_most_sampling_variance_for_both_players():
+    """The baseline is PLAYER 0's value and is negated for player 1: with the exact action values of the current
+    profile as baseline, the sampled advantages on Kuhn (no chance below the deal) lose most of their variance
+    for either traverser (an unbiased estimator with a wrong-signed baseline would gain variance instead)."""
+    g = make_game("kuhn")
+    tree = Tree(g)
+    rng = np.random.default_rng(2)
+    sigma = _random_profile(tree, rng)
+    v0 = tree.values(sigma) / tree.max_utility
+    dec = np.flatnonzero(tree.dec >= 0)
+    exact = np.where(tree.legal[dec], v0[np.maximum(tree.child[dec], 0)], 0.0)  # (num_decisions, A): player 0's action values
+    for p in (0, 1):
+        var = []
+        for q in (np.zeros_like(exact), exact):
+            data = sample_episodes(tree, sigma, q, p, 100_000, 0.6, rng, scale=tree.max_utility)
+            mean = np.zeros((tree.num_infosets, 3))
+            np.add.at(mean, data["adv_info"], data["adv"])
+            mean /= np.maximum(np.bincount(data["adv_info"], minlength=tree.num_infosets), 1)[:, None]
+            var.append(((data["adv"] - mean[data["adv_info"]]) ** 2).mean())
+        assert var[1] < 0.25 * var[0], (p, var)

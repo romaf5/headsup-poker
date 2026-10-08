@@ -187,3 +187,74 @@ class Tree:
                 else:
                     reach[kids] = reach[i] * sigma[self.info[i], a]
         return num / np.maximum(den, 1e-300)[:, None]
+
+
+def sample_episodes(tree, sigma, q, traverser, n, epsilon, rng, scale=1.0):
+    """``n`` outcome-sampling episodes for ``traverser``, all at once.  The traverser samples
+    ``xi = eps * uniform + (1 - eps) * sigma``, the opponent ``sigma``, chance its distribution.  Backwards along
+    each trajectory, at every decision node h with sampled action a* and child h':
+
+        v(h, a) = Q_i(h, a) + [a = a*] (v(h') - Q_i(h, a)) / xi(a*),      v(h) = sum_a sigma(a) v(h, a)
+
+    with Q_i = +-q (the baseline of player 0's value) and terminal values u_i / scale.  Traverser nodes give an
+    advantage sample v(h, .) - v(h); opponent nodes a strategy sample; every decision a baseline transition."""
+    sign = 1.0 if traverser == 0 else -1.0
+    visited = 0
+
+    def deal(nodes):  # resolve chance nodes (several can follow each other)
+        nonlocal visited
+        while True:
+            c = np.flatnonzero(tree.kind[nodes] == CHANCE)
+            if len(c) == 0:
+                return nodes
+            j = (rng.random(len(c))[:, None] >= tree.chance_cum[nodes[c]]).sum(1)
+            nodes[c] = tree.chance_child[nodes[c], j]
+            visited += len(c)
+
+    rows = np.arange(n)  # the episodes still running
+    h = deal(np.zeros(n, dtype=np.int64))  # their current decision nodes
+    value = np.zeros(n)  # per episode: the value of the node below the step being processed
+    reach = np.ones(n)  # the traverser's own sampling reach of the current node
+    steps = []
+    while len(rows):
+        visited += len(rows)
+        info, legal = tree.info[h], tree.legal[h]
+        sig = sigma[info]
+        mine = tree.player[h] == traverser
+        xi = np.where(mine[:, None], epsilon * legal / legal.sum(1, keepdims=True) + (1.0 - epsilon) * sig, sig)
+        cum = np.cumsum(xi, axis=1)
+        # inverse CDF: the number of cumulative sums not above the draw; an action with probability 0 is never hit
+        a = (rng.random(len(rows))[:, None] * cum[:, -1:] >= cum).sum(1)
+        ar = np.arange(len(rows))
+        p_a = xi[ar, a] / cum[:, -1]
+        nxt = deal(tree.child[h, a])
+        done = tree.kind[nxt] == TERMINAL
+        visited += int(done.sum())
+        value[rows[done]] = sign * tree.util[nxt[done]] / scale
+        steps.append(dict(rows=rows, h=h, info=info, legal=legal, sig=sig, mine=mine, a=a, p=p_a, nxt=nxt, done=done, reach=reach[rows]))
+        reach[rows[mine]] *= p_a[mine]
+        rows, h = rows[~done], nxt[~done]
+
+    adv_info, adv, adv_reach, strat_info = [], [], [], []
+    for s in reversed(steps):
+        ar = np.arange(len(s["rows"]))
+        qh = sign * q[tree.dec[s["h"]]] * s["legal"]
+        qh[ar, s["a"]] += (value[s["rows"]] - qh[ar, s["a"]]) / s["p"]
+        v = (qh * s["sig"]).sum(1)
+        mine = s["mine"]
+        adv_info.append(s["info"][mine])
+        adv.append(((qh - v[:, None]) * s["legal"])[mine])
+        adv_reach.append(s["reach"][mine])
+        strat_info.append(s["info"][~mine])
+        value[s["rows"]] = v
+    cat = np.concatenate
+    return {
+        "adv_info": cat(adv_info), "adv": cat(adv), "adv_reach": cat(adv_reach), "strat_info": cat(strat_info),
+        "q_node": cat([tree.dec[s["h"]] for s in steps]),
+        "q_action": cat([s["a"] for s in steps]),
+        "q_next": cat([np.where(s["done"], 0, tree.dec[s["nxt"]]) for s in steps]),
+        "q_next_info": cat([np.where(s["done"], 0, tree.info[s["nxt"]]) for s in steps]),
+        "q_reward": cat([np.where(s["done"], tree.util[s["nxt"]] / scale, 0.0) for s in steps]),
+        "q_done": cat([s["done"].astype(np.float32) for s in steps]),
+        "nodes": visited,
+    }
