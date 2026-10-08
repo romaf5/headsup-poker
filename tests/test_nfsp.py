@@ -353,7 +353,7 @@ def test_m_sl_receives_exactly_the_best_response_decisions(preset):
     assert s.rl_memory[0].seen > 2 * s.sl_memory[0].seen  # M_RL has the average-mode decisions as well
 
 
-_GAMES = [("paper", "kuhn", 1.0), ("paper", "leduc", 1.0), ("dream", "kuhn", 0.4), ("dream", "leduc", 2.6)]
+_GAMES = [("paper", "kuhn", 0.4), ("paper", "leduc", 2.6), ("dream", "kuhn", 0.4), ("dream", "leduc", 2.6), ("antes", "leduc", 1.0)]
 
 
 @pytest.mark.parametrize("preset,game,scale", _GAMES)
@@ -361,7 +361,8 @@ def test_every_transition_reaches_m_rl_for_both_seats(preset, game, scale):
     """A step-by-step replay of every table: each player's consecutive decisions are linked by a zero-reward
     transition to its OWN next infoset; the end of a hand completes both players' last decisions with their own
     utility (seat 1: the negative), scaled; nothing leaks into the next hand."""
-    s = _solver(preset, game=game, eta=0.5, envs=32, steps=32, seed=1)
+    kw = dict(preset="paper", reward_scale=1.0) if preset == "antes" else dict(preset=preset)  # both presets: the largest utility / 5
+    s = _solver(game=game, eta=0.5, envs=32, steps=32, seed=1, **kw)
     assert s.reward_scale == pytest.approx(scale)
     tree, n = s.tree, s.envs
     calls = _spy_actions(s)
@@ -619,15 +620,15 @@ def test_iteration_plays_then_updates_q_then_pi():
 
 
 def test_presets_set_what_they_claim():
-    paper = dict(arch="mlp", hidden=64, layers=1, lr_q=0.1, lr_pi=0.005, grad_clip=0.0, double_dqn=False, reward_scale=1.0,
+    paper = dict(arch="mlp", hidden=64, layers=1, lr_q=0.1, lr_pi=0.005, grad_clip=0.0, double_dqn=False, reward_scale=None,
                  eps_start=0.06, eps_const=None, shared_explore=False, batch=128, updates=2, steps=128, envs=128,
                  rl_capacity=200_000, sl_capacity=2_000_000, sl_min_prob=0.0, sl_window=False, target_every=300, eta=0.1)
     assert PRESETS["paper"] == paper
     assert {k: v for k, v in PRESETS["dream"].items() if paper[k] != v} == dict(
-        arch="deepcfr_dueling", lr_pi=0.01, grad_clip=1.0, double_dqn=True, reward_scale=None, eps_const=0.01, shared_explore=True)
+        arch="deepcfr_dueling", lr_pi=0.01, grad_clip=1.0, double_dqn=True, eps_const=0.01, shared_explore=True)
     for preset in ("paper", "dream"):
         s = _solver(preset, game="leduc")
-        want = dict(PRESETS[preset], reward_scale=1.0 if preset == "paper" else 2.6)  # DREAM: stack / 5
+        want = dict(PRESETS[preset], reward_scale=2.6)  # None: the largest utility / 5 (the DREAM code: stack / 5)
         assert s.config == want and all(getattr(s, k) == v for k, v in want.items())
         assert all(type(n).__name__ == ("MLP" if preset == "paper" else "Dueling") for n in s.Q + s.Pi)
         assert len({id(n) for n in s.Q + s.Pi}) == 4 and not np.array_equal(s.Q[0].theta, s.Q[1].theta)
@@ -666,7 +667,7 @@ def test_average_policy_is_the_profile_of_the_pi_networks():
 
 @pytest.mark.parametrize("preset,iterations,bound", [("paper", 3000, 0.26), ("dream", 700, 0.2)])
 def test_kuhn_converges(preset, iterations, bound):
-    """8 / 6 seeds: 0.42-0.51 untrained; paper 0.16-0.21 after 3000 iterations, dream 0.10-0.14 after 700."""
+    """8 / 6 seeds: 0.42-0.51 untrained; paper 0.16-0.20 after 3000 iterations, dream 0.10-0.14 after 700."""
     s = _solver(preset, seed=0)
     start = s.evaluate()["average"]
     assert 0.3 < start < 0.6  # an untrained profile is near uniform play (0.458)

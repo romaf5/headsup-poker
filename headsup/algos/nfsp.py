@@ -10,8 +10,10 @@ Two presets (docs/superpowers/specs/2026-10-08-nfsp-design.md lists every differ
 
 * ``paper`` - the paper's Leduc setup: 1 x 64 ReLU MLPs, plain SGD (0.1 / 0.005), DQN, eps = 0.06 / sqrt(iteration);
 * ``dream`` - the DREAM authors' NFSP (EricSteinberger/DREAM, Leduc_NFSP.py): Deep-CFR-style nets with a dueling Q
-  head, Double DQN, SGD (0.1 / 0.01) with gradient clipping, rewards / 2.6, eps = 0.06 / (1 + 0.01 sqrt(iteration)).
+  head, Double DQN, SGD (0.1 / 0.01) with gradient clipping, eps = 0.06 / (1 + 0.01 sqrt(iteration)).
 
+Rewards are in the DREAM code's unit (utilities / 2.6 in Leduc) in both: the paper does not state its unit, and with
+antes its learning rate of 0.1 leaves half of the Q networks' hidden units dead (``--reward-scale 1``).
 An iteration is 128 environment steps (one decision at each of 128 parallel tables) followed by 2 SGD steps per network.
 Small games only: the tree is compiled to arrays, memories hold infoset indices, and the networks are numpy arrays
 with a hand-written backward pass (an autograd step on a 64-unit network costs 5-7 times its arithmetic).
@@ -33,13 +35,13 @@ import torch.nn as nn
 from headsup.algos.best_response import TabularPolicy, exploitability
 from headsup.algos.pdcfr import CHANCE, TERMINAL, Tree
 
-_PAPER = dict(arch="mlp", hidden=64, layers=1, lr_q=0.1, lr_pi=0.005, grad_clip=0.0, double_dqn=False, reward_scale=1.0,
+# reward_scale None: the game's largest utility / 5 (the DREAM code divides by stack / 5: 2.6 in Leduc)
+_PAPER = dict(arch="mlp", hidden=64, layers=1, lr_q=0.1, lr_pi=0.005, grad_clip=0.0, double_dqn=False, reward_scale=None,
               eps_start=0.06, eps_const=None, shared_explore=False, batch=128, updates=2, steps=128, envs=128,
               rl_capacity=200_000, sl_capacity=2_000_000, sl_min_prob=0.0, sl_window=False, target_every=300, eta=0.1)
-# reward_scale None: the game's largest utility / 5 (the DREAM code divides by stack / 5: 2.6 in Leduc)
 PRESETS = {"paper": _PAPER,
-           "dream": {**_PAPER, "arch": "deepcfr_dueling", "lr_pi": 0.01, "grad_clip": 1.0, "double_dqn": True, "reward_scale": None,
-                     "eps_const": 0.01, "shared_explore": True}}
+           "dream": {**_PAPER, "arch": "deepcfr_dueling", "lr_pi": 0.01, "grad_clip": 1.0, "double_dqn": True, "eps_const": 0.01,
+                     "shared_explore": True}}
 ARCHS = ("mlp", "deepcfr_dueling")
 
 _FILLED = {}
