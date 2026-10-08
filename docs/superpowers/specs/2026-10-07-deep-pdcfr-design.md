@@ -92,6 +92,9 @@ Deliberate deviations from the authors' code:
    theirs are drawn without replacement, and the whole batch is used when it is smaller than 2 048.
 7. The episodes of an iteration are sampled in one vectorised pass over a compiled game tree; they are independent
    given the networks, so this is the same distribution as sampling them one at a time.
+8. Small differences found by the review of the implementation: `Q` gets 1 000 steps where their loop does 1 001; it
+   is fitted even when the buffer holds less than one minibatch (theirs skips the fit); the curve has no
+   0-episode row of the untrained networks.
 
 ## Architecture
 
@@ -144,3 +147,35 @@ PDCFR+ 158 / 121 / 115 / 88). The paper's own baselines at 10 M episodes: DREAM 
 
 Kuhn runs take minutes. A Leduc run is about 2-3 hours (10 M Python episodes plus roughly 3 M SGD steps); the
 six Leduc runs go in parallel on one GPU and ~12 cores, 3-4 hours of wall time (approved 2026-10-07).
+
+## Result (2026-10-08)
+
+Twelve runs (Kuhn and Leduc, both variants, seeds 0-2, 10 M episodes each) on the two GPUs, four at a time: 27-40
+minutes per run (3.2-4.8 s per iteration of 20 000 episodes). One run hit a transient CUDA out-of-memory under WSL
+and resumed from its checkpoint. Exploitability of the average-policy net in mA/g, mean ± sd over the seeds; the last
+column is the mean over 9-10 M episodes (`python -m headsup.algos.leduc_report`):
+
+| Leduc, by episodes | 1e6 | 2e6 | 4e6 | 8e6 | 9-10 M |
+|---|---|---|---|---|---|
+| VR-DeepDCFR+, paper | 152 | 121 | 114 | 85 | 89 (95 % band 51-133) |
+| VR-DeepDCFR+, ours | 101 ± 11 | 79 ± 8 | 69 ± 6 | 68 ± 5 | 69 ± 1 |
+| VR-DeepPDCFR+, paper | 158 | 121 | 115 | 88 | 90 (95 % band 63-147) |
+| VR-DeepPDCFR+, ours | 102 ± 6 | 82 ± 5 | 84 ± 6 | 77 ± 6 | 77 ± 5 |
+
+| Kuhn, by episodes | 1e6 | 2e6 | 4e6 | 8e6 | 9-10 M |
+|---|---|---|---|---|---|
+| VR-DeepDCFR+, paper | 8.7 | 7.0 | 5.2 | 5.6 | 5.3 |
+| VR-DeepDCFR+, ours | 9.3 ± 2.5 | 7.7 ± 2.3 | 6.3 ± 1.5 | 5.6 ± 0.3 | 5.4 ± 1.0 |
+| VR-DeepPDCFR+, paper | 4.1 | 4.3 | 4.1 | 4.3 | 3.3 |
+| VR-DeepPDCFR+, ours | 4.2 ± 0.6 | 4.7 ± 1.0 | 3.4 ± 0.5 | 2.9 ± 0.3 | 3.0 ± 0.2 |
+
+All success criteria are met: both Leduc means are inside the paper's 95 % bands, the Kuhn values are within 10 % of
+the paper's. On Leduc our curves lie below the paper's from the first million episodes on (about a third lower); the
+deviations listed above (inputs, final `Q` weights, minibatches with replacement) are the candidates, and none of
+them was isolated. The predictive variant is not better than the plain one on Leduc here (77 against 69), as in the
+paper (90 against 89).
+
+An independent review of the implementation compared the episode sampler with a scalar re-implementation of the
+authors' `dfs` (120 000 Leduc episodes, counts and advantage means within noise), the strategy rule with their
+`get_policy` (20 000 random cases, no mismatch) and both fit losses with their formulas (equal to 15 digits).
+

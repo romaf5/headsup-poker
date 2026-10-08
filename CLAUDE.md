@@ -1,7 +1,9 @@
 # CLAUDE.md — working notes for this repository
 
 Heads-up hold'em research code: engine (Python + C++), DeepCFR / SD-CFR / DREAM / ESCHER, tabular
-Pluribus-style blueprint + real-time search, best-response / LBR / PPO evaluation, browser UI.
+Pluribus-style blueprint + real-time search, best-response / LBR / PPO evaluation, browser UI. Small-game
+solvers (Kuhn / Leduc, exact exploitability): `headsup/algos/` - tabular CFR family, the deep algorithms
+(`deep.py`), Deep DCFR+ / PDCFR+ (`pdcfr.py`); their design specs are in `docs/superpowers/specs/`.
 README.md is the user-facing documentation (commands, results); this file holds what a new
 session needs to work on the code safely. docs/paper-fidelity.md lists every known difference from the papers
 (fixed / by choice / open) - update it when one is closed or found.

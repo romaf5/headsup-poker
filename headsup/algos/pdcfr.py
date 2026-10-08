@@ -10,7 +10,7 @@ Xu, Li, Fu, Fu, Xing & Cheng 2025 (arXiv 2511.08174), following the authors' cod
 * outcome sampling (the traverser explores with ``eps``), variance-reduced by a history-action baseline ``Q``
   (player 0's value; negated for player 1) that is re-fitted from scratch with expected-SARSA targets;
 * the result is an average-strategy network fitted on a reservoir of ``(I, t, sigma_t(I))`` with weights
-  ``(t / T)^gamma``.
+  ``(2 t / T)^gamma`` (T = the current iteration).
 
 Where the paper and the code disagree the defaults follow the code (see docs/superpowers/specs/2026-10-07-deep-pdcfr-design.md).
 Small games only: the whole tree is compiled to arrays and the episodes of an iteration are sampled in one
@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 
 from headsup.algos.best_response import TabularPolicy, exploitability
-from headsup.algos.deep import _adam, _batch_index, _optimise
+from headsup.algos.deep import _adam, _batch_index, _load_optimiser, _optimise
 from headsup.deepcfr.memory import ReservoirBuffer
 
 VARIANTS = ("dcfr+", "pdcfr+")
@@ -291,18 +291,6 @@ def baseline_target(reward, done, next_q, next_sigma):
     return reward + (1.0 - done) * (next_q * next_sigma).sum(1)
 
 
-def _load_optimiser(opt, saved):
-    """Load an optimiser's state without sharing tensors with ``saved`` (two solvers must never step one Adam)
-    and without taking over the checkpoint's device-dependent switches: fused / capturable are what ``_adam``
-    chose for THIS solver's device (a CPU-written checkpoint would leave a CUDA solver's persistent optimiser
-    non-capturable inside the CUDA graph)."""
-    saved = copy.deepcopy(saved)
-    for group, mine in zip(saved["param_groups"], opt.param_groups):
-        for key in ("fused", "capturable", "foreach"):
-            group[key] = mine.get(key)
-    opt.load_state_dict(saved)
-
-
 class PDCFRSolver:
     def __init__(self, game, variant="pdcfr+", traversals=10_000, epsilon=0.6, alpha=None, gamma=None, discount_offset=None,
                  adv_steps=750, adv_batch=2048, q_steps=1000, q_batch=2048, q_capacity=1_000_000, q_sync=50,
@@ -470,8 +458,17 @@ class PDCFRSolver:
         return self._tabular(probs.cpu().numpy().astype(np.float64))
 
     def evaluate(self):
-        return {"current": exploitability(self.game, self.current_policy())[0],
-                "average": exploitability(self.game, self.average_policy())[0]}
+        """Exploitability of the current strategy and of the fitted average policy.  The fit draws from torch's
+        generators; they are put back, so a run does not depend on how often it is evaluated."""
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if self.device.type == "cuda" else None
+        try:
+            return {"current": exploitability(self.game, self.current_policy())[0],
+                    "average": exploitability(self.game, self.average_policy())[0]}
+        finally:
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
 
     # -- checkpoints -----------------------------------------------------------------------------------
     def state_dict(self):
@@ -513,7 +510,7 @@ class PDCFRSolver:
 
 
 def main(argv=None):
-    from headsup.games import make_game
+    from headsup.games import make_small_game
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--game", default="leduc")
@@ -543,7 +540,7 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", default=None)
     args = p.parse_args(argv)
-    game = make_game(args.game)
+    game = make_small_game(args.game)
     solver = PDCFRSolver(game, args.variant, traversals=args.traversals, epsilon=args.epsilon, alpha=args.alpha, gamma=args.gamma,
                          discount_offset=args.discount_offset, adv_steps=args.adv_steps, adv_batch=args.adv_batch, q_steps=args.q_steps,
                          q_batch=args.q_batch, policy_steps=args.policy_steps, policy_batch=args.policy_batch, fallback=args.fallback,

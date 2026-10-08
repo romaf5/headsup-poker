@@ -464,3 +464,23 @@ def test_loading_keeps_this_solvers_optimiser_switches():
     b.load_state_dict(state)
     assert [(g.get("fused"), g.get("capturable")) for o in b.opt_R + b.opt_r for g in o.param_groups] == fresh
     b.iterate(1)
+
+
+def test_evaluation_does_not_change_the_training_trajectory():
+    """evaluate() fits the average-policy net with torch's generator: the run depended on --eval-every."""
+    def run(evaluate):
+        s = _small("pdcfr+", traversals=200, adv_steps=10, q_steps=10, policy_steps=10)
+        s.iterate(2)
+        if evaluate:
+            s.evaluate()
+        s.iterate(1)
+        return torch.cat([p.detach().flatten() for n in s.R + s.r for p in n.parameters()])
+
+    torch.testing.assert_close(run(True), run(False))
+
+
+def test_cli_refuses_games_it_cannot_enumerate():
+    from headsup.algos.pdcfr import main
+
+    with pytest.raises(ValueError, match="small game"):
+        main(["--game", "fhp", "--episodes", "1000"])

@@ -37,7 +37,8 @@ Opponents: `pluribus` (blueprint + real-time search), `tab` (blueprint), `cfr` (
 |---|---|---|
 | Deep CFR, SD-CFR, DREAM, ESCHER (hold'em) | `headsup/deepcfr/`, `sdcfr.py` | `python -m headsup.deepcfr.train --algo both --features history --net paper --out runs/x` |
 | same on Leduc / Kuhn | `headsup/algos/deep.py` | `python -m headsup.algos.deep --game leduc --algo sdcfr` |
-| tabular CFR, CFR+, DCFR, PCFR+, MCCFR | `headsup/algos/tabular.py` | reference solvers for the small games |
+| Deep DCFR+ / Deep PDCFR+ (Leduc / Kuhn) | `headsup/algos/pdcfr.py` | `python -m headsup.algos.pdcfr --game leduc --variant pdcfr+` |
+| tabular CFR, CFR+, DCFR, PCFR+, DCFR+, PDCFR+, MCCFR | `headsup/algos/tabular.py` | reference solvers for the small games |
 | Pluribus blueprint (Linear MCCFR + pruning) | `headsup/blueprint.py` | `python -m headsup.blueprint --game nlhe --iterations 20000000 --out runs/bp.pt` |
 | real-time search (depth-limited, Pluribus mode) | `headsup/search.py` | player spec `search:<blueprint>[@pluribus]` |
 
@@ -108,6 +109,33 @@ What it took, beyond the papers' text (all taken from the authors' code):
 - **The DREAM plot's x-axis** counts decision and terminal nodes only (ours / 1.23 for ES, / 1.64 for DREAM's
   sampler); the paper values are its 3-seed means (single-seed tails excluded).
 
+**Deep (Predictive) Discounted CFR** (Xu et al. 2025): persistent cumulative-advantage networks that are bootstrapped
+from their own discounted, clipped output, outcome sampling with a learned baseline, and an average-policy network.
+Paper setup, 10 000 episodes per player and iteration, 3 seeds; the last column is the mean over 9-10 M episodes:
+
+| Leduc, by episodes | 1e6 | 2e6 | 4e6 | 8e6 | 9-10 M |
+|---|---|---|---|---|---|
+| **VR-DeepDCFR+, Xu et al. (2025)** | **152** | **121** | **114** | **85** | **89** |
+| VR-DeepDCFR+ (3) | 101 ± 11 | 79 ± 8 | 69 ± 6 | 68 ± 5 | 69 ± 1 |
+| **VR-DeepPDCFR+, Xu et al. (2025)** | **158** | **121** | **115** | **88** | **90** |
+| VR-DeepPDCFR+ (3) | 102 ± 6 | 82 ± 5 | 84 ± 6 | 77 ± 6 | 77 ± 5 |
+
+| Kuhn, by episodes | 1e6 | 2e6 | 4e6 | 8e6 | 9-10 M |
+|---|---|---|---|---|---|
+| **VR-DeepDCFR+, Xu et al. (2025)** | **8.7** | **7.0** | **5.2** | **5.6** | **5.3** |
+| VR-DeepDCFR+ (3) | 9.3 ± 2.5 | 7.7 ± 2.3 | 6.3 ± 1.5 | 5.6 ± 0.3 | 5.4 ± 1.0 |
+| **VR-DeepPDCFR+, Xu et al. (2025)** | **4.1** | **4.3** | **4.1** | **4.3** | **3.3** |
+| VR-DeepPDCFR+ (3) | 4.2 ± 0.6 | 4.7 ± 1.0 | 3.4 ± 0.5 | 2.9 ± 0.3 | 3.0 ± 0.2 |
+
+```bash
+python -m headsup.algos.pdcfr --game leduc --variant pdcfr+ --episodes 10000000 --device cuda   # ~35 min on an RTX 3090
+```
+
+Both Leduc results lie inside the paper's 95 % bands (51-133 and 63-147 at 10 M episodes) and below its curves
+throughout; Kuhn matches. Where the paper and the authors' code differ, the defaults follow the code (discount
+constant 1.5 for DCFR+, 1 000 baseline steps, the prediction network is never re-initialised, first-legal-action
+fallback); `--discount-offset`, `--q-steps`, `--reinit-prediction` and `--fallback` give the paper's values.
+
 ESCHER's paper has no deep Leduc results. Its Leduc experiment is tabular with oracle history
 values (`python -m headsup.algos.oracle`, 500 trajectories per iteration, 1000 iterations):
 
@@ -177,4 +205,6 @@ Brown & Sandholm, Pluribus (Science 2019), [nested subgame solving](https://arxi
 [DCFR](https://arxiv.org/abs/1809.04040) (AAAI 2019) ·
 Brown, Sandholm & Amos, [depth-limited solving](https://arxiv.org/abs/1805.08195) (NeurIPS 2018) ·
 Lisý & Bowling, [LBR](https://arxiv.org/abs/1612.07547) (2017) ·
-Farina, Kroer & Sandholm, [PCFR+](https://arxiv.org/abs/2007.14358) (AAAI 2021)
+Farina, Kroer & Sandholm, [PCFR+](https://arxiv.org/abs/2007.14358) (AAAI 2021) ·
+Xu et al., [DCFR+ / PDCFR+](https://arxiv.org/abs/2404.13891) (IJCAI 2024) and
+[Deep (Predictive) Discounted CFR](https://arxiv.org/abs/2511.08174) (2025)
