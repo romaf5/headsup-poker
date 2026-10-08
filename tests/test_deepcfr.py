@@ -720,3 +720,68 @@ def test_escher_value_net_sees_all_trajectories_of_its_iteration(tmp_path):
     trainer.cfr_iteration()
     assert seen[0] > 40 and len(trainer.value_memory[0]) == seen[0]
     trainer.runner.close()
+
+
+def test_advantage_fit_can_anneal_the_learning_rate_and_average_its_weights(monkeypatch):
+    """Two refits of one regret net on the same memory disagree (FHP at t = 125: 6.7 chips rms per net at the pre-flop
+    infosets, where a tabular mean of the same samples has a standard error of 4.5), and regret matching turns that
+    noise into the strategy.  A cosine learning rate, or the average of the weights over the second half of the fit,
+    brings it to 2.7-2.9 at the same number of steps.  Not in the paper (constant rate, last weights): off by default."""
+    import headsup.deepcfr.train as train
+
+    w = [BaseModel().numpy_weights(), BaseModel().numpy_weights()]
+    adv, _, _ = run_traversals_python(w, 0, 100, 1.0, seed=0)
+    buf = ReservoirBuffer(10000, "cpu", obs_dim=31, seed=0)
+    buf.add(adv.obs, adv.t, adv.target)
+    rates, weights = [], []
+    step = train._run_step
+
+    def spy(fwd, model, opt, obs, t, target, loss_fn, grad_clip, legal=None):
+        rates.append(opt.param_groups[0]["lr"])
+        out = step(fwd, model, opt, obs, t, target, loss_fn, grad_clip, legal)
+        weights.append({k: v.detach().clone() for k, v in model.state_dict().items()})
+        return out
+
+    monkeypatch.setattr(train, "_run_step", spy)
+    kw = dict(steps=20, batch_size=64, compile=False, target_scale=None)
+    train.train_advantage_net(buf, "cpu", **kw)
+    assert set(rates) == {1e-3}  # the paper: a constant rate
+    rates.clear()
+    train.train_advantage_net(buf, "cpu", lr_schedule="cosine", **kw)
+    assert rates == pytest.approx([1e-3 * 0.5 * (1 + np.cos(np.pi * i / 20)) for i in range(20)]) and rates[-1] < 1e-5
+    with pytest.raises(ValueError, match="schedule"):
+        train.train_advantage_net(buf, "cpu", lr_schedule="linear", **kw)
+
+    weights.clear()
+    last, _ = train.train_advantage_net(buf, "cpu", **kw)
+    assert all(torch.equal(v, weights[-1][k]) for k, v in last.state_dict().items())  # default: the last weights
+    weights.clear()
+    net, _ = train.train_advantage_net(buf, "cpu", weight_average=0.9, **kw)
+    want = {k: v.clone() for k, v in weights[9].items()}  # the average starts at the middle of the fit ...
+    for snap in weights[10:]:
+        for k in want:
+            want[k] = 0.9 * want[k] + 0.1 * snap[k]  # ... as an exponential moving average
+    assert not net.training
+    for k, v in net.state_dict().items():
+        assert torch.allclose(v, want[k], atol=1e-7), k
+    assert any(not torch.allclose(v, weights[-1][k], atol=1e-5) for k, v in net.state_dict().items())
+
+
+def test_fit_options_reach_the_fit_and_are_inherited_on_resume(tmp_path, monkeypatch):
+    import headsup.deepcfr.train as train
+
+    assert (train.cli_args(_TINY).lr_schedule, train.cli_args(_TINY).weight_average) == ("constant", 0.0)
+    seen = []
+    fit = train.train_advantage_net
+
+    def spy(*args, **kw):
+        seen.append((kw.get("lr_schedule"), kw.get("weight_average")))
+        return fit(*args, **kw)
+
+    monkeypatch.setattr(train, "train_advantage_net", spy)
+    out = tmp_path / "run"
+    train.main(["--algo", "sdcfr", "--iterations", "1", "--checkpoint-every", "1", "--lr-schedule", "cosine", "--weight-average", "0.5",
+                "--out", str(out)] + _TINY)
+    assert seen and set(seen) == {("cosine", 0.5)}
+    a = train.cli_args(["--resume", str(out / "checkpoint.pt")])
+    assert (a.lr_schedule, a.weight_average) == ("cosine", 0.5)

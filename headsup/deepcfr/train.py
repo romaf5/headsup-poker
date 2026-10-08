@@ -14,6 +14,7 @@ memory, saved to ``<out>/policy.pth`` and evaluated against simple opponents.
 
 import argparse
 import json
+import math
 import os
 import time
 
@@ -104,10 +105,16 @@ def _power_weighted_mse(power, masked=False, scale=1.0):
 def train_advantage_net(
     buffer, device, steps, batch_size, lr=1e-3, grad_clip=1.0, log=None, tag="", compile=True, log_step_offset=0, log_every=100,
     model_config=None, weight_power=1.0, target_scale="auto", masked=False, iteration=0, loss_weights="paper", zero_head=False,
+    lr_schedule="constant", weight_average=0.0,
 ):
     """Fresh network fitted to (obs -> regrets) with iteration-weighted MSE (weight t^weight_power, rescaled for
     the fit of ``iteration`` as ``loss_weights`` says: :func:`loss_weight_scale`).  The network starts "from a
     random initialization" (paper 5.2) unless ``zero_head``.
+
+    ``lr_schedule``: ``constant`` (the paper) or ``cosine`` (from ``lr`` to 0 over the fit).  ``weight_average``
+    d > 0: the returned network is the exponential moving average (decay d) of the weights over the second half of the
+    fit instead of the last weights.  Both shrink the part of a refit that is optimiser noise - two refits on the same
+    FHP memory differ by 6.7 chips rms per net at the pre-flop infosets, 2.7-2.9 with either (4,000 steps).
 
     ``target_scale``: the regrets are divided by it for the fit and the output layer is multiplied
     by it afterwards, so the network still predicts chips.  From a zero-initialised head, Adam's
@@ -132,16 +139,22 @@ def train_advantage_net(
     scale = float(target_scale or 1.0)
     if len(buffer) == 0:  # no samples yet (e.g. the opponent folds every hand before this seat acts): uniform net
         return BaseModel(config=model_config).to(device).eval(), float("nan")
+    if lr_schedule not in ("constant", "cosine"):
+        raise ValueError(f"learning-rate schedule {lr_schedule!r}: constant or cosine")
     model = BaseModel(config=model_config, zero_head=zero_head).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     model.train()
     fwd = maybe_compile(model, compile)
     loss_fn = _power_weighted_mse(weight_power, masked, loss_weight_scale(iteration, weight_power, loss_weights))
     loss = None
+    average = None  # the moving average of the parameters, from the middle of the fit
     for step, (obs, t, target, *legal) in enumerate(buffer.prefetch(batch_size, steps, with_legal=masked)):
         legal = legal[0] if legal else None
         if scale != 1.0:
             target = target / scale
+        if lr_schedule == "cosine":
+            for group in opt.param_groups:
+                group["lr"] = lr * 0.5 * (1.0 + math.cos(math.pi * step / steps))
         try:
             loss = _run_step(fwd, model, opt, obs, t, target, loss_fn, grad_clip, legal)
         except Exception as exc:
@@ -152,6 +165,17 @@ def train_advantage_net(
             loss = _run_step(fwd, model, opt, obs, t, target, loss_fn, grad_clip, legal)
         if log is not None and step % log_every == 0:
             log(f"advantage{tag}/loss", loss.item(), log_step_offset + step)
+        if weight_average and step + 1 >= steps // 2:
+            with torch.no_grad():
+                if average is None:
+                    average = [p.detach().clone() for p in model.parameters()]
+                else:
+                    for avg, p in zip(average, model.parameters()):
+                        avg.mul_(weight_average).add_(p, alpha=1.0 - weight_average)
+    if average is not None:
+        with torch.no_grad():
+            for avg, p in zip(average, model.parameters()):
+                p.copy_(avg)
     model.eval()
     if scale != 1.0:
         with torch.no_grad():
@@ -511,6 +535,8 @@ class DeepCFRTrainer:
                 loss_weights=a.loss_weights,
                 target_scale=None if a.target_scale == "none" else ("auto" if a.target_scale == "auto" else float(a.target_scale)),
                 masked=self.masked_loss,
+                lr_schedule=a.lr_schedule,
+                weight_average=a.weight_average,
             )
             weights[seat] = self.nets[seat].numpy_weights()
             if self.iterates is not None:
@@ -780,6 +806,11 @@ def build_parser():
     p.add_argument("--loss-weights", default=None, choices=["paper", "raw"],
                    help="sample weights of the fits at iteration T: paper = t rescaled by 2/T (DeepCFR 5.3; default) | raw = t "
                         "(the loss and its gradient grow with T; the behaviour before 2026-10-08)")
+    p.add_argument("--lr-schedule", default="constant", choices=["constant", "cosine"],
+                   help="advantage-net fit: constant learning rate (the paper) | cosine from --lr to 0 (less refit noise)")
+    p.add_argument("--weight-average", type=float, default=0.0,
+                   help="advantage-net fit: return the exponential moving average of the weights over the second half of the fit "
+                        "(decay, e.g. 0.998) instead of the last weights; 0 = off (the paper)")
     p.add_argument("--policy-lr-decay", type=float, default=None,
                    help="policy-net fit: learning-rate factor per epoch (per 2 %% of --policy-steps); default: constant lr, as the "
                         "authors (0.9 = the earlier schedule here)")
@@ -857,7 +888,7 @@ RESUME_INHERITED = ("algo", "traversals", "adv_capacity", "strat_capacity", "val
                     "policy_steps", "policy_batch_size", "regret_power", "strategy_power", "epsilon", "q_steps", "q_batch",
                     "q_capacity", "value_trajectories", "eval_hands", "eval_every", "policy_eval_every", "lbr_every", "lbr_hands",
                     "lbr_final_hands", "lbr_tables", "lbr_model_iterates", "seed", "lr", "target_scale", "value_epsilon", "masked_loss",
-                    "checkpoint_every", "loss_weights", "policy_lr_decay")
+                    "checkpoint_every", "loss_weights", "policy_lr_decay", "lr_schedule", "weight_average")
 # what a checkpoint written before a hyperparameter existed was trained with (a resumed run continues as it began)
 RESUME_LEGACY = {"loss_weights": "raw", "policy_lr_decay": 0.9}
 
