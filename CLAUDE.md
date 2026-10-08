@@ -3,7 +3,8 @@
 Heads-up hold'em research code: engine (Python + C++), DeepCFR / SD-CFR / DREAM / ESCHER, tabular
 Pluribus-style blueprint + real-time search, best-response / LBR / PPO evaluation, browser UI. Small-game
 solvers (Kuhn / Leduc, exact exploitability): `headsup/algos/` - tabular CFR family, the deep algorithms
-(`deep.py`), Deep DCFR+ / PDCFR+ (`pdcfr.py`); their design specs are in `docs/superpowers/specs/`.
+(`deep.py`), Deep DCFR+ / PDCFR+ (`pdcfr.py`), NFSP (`nfsp.py`, numpy networks), ReBeL (`rebel.py`, Leduc); AlphaHoldem
+for the NL game is `headsup/alphaholdem/`. Their design specs are in `docs/superpowers/specs/`.
 README.md is the user-facing documentation (commands, results); this file holds what a new
 session needs to work on the code safely. docs/paper-fidelity.md lists every known difference from the papers
 (fixed / by choice / open) - update it when one is closed or found.
@@ -14,7 +15,7 @@ session needs to work on the code safely. docs/paper-fidelity.md lists every kno
 python3.12 -m venv .venv && source .venv/bin/activate       # 3.10-3.12
 pip install -r requirements.txt -r requirements-rl.txt
 python setup.py build_ext --inplace                          # C++17; -> headsup_cpp.*.so
-python -m pytest tests -q                                    # ~270 tests, ~7 min on CPU (CI: GitHub Actions)
+python -m pytest tests -q                                    # ~440 tests, ~13 min on CPU (CI: GitHub Actions)
 ```
 
 - Device: automatic (`mps` > `cuda` > `cpu`), `--device` / `HEADSUP_DEVICE=cuda:0` to force. CPU-only
@@ -64,6 +65,11 @@ python -m pytest tests -q                                    # ~270 tests, ~7 mi
   authors' code bases). `--net deepcfr` is that network (plus Appendix C's card tables, minus an unused 4th output);
   `--net paper` is Appendix C as printed (d-wide card branch, extra inputs) and is kept for the models trained with it.
 - First iteration: untrained nets output zeros and the argmax fallback shares exact ties, i.e. plays uniformly.
+- FHP is not reproduced (2026-10-08, four-bet game, paper preset: 202 / 113 / 95 mbb/g total at t = 100 / 200 / 300
+  against the paper's 70 / 51 / 40). Two measured causes: (1) the paper's "10,000 traversals" touch ~2.4x the nodes of
+  ours - `--traversals 25000` gives 178 / 121 at t = 50 / 100 against 367 / 199; (2) the 4,000-step fit is noisy and
+  underfits: `--batch-size 40000 --lr 3e-3 --lr-schedule cosine` (or `--weight-average 0.998`) lowers the held-out
+  loss as much as 16,000 steps do. Offline fit benchmark on a checkpoint's memory: see docs/paper-fidelity.md.
 - Search: pre-river subgames use *sampled* MCCFR where LCFR beats DCFR / CFR+ / PCFR+ (measured); the
   river uses full-width vector CFR where DCFR / CFR+ / PCFR+ win. Do not add regret flooring to the
   sampled solver. `search:` players are slow (~1-2 s/decision): evaluate on 1-2k hands.
