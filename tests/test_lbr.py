@@ -179,3 +179,39 @@ def test_lbr_models_the_pluribus_bot_by_its_blueprint():
         pytest.skip("the shipped blueprint is not present")
     for spec in ("pluribus", "pluribus@it20@th2@b50"):
         assert isinstance(_model_for(spec, "cpu", 0), TabularPlayer)
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_flop_equities_are_enumerated_by_default():
+    """Lisy & Bowling compute the rollout values exhaustively after the flop; the default sampled 200 of the flop's
+    1081 runouts (turn: all 46).  Enumerated equities do not depend on the seed."""
+    a = LocalBestResponse("call", num_tables=2, device="cpu", seed=0, duplicate=False, workers=2)
+    b = LocalBestResponse("call", num_tables=2, device="cpu", seed=1, duplicate=False, workers=2)
+    sampled = LocalBestResponse("call", num_tables=2, device="cpu", seed=1, duplicate=False, workers=2, max_exact=100)
+    deck = [51, 38, 0, 13, 5, 18, 31, 44, 9]
+    for lbr in (a, b, sampled):
+        t = lbr.tables[0]
+        t.start(1, deck)
+        t.engine.step(Action.CHECK_CALL)
+        t.engine.step(Action.CHECK_CALL)
+        assert t.engine.stage == 1 and t.engine.current == 1
+    ea, eb, es = (lbr._equities([lbr.tables[0]])[0] for lbr in (a, b, sampled))
+    assert np.array_equal(ea, eb)
+    assert not np.array_equal(ea, es) and np.abs(ea - es)[ea >= 0].max() < 0.2
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_lbr_can_check_call_until_a_given_round():
+    """The LBR paper's Table 2: LBR that only check/calls in the first rounds (its myopic pre-flop raises and folds
+    often cost more than they win) - there the strongest settings against most bots."""
+    kw = dict(num_tables=16, device="cpu", seed=0, workers=4, mc_samples=50, max_exact=100, duplicate=False)
+    lbr = LocalBestResponse("allin", from_round=1, **kw)
+    r = lbr.play(64, progress=False)
+    counts = lbr.action_counts
+    assert counts[0].sum() > 0 and counts[0, Action.CHECK_CALL] == counts[0].sum()  # it calls every shove
+    assert lbr.summary(r)["from_round"] == "flop"
+    default = LocalBestResponse("allin", **kw)
+    default.play(64, progress=False)
+    assert default.action_counts[0, Action.FOLD] > 0 and default.summary(r)["from_round"] == "preflop"
+    with pytest.raises(ValueError, match="round"):
+        LocalBestResponse("allin", from_round=4, **kw)

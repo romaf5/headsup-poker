@@ -138,9 +138,9 @@ class _Table:
 
 
 class LocalBestResponse:
-    def __init__(self, opponent_spec, num_tables=64, device=None, seed=0, mc_samples=200, max_exact=100,
+    def __init__(self, opponent_spec, num_tables=64, device=None, seed=0, mc_samples=200, max_exact=1081,
                  duplicate=True, workers=None, engine_kwargs=None, model_iterates=0, opponent=None, model=None, game=None,
-                 allin_ev=True, range_ev=None):
+                 allin_ev=True, range_ev=None, from_round=0):
         from headsup.players import make_player
 
         from headsup.env import resolve_game
@@ -162,6 +162,9 @@ class LocalBestResponse:
         self.rng = np.random.default_rng(seed)
         self._ev_rng = np.random.default_rng([int(seed) % 2**63, 0xE7])
         self.mc_samples, self.max_exact = mc_samples, max_exact
+        if not 0 <= int(from_round) < self.game.num_rounds:
+            raise ValueError(f"from_round {from_round}: the game has rounds 0..{self.game.num_rounds - 1}")
+        self.from_round = int(from_round)  # LBR only check/calls in earlier rounds (Lisy & Bowling, Table 2)
         self.tables = [_Table(i, self.game) for i in range(self.n)]
         from headsup import native
 
@@ -243,6 +246,13 @@ class LocalBestResponse:
         return float(np.dot(p, 2.0 * eq - 1.0)) * stake
 
     def _lbr_step(self, tables):
+        for t in tables:  # before its first round LBR only check/calls
+            if t.engine.stage < self.from_round:
+                self.action_counts[int(t.engine.stage), Action.CHECK_CALL] += 1
+                t.engine.step(Action.CHECK_CALL)
+        tables = [t for t in tables if not t.engine.done and t.engine.current == t.seat and t.engine.stage >= self.from_round]
+        if not tables:
+            return
         eqs = self._equities(tables)
         # hypothetical opponent decisions after each bet action
         bet_states, bet_query = [], []  # per table: {action: state}, list of (table index, action, obs)
@@ -360,7 +370,7 @@ class LocalBestResponse:
         counts = {s: {action_label(self.game, a): int(self.action_counts[i, a]) for a in range(self.num_actions)} for i, s in enumerate(stages)}
         return {
             "policy": self.spec, "hands": int(len(results)), "duplicate": self.duplicate, "allin_ev": self.allin_ev,
-            "range_ev": self.range_ev,
+            "range_ev": self.range_ev, "from_round": ("preflop", "flop", "turn", "river")[self.from_round],
             "lbr_chips_per_hand": m, "se": se, "mbb_per_hand": 1000.0 * m / self.game.big_blind, "mbb_se": 1000.0 * se / self.game.big_blind,
             "model_iterates": getattr(getattr(self.model, "bank", None), "T", None),
             "lbr_actions_by_stage": counts,
@@ -374,7 +384,10 @@ def main(argv=None):
     p.add_argument("--hands", type=int, default=20_000, help="hands (duplicate: pairs of hands)")
     p.add_argument("--num-tables", type=int, default=64, help="tables played in lock-step")
     p.add_argument("--mc-samples", type=int, default=200, help="Monte-Carlo runouts for pre-flop / flop equities")
-    p.add_argument("--max-exact", type=int, default=100, help="enumerate all runouts when there are at most this many (turn: 46; flop: 1081 -> Monte-Carlo)")
+    p.add_argument("--max-exact", type=int, default=1081,
+                   help="enumerate all runouts when there are at most this many (turn: 46, flop: 1081; 100: sampled flop equities, ~2x faster)")
+    p.add_argument("--from-round", choices=("preflop", "flop", "turn", "river"), default="preflop",
+                   help="LBR only check/calls before this round (the LBR paper's Table 2: often the stronger exploiter)")
     p.add_argument("--no-duplicate", action="store_true", help="independent hands instead of duplicate pairs")
     p.add_argument("--workers", type=int, default=None, help="threads for the equity kernel")
     p.add_argument("--model-iterates", type=int, default=0,
@@ -387,6 +400,7 @@ def main(argv=None):
 
     lbr = LocalBestResponse(args.policy, num_tables=args.num_tables, device=args.device, seed=args.seed,
                             mc_samples=args.mc_samples, max_exact=args.max_exact, duplicate=not args.no_duplicate,
+                            from_round=("preflop", "flop", "turn", "river").index(args.from_round),
                             workers=args.workers, model_iterates=args.model_iterates, allin_ev=not args.raw)
     t0 = time.perf_counter()
     results = lbr.play(args.hands)
