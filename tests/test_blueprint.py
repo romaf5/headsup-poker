@@ -178,3 +178,76 @@ def test_average_strategy_mode_is_selectable_and_recorded(tmp_path):
     assert dense.params["dense_average"] is True
     assert counters.params["dense_average"] is False and counters.params["strategy_interval"] == 7
     assert np.asarray(counters.cpp.phi).sum() > 0 and np.asarray(dense.cpp.phi).sum() > 0
+
+
+def test_bucket_of_a_situation_is_a_function_of_the_cards(tmp_path):
+    """Pluribus: "each information situation is put into one of 200 buckets".  Ours drew a fresh Monte-Carlo hand
+    strength at every lookup (the same hand on the same flop landed in its modal bucket 16 % of the time) and the
+    1326-hand queries used another estimator than single ones."""
+    from headsup.blueprint import TabularBlueprint
+
+    bp = TabularBlueprint(DEFAULT_GAME, buckets=200, samples=500).fit_abstraction(20000, 0, 4)
+    rng = np.random.default_rng(0)
+    node = bp.node_of([1, 1])  # the first flop decision
+    for nb, rnd in ((3, 1), (4, 2)):
+        for _ in range(5):
+            cards = [int(c) for c in rng.permutation(52)[: 2 + nb]]
+            c0, c1, board = cards[0], cards[1], cards[2:]
+            seen = {bp.cpp.bucket(rnd, c0, c1, board, seed) for seed in range(12)}
+            assert len(seen) == 1
+            assert bp.cpp.bucket(rnd, c1, c0, board[::-1], 99) in seen  # nor on the order of the cards
+    # a query for all hands of a public state gives every hand the row of its own bucket
+    board = [5, 20, 33]
+    hands = np.array([(a, b) for a in range(52) for b in range(a + 1, 52)], dtype=np.int32)
+    all_rows = bp.strategy_for_hands(node, hands, board, seed=1)
+    for i in rng.choice(len(hands), 25, replace=False):
+        a, b = map(int, hands[i])
+        if a in board or b in board:
+            continue
+        key = bp.cpp.bucket(1, a, b, board, 7)
+        np.testing.assert_array_equal(all_rows[i], np.asarray(bp.cpp.strategy(node, key)))
+
+
+def test_table_abstraction_is_the_same_in_every_process(tmp_path):
+    """The exact per-board abstraction: the flop features come from all 1,081 completions by default (sampled ones
+    were re-drawn by every process, so play and training could disagree about a flop's buckets)."""
+    from headsup.blueprint import TabularBlueprint
+
+    a = TabularBlueprint(DEFAULT_GAME, buckets=30, samples=100, mode="table").fit_abstraction(10 * 1326, 0, 4)
+    assert a.completions == 0  # 0 = every completion
+    a.save(tmp_path / "t.pt")
+    b = TabularBlueprint.load(tmp_path / "t.pt")
+    board = [5, 20, 33]
+    for c0, c1 in ((0, 1), (12, 25), (40, 41)):
+        assert a.cpp.bucket(1, c0, c1, board, 1) == b.cpp.bucket(1, c0, c1, board, 2)
+    f = np.array(a.cpp.features(1, board, 1))
+    np.testing.assert_array_equal(f, np.array(b.cpp.features(1, board, 5)))
+    sampled = TabularBlueprint(DEFAULT_GAME, buckets=30, samples=100, mode="table", completions=50).fit_abstraction(10 * 1326, 0, 4)
+    np.testing.assert_array_equal(np.array(sampled.cpp.features(1, board, 1)), np.array(sampled.cpp.features(1, board, 2)))  # seeded by the board
+    assert np.abs(np.array(sampled.cpp.features(1, board, 1)) - f).max() > 1e-3  # and an approximation of the exact features
+
+
+def test_pruning_threshold_scales_with_the_run_and_is_reported(tmp_path, capsys):
+    """Pluribus's -300M is for its stacks and its billions of iterations; scaled by the stack alone it was never
+    reached at tens of millions of iterations (most negative regret after 20 M: -1.4e6 against -3e6), so the
+    "Linear MCCFR with pruning" blueprint never pruned.  The threshold now scales with the stack AND the
+    iterations, and every chunk reports how many regrets are below it."""
+    import json
+
+    from headsup.blueprint import TabularBlueprint, main, prune_threshold
+
+    assert prune_threshold(DEFAULT_GAME, 20_000_000) == pytest.approx(-3.0e5)  # ~ the 0.1 % quantile measured there
+    assert prune_threshold(DEFAULT_GAME, 20_000_000, scale=5e-5) == pytest.approx(-1.0e5)
+    assert prune_threshold(FHP, 1_000_000) == pytest.approx(-1.5e-4 * 100_000 * 1_000_000)
+    common = ["--game", "fhp", "--iterations", "40000", "--threads", "2", "--buckets", "8", "--samples", "20", "--situations", "400",
+              "--chunks", "2", "--eval-hands", "0"]
+    main(common + ["--prune-scale", "1e-6", "--out", str(tmp_path / "p.pt")])
+    out = capsys.readouterr().out
+    bp = TabularBlueprint.load(tmp_path / "p.pt")
+    assert bp.params["prune_threshold"] == pytest.approx(-1e-6 * 100_000 * 40_000)
+    assert bp.params["regret_floor"] == pytest.approx(bp.params["prune_threshold"] * 310 / 300)
+    log = json.load(open(str(tmp_path / "p.pt") + ".log.json"))
+    assert 0.0 < log[-1]["prunable"] < 1.0 and "prunable" in out
+    assert float(np.asarray(bp.cpp.regret).min()) >= bp.params["regret_floor"] - 1e-3  # the floor holds
+    main(common + ["--no-prune", "--out", str(tmp_path / "n.pt")])
+    assert json.load(open(str(tmp_path / "n.pt") + ".log.json"))[-1]["prunable"] == 0.0

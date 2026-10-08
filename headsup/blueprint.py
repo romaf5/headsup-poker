@@ -39,13 +39,27 @@ from headsup.game import DEFAULT_GAME, GameConfig
 from headsup.public import board_cards, replay_from_obs
 
 
+PRUNE_SCALE = 1.5e-4  # pruning threshold per chip of stack and per iteration (see prune_threshold)
+
+
+def prune_threshold(game, iterations, scale=PRUNE_SCALE):
+    """Regret below which an action is skipped in 95 % of the iterations: -scale x stack x iterations.
+
+    Pluribus's -300,000,000 belongs to 10,000-chip stacks and a run of billions of iterations.  Accumulated regrets
+    grow with both, so a threshold for another game and budget has to as well: scaled by the stack alone it sat at
+    -3e6 for our game, twice beyond the most negative regret of a 20 M-iteration run.  The default scale puts it at
+    about the 0.1 % most negative regrets at the end of such a run (-3e5); 5e-5 at about 1 %."""
+    return -float(scale) * game.stack_size * int(iterations)
+
+
 class TabularBlueprint:
     """The C++ trainer/policy plus its parameters; ``save`` / ``load`` round-trip everything."""
 
-    def __init__(self, game=DEFAULT_GAME, buckets=200, samples=500, mode="mc", completions=300):
-        """``mode``: ``mc`` = per-hand Monte-Carlo EHS into equal-mass buckets; ``table`` = exact
-        per-board equity features (mean, std over the completions) with k-means buckets, cached per
-        board (potential-aware, no sampling noise; slower to warm up)."""
+    def __init__(self, game=DEFAULT_GAME, buckets=200, samples=500, mode="mc", completions=0):
+        """``mode``: ``mc`` = per-hand Monte-Carlo EHS (seeded by the cards: a situation always gets the same
+        estimate) into equal-mass buckets; ``table`` = exact per-board equity features (mean, std over the
+        completions; ``completions`` > 0 samples that many per flop instead of all 1,081) with k-means buckets,
+        cached per board (potential-aware, no sampling noise; slower to warm up)."""
         self.game = game
         self.mode, self.completions = mode, completions
         self.cpp = native.module().TabularBlueprint()
@@ -241,7 +255,7 @@ def main(argv=None):
     p.add_argument("--abstraction", default="mc", choices=["mc", "table"],
                    help="mc: per-hand Monte-Carlo EHS, equal-mass buckets; table: exact per-board (mean, std) equity features, "
                         "k-means buckets, cached per board (potential-aware, no noise)")
-    p.add_argument("--completions", type=int, default=300, help="table: sampled completions per flop board (turn: all rivers)")
+    p.add_argument("--completions", type=int, default=0, help="table: sampled completions per flop board instead of all 1,081 (0 = all)")
     p.add_argument("--situations", type=int, default=200_000, help="random situations per round to fit the buckets (table: / 1326 boards)")
     p.add_argument("--lcfr", type=float, default=0.4,
                    help="fraction of the iterations with linear discounting (Pluribus: the first 400 minutes of ~11,500, i.e. 0.035)")
@@ -250,6 +264,9 @@ def main(argv=None):
     p.add_argument("--prune-after", type=float, default=0.2,
                    help="start pruning after this fraction of the iterations (Pluribus: after 200 minutes, i.e. 0.017)")
     p.add_argument("--no-prune", action="store_true")
+    p.add_argument("--prune-scale", type=float, default=PRUNE_SCALE,
+                   help="pruning threshold = -scale x stack x iterations (default: about the 0.1 %% most negative regrets at the end of "
+                        "a 20 M-iteration run; 5e-5: about 1 %%); the regret floor sits 3.3 %% below it, as Pluribus's")
     p.add_argument("--average", default="dense", choices=["dense", "counters"],
                    help="average strategy: dense = sigma added at every sampled opponent infoset (reach-weighted; default) | counters = "
                         "Pluribus's sampled action counters, updated every --strategy-every iterations")
@@ -273,8 +290,10 @@ def main(argv=None):
         overrides["raise_cap"] = args.raise_cap
     game = make_holdem(args.game, **overrides)
     bp = TabularBlueprint(game, args.buckets, args.samples, args.abstraction, args.completions)
+    threshold = prune_threshold(game, args.iterations, args.prune_scale)
     bp.configure(lcfr_iterations=int(args.lcfr * args.iterations), discount_interval=max(1, int(args.discount_every * args.iterations)),
                  prune_after=0 if args.no_prune else int(args.prune_after * args.iterations),
+                 prune_threshold=threshold, regret_floor=threshold * 310.0 / 300.0,
                  strategy_interval=args.strategy_every or max(1, args.iterations // 1_000_000),
                  dense_average=args.average == "dense")
     print(f"{args.game}: {bp.cpp.num_nodes} public nodes, {bp.cpp.num_infosets:,} infosets; params {bp.params}", flush=True)
@@ -288,13 +307,15 @@ def main(argv=None):
         bp.run(per_chunk, args.seed + 1000 * (c + 1), args.threads)
         dt = time.perf_counter() - t0
         bp.save(args.out)
-        entry = {"iterations": bp.iterations, "seconds": dt}
+        # how much the pruning rule can act on: the share of regrets below the threshold
+        prunable = 0.0 if args.no_prune else float((np.asarray(bp.cpp.regret) < bp.params["prune_threshold"]).mean())
+        entry = {"iterations": bp.iterations, "seconds": dt, "prunable": prunable}
         if args.eval_hands:
             scores = evaluate(TabularPlayer(bp, seed=c), args.eval_hands, seed=c)
             entry.update(scores)
         log.append(entry)
-        print(f"chunk {c + 1}/{args.chunks}: {bp.iterations:,} iterations ({per_chunk / dt:,.0f} it/s) " +
-              " ".join(f"vs {k} {v:+.2f}" for k, v in entry.items() if k not in ("iterations", "seconds")), flush=True)
+        print(f"chunk {c + 1}/{args.chunks}: {bp.iterations:,} iterations ({per_chunk / dt:,.0f} it/s) prunable {prunable:.2%} " +
+              " ".join(f"vs {k} {v:+.2f}" for k, v in entry.items() if k not in ("iterations", "seconds", "prunable")), flush=True)
         with open(str(args.out) + ".log.json", "w") as f:
             json.dump(log, f, indent=2)
 

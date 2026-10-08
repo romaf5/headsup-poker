@@ -2514,7 +2514,7 @@ struct Abstraction {
   // per round, and the buckets of all hands are cached per board (thread-safe; the flop's 22 100
   // boards are ~60 MB, the turn's up to ~2.8 GB when every board has been seen).
   bool table_mode = false;
-  int completions = 300;                                    // completions per flop board (turn: all rivers)
+  int completions = 0;                                      // sampled completions per flop board; 0 = all 1,081 (turn: all rivers)
   std::vector<std::vector<float>> centroids;                // per round: buckets x 2 (mean, std)
   mutable std::vector<std::unordered_map<int, std::vector<uint16_t>>> cache;  // per round: board code -> bucket per hand
   mutable std::vector<std::mutex> cache_mutex;
@@ -2561,11 +2561,19 @@ struct Abstraction {
     };
     if (missing == 1) {  // every river
       for (int i = 0; i < nd; ++i) take(&deck[i]);
-    } else {  // sampled completions (without replacement per completion)
+    } else if (completions <= 0 || completions >= nd * (nd - 1) / 2) {  // every turn and river
+      for (int i = 0; i < nd; ++i)
+        for (int j = i + 1; j < nd; ++j) {
+          const int pair[2] = {deck[i], deck[j]};
+          take(pair);
+        }
+    } else {  // sampled completions (without replacement per completion), drawn from the board's own generator:
+      (void)rng;  // every process gets the same features for a board
+      std::mt19937_64 own(0x9E3779B97F4A7C15ull ^ uint64_t(board_code(board, n)));
       for (int r = 0; r < completions; ++r) {
         for (int i = 0; i < missing; ++i) {
           std::uniform_int_distribution<int> d(i, nd - 1);
-          std::swap(deck[i], deck[d(rng)]);
+          std::swap(deck[i], deck[d(own)]);
         }
         take(deck);
       }
@@ -2751,10 +2759,21 @@ struct Abstraction {
     return int(std::upper_bound(ed.begin(), ed.end(), e) - ed.begin());
   }
   template <class RNG>
+  // The bucket is a function of the cards alone ("each information situation is put into one of 200 buckets"):
+  // the Monte-Carlo hand strength draws from a generator seeded by the hand and the board, so training, a single
+  // query and a query for all 1326 hands of a public state agree (a fresh estimate per lookup moved the same
+  // situation over ~20 neighbouring buckets).
   int bucket(int round, int c0, int c1, const int* board, RNG& rng) const {
     if (round == 0) return preflop_index(c0, c1);
-    if (table_mode) return table_buckets(round, board, rng)[combo_index(std::min(c0, c1), std::max(c0, c1))];
-    return bucket_of(round, ehs(c0, c1, board, BOARD_CARDS_BY_STAGE[round], rng));
+    const int lo = std::min(c0, c1), hi = std::max(c0, c1), n = BOARD_CARDS_BY_STAGE[round];
+    if (table_mode) return table_buckets(round, board, rng)[combo_index(lo, hi)];
+    int sorted[5];
+    for (int i = 0; i < n; ++i) sorted[i] = board[i];
+    std::sort(sorted, sorted + n);  // nor on the order the board was dealt in
+    uint64_t seed = 0x9E3779B97F4A7C15ull ^ (uint64_t(lo * NUM_CARDS + hi) << 32) ^ uint64_t(board_code(board, n));
+    seed ^= seed >> 30; seed *= 0xBF58476D1CE4E5B9ull; seed ^= seed >> 27; seed *= 0x94D049BB133111EBull; seed ^= seed >> 31;
+    std::mt19937_64 own(seed);
+    return bucket_of(round, ehs(lo, hi, sorted, n, own));
   }
 
   // equal-mass bucket edges from random situations of every post-flop round
@@ -3387,12 +3406,12 @@ PYBIND11_MODULE(headsup_cpp, m) {
   py::class_<TabularBlueprint>(m, "TabularBlueprint")
       .def(py::init<>())
       .def("build", [](TabularBlueprint& b, const EngineConfig& cfg, int buckets, int samples, const std::string& mode, int completions) {
-        if (buckets < 1 || buckets > 65535 || samples < 1 || completions < 1) throw std::runtime_error("bad buckets / samples / completions");
+        if (buckets < 1 || buckets > 65535 || samples < 1 || completions < 0) throw std::runtime_error("bad buckets / samples / completions");
         if (mode != "mc" && mode != "table") throw std::runtime_error("abstraction mode must be 'mc' or 'table'");
         b.build(cfg, buckets, samples);
         b.abs.table_mode = mode == "table";
         b.abs.completions = completions;
-      }, py::arg("cfg"), py::arg("buckets") = 200, py::arg("samples") = 500, py::arg("mode") = "mc", py::arg("completions") = 300)
+      }, py::arg("cfg"), py::arg("buckets") = 200, py::arg("samples") = 500, py::arg("mode") = "mc", py::arg("completions") = 0)
       .def("fit_abstraction", [](TabularBlueprint& b, int situations, uint64_t seed, int threads) {
         if (situations < 1) throw std::invalid_argument("situations must be positive");
         py::gil_scoped_release release;
@@ -3489,8 +3508,10 @@ PYBIND11_MODULE(headsup_cpp, m) {
         std::mt19937_64 rng(seed);
         std::vector<float> row(b.n_actions), all;
         const int nb = BOARD_CARDS_BY_STAGE[round];
-        const bool vector_path = round > 0 && n >= 64 && !b.abs.table_mode;  // many hands of one state: shared runouts for all combos
-        if (vector_path) b.abs.ehs_all(bd, nb, std::max(20, b.abs.samples / 12), rng, all);  // ~40 runouts x all opponents: noise ~ the per-hand MC of training
+        // many hands on a complete board: the exact equities of all combos at once (before the last card every hand
+        // has its own seeded estimate, see Abstraction::bucket - a query must find the buckets training used)
+        const bool vector_path = round > 0 && n >= 64 && !b.abs.table_mode && nb == b.abs.showdown;
+        if (vector_path) b.abs.ehs_all(bd, nb, 1, rng, all);
         for (int i = 0; i < n; ++i) {
           bool blocked = h(i, 0) == h(i, 1);
           for (int k = 0; k < nb; ++k) blocked |= (bd[k] == h(i, 0) || bd[k] == h(i, 1));
