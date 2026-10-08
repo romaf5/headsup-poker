@@ -1,7 +1,7 @@
 # Neural Fictitious Self-Play on the small games - design
 
-Status: written and implemented autonomously on 2026-10-08 (the work was pre-approved); the long validation runs are
-still to be done.
+Status: written and implemented autonomously on 2026-10-08 (the work was pre-approved); the three-seed validation runs
+to 3e6 iterations are still to be done (first curves: "Success criteria" below).
 Sources: Heinrich & Silver, "Deep Reinforcement Learning from Self-Play in Imperfect-Information Games",
 arXiv 1603.01121 (2016); OpenSpiel @ 48401890 (`open_spiel/python/pytorch/nfsp.py`, `dqn.py`); the DREAM authors'
 NFSP (github.com/EricSteinberger/DREAM: `NFSP/`, `Leduc_NFSP.py`, `PokerRL/rl/agent_modules/DDQN.py`); Steinberger,
@@ -53,8 +53,8 @@ Illegal actions never enter: the argmax, the max over next actions and the polic
 | networks | MLP, 1 hidden layer x 64 ReLU, PyTorch default initialisation | `game.make_model(arch="deepcfr_dueling")`: Deep-CFR body (64), dueling `Q` head, `Pi` head |
 | optimiser | plain SGD, lr 0.1 (`Q`) / 0.005 (`Pi`) | plain SGD, lr 0.1 / 0.01, gradient-norm clip 1.0 |
 | RL loss | DQN, squared TD | Double DQN, squared TD |
-| reward unit | antes (`scale` 1) | antes / 2.6 (`scale` = largest utility / 5; Kuhn: 0.4) |
 | exploration | `0.06 / sqrt(t)`, one coin per decision | `0.06 / (1 + 0.01 sqrt(t - 1))`, one coin per seat and step for all tables |
+| reward unit | utilities / 2.6 (`scale` = largest utility / 5; Kuhn: 0.4) - see "The reward unit" | the same (the DREAM code: stack / 5) |
 | minibatch, updates | 128, 2 per network and iteration | same |
 | iteration | 128 steps (128 tables x 1) | same |
 | `M_RL` | 200 000, circular | same |
@@ -72,7 +72,7 @@ Every row is a keyword of `NFSPSolver` and a command-line option; a preset only 
 | learning rates `Q` / `Pi` | 0.1 / 0.005 | 0.01 / 0.01 | 0.1 / 0.01 | paper | DREAM | `--lr-q`, `--lr-pi` |
 | gradient clipping | none stated | optional, off | norm 1.0 | none | 1.0 | `--grad-clip` |
 | RL target | DQN | DQN | Double DQN | DQN | Double DQN | `--double-dqn` / `--no-double-dqn` |
-| reward scale | not stated (antes assumed) | 1 | stack / 5 | 1 | largest utility / 5 | `--reward-scale` |
+| reward unit | not stated | antes | stack / 5 | DREAM (calibrated, see below) | DREAM | `--reward-scale` (1: antes) |
 | `eps` schedule | 0.06, "proportionally to the inverse square root of the number of iterations" | 0.06 -> 0.001 "exp" over 2e7 inner steps (ends near 0.023) | `0.06 / (1 + 0.01 sqrt(iter))` | `0.06 / sqrt(t)` | DREAM | `--eps-start`, `--eps-const` |
 | exploration coin | per decision | per decision | one for the whole batch of a seat's tables | per decision | DREAM | `--shared-explore` / `--no-shared-explore` |
 | what "128 steps" counts | not defined | each agent's own steps (1 update per 64) | steps of both players (2 updates per 128) | DREAM's reading | DREAM | `--steps` (256 = OpenSpiel's ratio), `--updates` |
@@ -89,18 +89,53 @@ The paper never defines an iteration. As in the research brief it is taken to be
 this is what the DREAM code does, and a 2M sliding window then fills after about 3e5 iterations, where the paper's
 sliding-window curve starts to diverge.
 
+## The reward unit of the `paper` preset
+
+The paper gives the learning rate (0.1, plain SGD) but not the unit of the rewards, and the two are one setting: the
+size of a step is the product. With the natural reading - antes, Leduc utilities up to 13 - the preset does not
+reproduce the paper. Measured on Leduc, exploitability in mA/g (seeds 0 / 1 / 2, the evaluation at that iteration; the
+paper's curve for comparison):
+
+| iterations | 1e5 | 2e5 | 3e5 | 5e5 | 6e5 | 8e5 | 1e6 |
+|---|---|---|---|---|---|---|---|
+| paper, Fig. 1a (64 units) | 430 | 257 | 213 | 158 | 150 | 138 | 128 |
+| rewards in antes (`--reward-scale 1`) | 264 / 307 / 305 | 275 / 211 / 297 | 234 / 155 / 298 | 275 / 188 / 225 | 283 / 220 / 239 | 304 / - / - | - |
+| utilities / 2.6 (the preset) | 291 / 367 / 268 | 146 / 178 / 295 | 120 / 130 / 303 | 95 / 116 / 202 | 87 / 96 / 166 | 91 / 90 / 151 | 86 / 87 / 146 |
+| utilities / 13 | 260 / 335 / - | 179 / 256 / - | 126 / 148 / - | - | - | - | - |
+
+With antes the curves stop falling near 250 mA/g and drift upwards; with the DREAM code's unit they keep falling and
+their three-seed mean is within a factor 1.5 of the paper's curve from 1e3 to 1e6 iterations. What goes wrong with
+antes, measured on checkpoints (antes: seed 0 at 490k and seed 1 at 290k / 580k iterations; scaled: seed 0 at 290k):
+
+- 27-34 of the 64 hidden units of each `Q` network are active on no infoset at all (scaled: 17-18; with
+  `--lr-q 0.02`: 4-10) and the hidden activations reach 10-15 (scaled: 5): a step of 0.1 on errors of several antes
+  kills ReLU units.
+- Against the exact action values of a best response to what the opponent actually plays (`Pi` with probability
+  `1 - eta`, greedy `Q` with `eta`), `Q` is off by 0.62-0.78 antes (visit-weighted rmse; scaled: 0.46-0.51), and the
+  greedy policy realises 12-54 % of the gain of the exact best response over `Pi` (scaled: 60 %).
+- `Pi` itself is not the problem: it is within 0.01 (total variation) of the empirical average of `M_SL`. A 1 x 64
+  MLP can represent the exact action values (rmse 0.02 by regression). More exploration (`--eps-const 0.01`), Double
+  DQN and a smaller `Q` learning rate did not remove the plateau (one or two seeds each).
+
+So the `paper` preset takes the unit of the DREAM code, whose authors ran NFSP at the same learning rate and report it
+as the paper's hyperparameters; `--reward-scale 1` gives antes. Normalising to [-1, 1] (`--reward-scale 13`) behaves
+like 2.6 as far as it was run. The choice was made on three seeds to 1e6 iterations and is the main thing the
+validation runs test.
+
 ## Deliberate deviations
 
 From all three sources:
 
 1. **Inputs.** The repository's perfect-recall info-state features (Leduc 34, Kuhn 22), not the paper's 30-feature
    card / betting tensor, OpenSpiel's tensor or PokerRL's observation.
-2. **The networks are numpy arrays with a hand-written backward pass.** An SGD step on a 64-unit network is bounded
-   by per-operation overhead, not arithmetic: on this machine a `Q` step costs 480-570 us with torch autograd against
-   about 75 us in numpy for the 1 x 64 MLP, and 3.5 ms against about 0.6 ms for the dueling net. The parameters keep
-   the torch module's names and layout, the initial weights are that module's, and the tests require the forward pass
-   and one whole `Q` / `Pi` update to equal the torch module's with autograd and `torch.optim.SGD`. `--device` exists
-   for symmetry with the other solvers and accepts `cpu` only (a GPU was not measured: it is launch-bound too).
+2. **The networks are numpy arrays with a hand-written backward pass** (as `headsup/numpy_model.py` mirrors the
+   hold'em network for the traversal workers). An SGD step on a 64-unit network is bounded by per-operation overhead,
+   not arithmetic: on this machine a `Q` step with torch autograd and `torch.optim.SGD` costs 480-570 us for the
+   1 x 64 MLP and 3.5 ms for `game.make_model(arch="deepcfr_dueling")`, against 0.09-0.14 ms and 1.0-1.4 ms here (see
+   "Compute"). The parameters keep the torch module's names and layout, the initial weights are that module's, and the
+   tests require the forward pass and one whole `Q` / `Pi` update to equal the torch module's with autograd,
+   `clip_grad_norm_` and `torch.optim.SGD`. `--device` exists for symmetry with the other solvers and accepts `cpu`
+   only (a GPU was not measured: these networks are launch-bound there as well).
 3. **The target network is stored as its outputs at every infoset** (one forward pass over the game's infosets per
    refit instead of one per minibatch) - the same numbers.
 4. **Memories hold infoset indices**, not observations (the tree is compiled to arrays): `M_SL` is 5 bytes a row.
@@ -110,18 +145,22 @@ From all three sources:
 
 `paper` preset, from the paper:
 
-7. 128 parallel tables with one step each per iteration instead of (presumably) one game played sequentially: a hand
+7. **Rewards are divided by 2.6** (the largest utility / 5): the paper states no unit; see the section above.
+8. 128 parallel tables with one step each per iteration instead of (presumably) one game played sequentially: a hand
    spans several iterations, the data are the same.
-8. `Q` and `Pi` are not updated before their memory holds a minibatch (the paper does not say).
+9. `Q` and `Pi` are not updated before their memory holds a minibatch (the paper does not say).
+10. `eps_t = 0.06 / sqrt(t)` is the literal reading of "decayed to 0, proportionally to the inverse square root of the
+    number of iterations"; the time constant is not given (the DREAM code's schedule is the same law with another
+    one: `--eps-const 0.01`).
 
 `dream` preset, from the DREAM code:
 
-9. **Network body.** `deepcfr_dueling` is the repository's net (docs/paper-fidelity.md): a 64-wide card branch without
-   skip connection, three trunk layers with the skip added after the ReLU, normalisation without gain and bias; the
-   authors' has a 192-wide card branch and a history branch with skips, two trunk layers and a LayerNorm with gain and
-   bias. Its `Pi` head has a hidden layer (64) before the logits; the authors' is a single linear layer.
-10. **Kuhn's reward scale** is the largest utility / 5 = 0.4 by analogy (PokerRL has no Kuhn).
-11. Iteration 0 of the DREAM driver skips the `Pi` updates; here they start when `M_SL` holds a minibatch (iteration
+11. **Network body.** `deepcfr_dueling` is the repository's net (docs/paper-fidelity.md): a 64-wide card branch without
+    skip connection, three trunk layers with the skip added after the ReLU, normalisation without gain and bias; the
+    authors' has a 192-wide card branch and a history branch with skips, two trunk layers and a LayerNorm with gain and
+    bias. Its `Pi` head has a hidden layer (64) before the logits; the authors' is a single linear layer.
+12. **Kuhn's reward scale** is the largest utility / 5 = 0.4 by analogy (PokerRL has no Kuhn).
+13. Iteration 0 of the DREAM driver skips the `Pi` updates; here they start when `M_SL` holds a minibatch (iteration
     ~20), which subsumes it.
 
 Not copied from OpenSpiel: the inner DQN's counters that only advance in best-response-mode steps, the soft
@@ -134,10 +173,11 @@ Not copied from OpenSpiel: the inner DQN's counters that only advance in best-re
     `cross_entropy(logits, legal, action)` - the three formulas, as pure functions.
   - `MLP` / `Dueling`: the numpy networks (`forward`, `backward`, `step`, `state_dict`, `torch_module`).
   - `Memory`: named columns, circular or reservoir (with `min_prob`).
+  - `chance_closure(tree)`: every deal as one draw (the two private cards are two chance nodes in a row).
   - `NFSPSolver(game, preset="paper", seed=0, **overrides)`: `iterate()`, `average_policy()`, `evaluate()`,
     `state_dict()` / `load_state_dict()` (the whole state: networks, target values, memories, tables, modes, pending
     transitions, counters, random generator; a snapshot shares nothing with the solver; a checkpoint written with
-    other settings is refused).
+    other settings is refused). Plain SGD has no optimiser state.
   - CLI `python -m headsup.algos.nfsp --game leduc --preset paper --iterations 3000000 --seed 0 --json ...
     --checkpoint ...`. Evaluations at 1, 2, 5, 10, 20, 50, ... iterations up to `--eval-every` (10 000), then at its
     multiples, and at the end. The JSON curve has, per evaluation, `iteration`, `average` (exploitability of the
@@ -150,24 +190,29 @@ Not copied from OpenSpiel: the inner DQN's counters that only advance in best-re
 
 ## Tests (`tests/test_nfsp.py`, `tests/test_deep_algos.py`)
 
-Each wiring test was checked against the one-line mutation it is meant to catch.
+66 tests, under 30 s on one core. 88 one-line mutations of `nfsp.py` were run against them (the list is in the plan):
+87 were killed at once; the survivor (`Q` trained before a minibatch was stored: the test's memories were empty) and
+two mutants that only an indirect test caught led to stronger tests; all 88 are killed now.
 
 - The formulas: `epsilon` (both schedules), `td_target` (target network values, legal-masked max, nothing added at
   terminals, Double DQN), `cross_entropy` (loss and gradient equal to torch's on masked logits).
-- Networks: forward equal to the torch module at every infoset of Kuhn and Leduc; one `Q` update and one `Pi` update
-  of the solver equal to torch autograd + `torch.optim.SGD` on the same minibatch (both architectures, DQN and Double
-  DQN, with and without clipping, a target network that differs from the online one).
+- Networks: forward equal to the torch module at every infoset of Kuhn and Leduc; `backward` + `step` equal to
+  autograd + `clip_grad_norm_` + `torch.optim.SGD`; one `Q` update and one `Pi` update of the solver equal to the
+  textbook version in torch on the same minibatch (both architectures, DQN and Double DQN, with and without clipping,
+  a target network that differs from the online one, rows where the best action overall is illegal).
 - Memories: FIFO order and wrap-around; the reservoir is uniform over everything offered; `min_prob`; the window.
-- Play: the mode is drawn per hand and per seat, independently, with probability `eta`, and is held; `M_SL` receives
-  exactly the best-response-mode decisions (exploratory ones too); `M_RL` receives every transition of both seats with
-  the next infoset of the same player, the done flag and the reward's sign and scale (checked against a step-by-step
-  replay of the game); acting uses each player's own networks, the legal-masked argmax, the legal-masked softmax and
-  the schedule's `eps`; the shared exploration coin.
+- Play: deals follow the chance probabilities; the mode is drawn per hand and per seat, independently, with
+  probability `eta`, and is held; `M_SL` receives exactly the best-response-mode decisions (exploratory ones too);
+  `M_RL` receives every transition of both seats with the next infoset of the same player, the done flag and the
+  reward's sign and scale (checked against a step-by-step replay of the game); acting uses each player's own
+  networks, the legal-masked argmax, the legal-masked softmax and the schedule's `eps`; the shared exploration coin.
+- Each half against exact values: one seat's Q-learning against a fixed opponent reaches the exact best-response
+  action values on Kuhn (either seat, both presets); `Pi` learns the eps-greedy behaviour recorded in `M_SL`.
 - Schedule: `updates` per network per iteration, `Q` before `Pi`, target refit counted in `Q` updates per player,
   no update before a minibatch is stored, `nodes_touched`.
 - Presets set what the table above says; overrides; unknown keywords.
 - Checkpoints: a restored solver continues bit-identically; snapshot, source and copy share no arrays; other settings
-  are refused; the CLI resumes and writes atomically.
+  are refused; the CLI resumes (the resumed curve equals an uninterrupted run's) and writes atomically.
 - Kuhn: both presets reduce the exploitability of the average policy within a few thousand iterations.
 - The report tables.
 
@@ -182,6 +227,38 @@ Three seeds per preset; our value at `x` is the mean of the evaluations within +
 | Leduc, `dream`, 1e8 nodes (781 250 iterations) | 71 mA/g | within a factor 1.5 |
 | Leduc, `dream`, 3.2e8 nodes (2 500 000 iterations) | 58 mA/g | within a factor 1.5 |
 
+First curves, measured in pieces of at most ten minutes through checkpoints (mA/g; ours: mean +- sd over seeds):
+
+| Leduc, `paper`, iterations | 1e3 | 1e4 | 1e5 | 2e5 | 5e5 | 9.5e5 |
+|---|---|---|---|---|---|---|
+| paper, Fig. 1a | 1880 | 1040 | 430 | 257 | 158 | 130 |
+| ours, seeds 0-2 | 2136 +- 44 | 1249 +- 82 | 310 +- 50 | 212 +- 78 | 130 +- 54 | 106 +- 38 |
+
+| Leduc, `dream`, nodes | 1.3e6 | 5e6 | 1e7 | 2e7 |
+|---|---|---|---|---|
+| DREAM paper, Fig. 2 (NFSP) | 909 | 403 | ~250 | 147 |
+| ours, seed 0 | 841 | 396 | 261 | 167 |
+
+Kuhn (one seed): `paper` 301 / 109 / 10 / 8 mA/g at 1e3 / 1e4 / 1e5 / 2e5 iterations; `dream` 117 / 128 / 25 at
+1e3 / 1e4 / 4e4.
+
+Not verified: `paper` beyond 1e6 iterations (the 3e6 criterion), `dream` beyond 2.4e7 nodes (both of its criteria),
+and the seed-to-seed spread, which is large (at 1e6 iterations: 86 / 87 / 146).
+
 ## Compute
 
-One process, one thread, CPU. See "Measured throughput" in the plan for the numbers of the finished implementation.
+One process, one thread (`OMP_NUM_THREADS=1`: more BLAS threads slow these small products down), CPU. Measured on
+Leduc while 30-40 threads of other jobs ran on the machine's 32 cores:
+
+| preset | per iteration | env steps / s | SGD updates / s | 3e6 iterations |
+|---|---|---|---|---|
+| `paper` | 1.3-1.6 ms | 82 000-99 000 | 5 100-6 200 | 1.1-1.3 h (1e6 measured: 0.49 h with the evaluations) |
+| `dream` | 8.0-10.8 ms | 11 800-16 000 | 740-1 000 | 6.7-9.0 h (2 500 000, the DREAM curve's end: 5.6-7.5 h) |
+
+`paper` meets the target of three hours; `dream` does not. A `dream` iteration is eight SGD steps on 12-layer
+networks at batch 128 plus a second forward pass per `Q` step (Double DQN) and four forward passes for acting: about
+3.7 ms of it is single-thread `sgemm` time (64 x 64 products at 13 us each), the rest numpy call overhead on small
+arrays. Not done: computing the card and bet branches once per distinct input in a minibatch (10-15 %), and a
+GPU port (not measured: this work was CPU-only).
+
+A checkpoint is 20-30 MB (`M_SL`: 2 x 2M rows of 5 bytes); the process uses about 550 MB, most of it the torch import.

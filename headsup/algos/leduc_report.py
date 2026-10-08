@@ -170,7 +170,7 @@ def main(argv=None):
     print("Leduc, against Heinrich & Silver's Fig. 1a\n")
     print(table(rows, "nfspp", (1e3, 1e4, 1e5, 2e5, 5e5, 1e6, 2e6, 3e6)))
     print("\nKuhn\n")
-    print(table(rows, "nfspk", (1e3, 1e4, 1e5, 1e6, 3e6)))
+    print(table(rows, "nfspk", (1e3, 1e4, 1e5, 2e5, 1e6)))
     print("\nNFSP on Leduc against the DREAM paper's NFSP curve, mA/g by nodes touched:\n")
     print(table(rows, "nfspd", (2e7, 3e7, 5e7, 1e8, 2e8, 3.2e8)))
 

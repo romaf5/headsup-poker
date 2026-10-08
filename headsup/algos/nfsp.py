@@ -16,7 +16,7 @@ Rewards are in the DREAM code's unit (utilities / 2.6 in Leduc) in both: the pap
 antes its learning rate of 0.1 leaves half of the Q networks' hidden units dead (``--reward-scale 1``).
 An iteration is 128 environment steps (one decision at each of 128 parallel tables) followed by 2 SGD steps per network.
 Small games only: the tree is compiled to arrays, memories hold infoset indices, and the networks are numpy arrays
-with a hand-written backward pass (an autograd step on a 64-unit network costs 5-7 times its arithmetic).
+with a hand-written backward pass (a torch autograd step on these networks takes 3-6 times as long).
 
     python -m headsup.algos.nfsp --game leduc --preset paper --iterations 3000000 --json runs/x.json --checkpoint runs/x.pt
 """
