@@ -1,7 +1,7 @@
 # AlphaHoldem on the default no-limit game - design
 
-Status: written and implemented by one agent under a blanket approval (2026-10-08); the long GPU run and the review
-are still to come.
+Status: written and implemented by one agent under a blanket approval (2026-10-08). Implemented and tested on CPU;
+the GPU path has not been executed (both GPUs were busy), and the long run and the review are still to come.
 Sources: Zhao, Yan, Li, Li, Xing, "AlphaHoldem: High-Performance Artificial Intelligence for Heads-Up No-Limit Poker
 via End-to-End Reinforcement Learning" (AAAI-22); the same lab's OpenHoldem (arXiv 2012.06168v4), which re-describes
 the agent; Ye et al. 2020 (arXiv 1912.09729) for the dual-clip PPO loss. There is no official code; the public
@@ -33,7 +33,7 @@ env drives both seats from Python in lock-step:
   back) - the trainer uses it to let the hands in progress finish at the end of a rollout.
 - `decks` (int[N, 9]): the cards of a table's next deal, for tests; otherwise the env's own generator deals.
 - `allin_ev` / `ev_samples`: rewards of hands that end all-in before the river are the expectation over the runouts
-  (as in `VecEnv`); the sampling seed of a hand is a hash of (env seed, table, hand number), the same in both
+  (as in `VecEnv`); the sampling seed of a hand is a hash of (`ev_seed`, table, hand number), the same in both
   implementations.
 - No opponent acts during a reset, so the one-seat envs' "terminal observation after an open-fold" cannot occur here.
 
@@ -62,7 +62,9 @@ hand-substituted observations), so both tensors are rebuilt from it, batched, on
 - **Value-clip bounds** from obs[24, 25, 29]: the chips the observer and the opponent have put in so far.
 
 Limits: a round's 7th action is not recorded (the cap of the default game allows 5); in a tree without
-`mask_redundant` a raise that the cap or the stack turned into an all-in appears as the all-in (it is one).
+`mask_redundant` a raise that the cap or the stack turned into an all-in appears as the all-in (it is one), and of
+two raise sizes with the same amount the first is recorded. No-limit stacks above 1000 chips are refused (the
+observation's stack feature saturates there, as for `legal_mask_from_obs`).
 
 ### Network (`headsup/alphaholdem/model.py`)
 
@@ -158,9 +160,10 @@ One iteration:
 4. Tensors are rebuilt from the observation instead of being written by the engine (the same content; tested against
    the engine's history).
 5. The network is about one sixth of the paper's size.
-6. Optional all-in EV rewards (off by default).
+6. Optional all-in EV rewards (`--allin-ev`, off by default) and an optional unclipped value target
+   (`--no-value-clip`, the ablation).
 
-## Tests (`tests/test_twoseat.py`, `tests/test_alphaholdem.py`; CPU, under a minute together)
+## Tests (`tests/test_twoseat.py`, `tests/test_alphaholdem.py`; 36 tests, about 10 s together on CPU)
 
 - Two-seat env: C++ against the Python twin on the same decks with random actions including waits (observations,
   seats, rewards, dones identical; also with all-in EV); the twin against `PokerVecEnv` with the same seed and
@@ -173,16 +176,60 @@ One iteration:
 - GAE on a hand-built two-table trajectory: interleaved seats, a hand without a decision of the learner, waiting
   cells; against values computed by hand.
 - ELO update, K-best selection, opponent assignment.
-- Trainer: frozen pool members do not change, the main agent does; samples come from main-controlled seats only and
-  every sample's return is its seat's reward of that hand; checkpoint round trip; a short run logs finite losses.
+- Trainer: with forced policies (the main agent always raises, the pool member folds to every bet) a rollout has
+  samples of the main agent's decisions only, the right returns, bounds and results, and none for the hands it won
+  without acting; in self-play every sample's return is its seat's reward of that hand (recomputed by a forward
+  walk over the recorded grid) and the stored inputs reproduce the stored log-probabilities and values; which
+  grid cells are samples is replayed from the opponent assignment and the seats, and each sample's tensors and
+  bounds are those of the observation at its cell; the ELO game follows the rollout's result; the update's loss is
+  the Trinal-Clip loss with the trainer's settings; frozen pool members do not change and the main agent does;
+  checkpoint round trip (network, Adam, pool, ratings, both generators) and the CLI with `--resume`.
 - Player: probabilities sum to 1, no illegal action, batch = row by row, `make_player("alpha:...")`, LBR and compare
   accept it.
-- Mutation check (by hand, recorded in the plan): each wiring test fails on its one-line mutation.
+- Mutation check: 59 one-line mutations of the env (Python and C++), the encoder, the loss, GAE, the pool, the
+  trainer and the player; each makes the test named for it in the plan fail. The first run found two that no test
+  noticed (the main agent's seat tensor aliased its numpy array on CPU, so a missing refresh would only have shown
+  on a GPU; a generator that is not restored from a checkpoint); the code / the test were changed and both fail now.
 
-## Compute
+## Compute and measurements (CPU, a machine busy with other jobs)
 
-- CPU smoke (8 threads): a few minutes; must beat `random` and not lose to `call`.
-- Long run (one RTX 3090): 5 000 iterations x 131 072 decisions = 0.66e9 samples, the paper's ablation budget.
+- Two-seat env, 4096 tables, one core, random actions: 3.9 M steps/s (the one-seat env: 1.7 M agent steps/s); with
+  all-in EV and 100 sampled runouts 0.18 M steps/s under random play, where a third of the actions are all-ins;
+  the Python twin 23 k steps/s.
+- Encoder: 0.1 - 0.8 M observations/s on CPU.
+- Trainer on 8 CPU threads: 1.5 k samples/s with the default network (rollout and 3 epochs), 3 - 4 k with the small
+  network of the smoke run.
+- Expected on one RTX 3090 (an estimate from operation counts, not a measurement): 30 - 45 k samples/s, i.e.
+  3 - 4.5 s per iteration of 131 072 decisions; 5 000 iterations = 0.66e9 samples (the paper's ablation budget) in
+  4 - 6 hours. GPU memory: well under 2 GB.
+
+## Results so far (CPU only)
+
+Smoke run (commit 90fdab9; `--envs 512 --samples 8192 --minibatch 1024 --epochs 4 --channels 32 --hidden 128
+--conv-layers 2 --snapshot-every 5 --pool 4 --iterations 60`: 0.53 M samples, about 2.5 minutes of training on 8
+threads, a 340 k-parameter network), then `python -m headsup.compare alpha:<run>/policy.pth cfr --bots --hands
+100000` (all-in EV, chips/hand ± SE):
+
+| against | random | call | allin | cfr |
+|---|---|---|---|---|
+| smoke agent | +4.26 ± 0.08 | +6.27 ± 0.13 | +4.63 ± 0.06 | -1.48 ± 0.07 |
+| for scale: `cfr` | +4.14 ± 0.07 | +7.86 ± 0.12 | +3.23 ± 0.06 | |
+
+Three runs of the same small configuration (snapshots every 10 iterations) to about 1 M samples, one seed each,
+evaluated against `cfr` inside the C++ env (50 k hands for the first row, 30 k for the others; chips/hand):
+
+| iteration (x 9 k samples) | 25 | 50 | 75 | 100 | 125 |
+|---|---|---|---|---|---|
+| default (per-state value clip, dealt rewards) | -2.50 ± 0.10 | -1.86 ± 0.11 | -1.77 ± 0.11 | -1.81 ± 0.11 | -2.01 ± 0.12 |
+| `--allin-ev` | -1.98 ± 0.13 | -1.68 ± 0.16 | -1.56 ± 0.15 | -1.81 ± 0.16 | -1.23 ± 0.15 |
+| `--no-value-clip` | -2.01 ± 0.13 | -1.91 ± 0.13 | -0.93 ± 0.12 | -0.68 ± 0.11 | (stopped) |
+
+What this does and does not show: the agent beats the bots within minutes and is far from the DeepCFR net after
+1 M samples (the long run has 600 times as many). With the per-state clip more than 40 % of the value targets are
+clipped and the value head explains none of the variance of the returns (explained variance about 0), so the
+advantages are close to raw returns. The run without the clip was ahead by about one chip per hand from 0.7 M
+samples on, but its explained variance was about 0 as well and it is one seed: the difference is not established.
+It is the first thing to check on a GPU (`--no-value-clip` is the paper's "dual-clip PPO" ablation).
 
 ## Success criteria (long run; 400k hands head-to-head, >= 20k LBR pairs, ± SE)
 
@@ -191,5 +238,24 @@ One iteration:
 3. LBR below the DeepCFR net's 1.33 ± 0.09 chips/hand; stretch: the blueprint's 0.60 ± 0.09.
 
 The paper reports no exploitability, and self-play PPO has no convergence guarantee in imperfect-information games
-(AlphaExploitem reports that a K-best PPO baseline approaches but does not reach Nash on Leduc), so criterion 3 is
-the open one.
+(AlphaExploitem reports that a K-best PPO baseline approaches but does not reach Nash on Leduc), so criteria 2 and 3
+are open; nothing measured so far says whether the long run meets them.
+
+Long run and its evaluation:
+
+```bash
+CUDA_VISIBLE_DEVICES=<free gpu> python -m headsup.alphaholdem.train --out runs/alphaholdem --iterations 5000 --device cuda:0 --eval-cfr
+python -m headsup.compare alpha:runs/alphaholdem/policy.pth cfr --bots --hands 400000 --device cuda:0
+python -m headsup.lbr --policy alpha:runs/alphaholdem/policy.pth --hands 20000 --device cuda:0
+```
+
+## Not verified
+
+- Anything on CUDA or MPS: the trainer, the encoder and the player were only run on CPU. Known device-dependent
+  spots: the action-sampling generator lives on the training device (saving its state is guarded), the encoder
+  uses float32 products on MPS (run on CPU with float32: no mismatch in 7 trees).
+- The throughput on an RTX 3090 and with it the duration of the long run.
+- Whether the per-state value clip helps or hurts (above), the entropy coefficient (0.01; the brief suggests a
+  sweep over 0.005 - 0.02), the number of epochs, K and the snapshot interval: none was tuned.
+- Larger trees: the encoder is tested in an 8-action tree and with 200 / 1000-chip stacks, the trainer only in the
+  default game (the shipped baselines exist only there).
