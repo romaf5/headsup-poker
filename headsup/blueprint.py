@@ -30,7 +30,7 @@ import numpy as np
 
 from headsup import native
 from headsup.game import DEFAULT_GAME, GameConfig
-from headsup.public import board_cards, hero_cards, replay_from_obs
+from headsup.public import board_cards, replay_from_obs
 
 
 class TabularBlueprint:

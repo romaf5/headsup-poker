@@ -41,7 +41,7 @@ import torch
 from headsup import native
 from headsup.cards import CARD_FEATURES, NUM_CARDS, hand_strength
 from headsup.engine import BOARD_CARDS_BY_STAGE, HeadsUpPoker
-from headsup.game import FHP, GameConfig
+from headsup.game import FHP
 from headsup.lbr import COMBO_FEATURES, COMBOS, NUM_COMBOS, substitute_hands, valid_combos
 from headsup.search import _opponent_mass, _showdown_values
 

@@ -13,7 +13,6 @@ memory, saved to ``<out>/policy.pth`` and evaluated against simple opponents.
 """
 
 import argparse
-import sys
 import json
 import os
 import time
@@ -356,7 +355,7 @@ class DeepCFRTrainer:
         return path
 
     def sdcfr_player(self, mode="sample", seed=None):
-        from headsup.sdcfr import IterateBank, SDCFRPlayer
+        from headsup.sdcfr import SDCFRPlayer
 
         bank = self._bank()
         return SDCFRPlayer(bank, mode=mode, seed=seed)
@@ -593,7 +592,7 @@ class DeepCFRTrainer:
         cur = RegretMatchingPlayer(self.nets, device=self.device, seed=a.seed)
         targets["current_strategy"] = (cur, cur)
         if self.iterates is not None:
-            from headsup.sdcfr import IterateBank, SDCFRPlayer
+            from headsup.sdcfr import SDCFRPlayer
 
             bank = self._bank()
             targets["sdcfr"] = (SDCFRPlayer(bank, mode="sample", seed=a.seed), SDCFRPlayer(bank.thin(a.lbr_model_iterates), mode="exact"))

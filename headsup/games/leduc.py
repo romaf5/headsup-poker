@@ -305,7 +305,6 @@ def DeepCFRNet(in_dim, num_actions, obs_dim=34, dim=64, game=None, policy=False)
 def legal_mask_from_history(game, x, obs_dim, caps=None):
     """Legal mask of the player to act from a history input (player 0's infostate, then player 1's): the actor
     alternates within a round starting with player 0, so the round's action count says whose turn it is."""
-    import torch
 
     rnd = x[:, 6].round().long().clamp(0, game.num_rounds - 1)
     base = 10 + 12 * rnd

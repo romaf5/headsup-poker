@@ -12,7 +12,7 @@ session needs to work on the code safely. docs/paper-fidelity.md lists every kno
 python3.12 -m venv .venv && source .venv/bin/activate       # 3.10-3.12
 pip install -r requirements.txt -r requirements-rl.txt
 python setup.py build_ext --inplace                          # C++17; -> headsup_cpp.*.so
-python -m pytest tests -q                                    # ~115 tests, ~8 min on CPU (CI: GitHub Actions)
+python -m pytest tests -q                                    # ~270 tests, ~7 min on CPU (CI: GitHub Actions)
 ```
 
 - Device: automatic (`mps` > `cuda` > `cpu`), `--device` / `HEADSUP_DEVICE=cuda:0` to force. CPU-only

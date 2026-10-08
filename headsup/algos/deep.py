@@ -722,17 +722,30 @@ def build_parser():
     return p
 
 
+# options that only some algorithms read (the others accepted and ignored them)
+USED_BY = {
+    "mean_regret": ("deepcfr", "sdcfr"), "epsilon": ("dream",), "shared_baseline": ("dream",), "bootstrap_chance": ("dream",),
+    "q_steps": ("dream", "escher"), "q_batch": ("dream", "escher"), "value_traversals": ("escher",), "value_epsilon": ("escher",),
+    "strat_capacity": ("deepcfr", "escher"), "policy_steps": ("deepcfr", "escher"), "policy_batch": ("deepcfr", "escher"),
+}
+
+
 def parse_args(argv=None):
-    """The command line, with the ``--preset``'s budgets for the options that were not given."""
+    """The command line, with the ``--preset``'s budgets for the options that were not given.  Options that have no
+    effect for the chosen algorithm are reported on stderr."""
+    import sys
+
     args = build_parser().parse_args(argv)
-    if args.preset:
-        probe = build_parser()
-        for action in probe._actions:
-            action.default = argparse.SUPPRESS
-        given = set(vars(probe.parse_args(argv)))
-        for key, value in PRESETS[args.preset].items():
-            if key not in given:
-                setattr(args, key, value)
+    probe = build_parser()
+    for action in probe._actions:
+        action.default = argparse.SUPPRESS
+    given = set(vars(probe.parse_args(argv)))
+    for key, value in (PRESETS[args.preset].items() if args.preset else ()):
+        if key not in given:
+            setattr(args, key, value)
+    ignored = sorted("--" + key.replace("_", "-") for key in given if key in USED_BY and args.algo not in USED_BY[key])
+    if ignored:
+        print(f"note: no effect with --algo {args.algo}: {', '.join(ignored)}", file=sys.stderr)
     return args
 
 

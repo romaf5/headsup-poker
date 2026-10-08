@@ -199,7 +199,6 @@ def test_dream_shared_baseline_is_zero_sum_and_resumes(tmp_path):
 
 
 def test_dream_checkpoint_baseline_layout_must_match():
-    import torch
 
     g = make_game("kuhn")
     s = DeepSolver(g, "dream", traversals=10, adv_steps=2, q_steps=2, seed=0, shared_baseline=True)
@@ -342,3 +341,17 @@ def test_escher_preset_is_the_papers_table_3():
     assert (a.traversals, a.value_traversals, a.adv_steps, a.adv_batch, a.q_steps, a.q_batch, a.policy_steps, a.policy_batch) == (
         1000, 1000, 5000, 2048, 5000, 256, 10000, 2048)
     assert parse_args(["--algo", "escher"]).q_steps == 1000  # without the preset: the defaults
+
+
+def test_options_without_effect_for_the_algorithm_are_reported(capsys):
+    """--mean-regret with DREAM, --epsilon with SD-CFR, ... were accepted and silently ignored."""
+    from headsup.algos.deep import parse_args
+
+    parse_args(["--algo", "dream", "--mean-regret", "--policy-steps", "10", "--epsilon", "0.4", "--q-steps", "5"])
+    err = capsys.readouterr().err
+    assert "--mean-regret" in err and "--policy-steps" in err and "--epsilon" not in err and "--q-steps" not in err
+    parse_args(["--algo", "sdcfr", "--epsilon", "0.4", "--shared-baseline", "--value-traversals", "9", "--mean-regret"])
+    err = capsys.readouterr().err
+    assert all(flag in err for flag in ("--epsilon", "--shared-baseline", "--value-traversals")) and "--mean-regret" not in err
+    parse_args(["--algo", "escher", "--preset", "escher"])
+    assert capsys.readouterr().err == ""  # a preset's values are not "given"
