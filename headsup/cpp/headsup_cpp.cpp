@@ -82,8 +82,8 @@ inline int eval5(uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3, uint32_t c4
   return g_tables.unsuited.at(prod);
 }
 
-// best 5 of 7 (lower is better), same as treys Evaluator._seven
-int eval7(const int* cards7) {
+// best 5 of 7 (lower is better), same as treys Evaluator._seven: the reference the fast tables are built from
+int eval7_reference(const int* cards7) {
   uint32_t c[7];
   for (int i = 0; i < 7; ++i) c[i] = treys_card(cards7[i]);
   int best = 7462;
@@ -95,28 +95,11 @@ int eval7(const int* cards7) {
   return best;
 }
 
-// best 5-card hand of n = 5..7 cards (treys-compatible), for games that show down on fewer board cards
-int eval_best(const int* cards, int n) {
-  if (n == 7) return eval7(cards);
-  uint32_t c[7];
-  for (int i = 0; i < n; ++i) c[i] = treys_card(cards[i]);
-  if (n == 5) return eval5(c[0], c[1], c[2], c[3], c[4]);
-  int best = 7462;  // n == 6: leave one out
-  for (int skip = 0; skip < 6; ++skip) {
-    uint32_t h[5];
-    int k = 0;
-    for (int i = 0; i < 6; ++i)
-      if (i != skip) h[k++] = c[i];
-    best = std::min(best, eval5(h[0], h[1], h[2], h[3], h[4]));
-  }
-  return best;
-}
-
-// ------------------------------------------------------------------ fast 7-card evaluation (the same ranks as eval7)
+// ------------------------------------------------------------------ fast 7-card evaluation (the same ranks as eval7_reference)
 // One table lookup instead of 21 five-card ones.  With five or more cards of a suit the best hand is a flush or a
 // straight flush of that suit (two cards outside it cannot make quads or a full house): a table over the suit's 13-bit
 // rank mask.  Otherwise the hand is decided by its rank multiset: a table over the product of the seven rank primes
-// (49,205 entries).  Both are built from eval5 / eval7 on first use.
+// (49,205 entries).  Both are built from eval5 / eval7_reference on first use.
 struct FastTables {
   std::vector<uint16_t> flush;                   // by 13-bit rank mask (>= 5 bits set)
   std::unordered_map<uint64_t, uint16_t> ranks;  // by the product of the seven rank primes (no flush possible)
@@ -154,7 +137,7 @@ inline void build_fast_tables() {
           ++k;
           prod *= PRIMES[i];
         }
-      g_fast.ranks[prod] = uint16_t(eval7(cards));
+      g_fast.ranks[prod] = uint16_t(eval7_reference(cards));
       return;
     }
     if (rank == 13) return;
@@ -181,6 +164,26 @@ inline int eval7_fast(const int* cards7) {
   for (int s = 0; s < 4; ++s)
     if (count[s] >= 5) return g_fast.flush[mask[s]];
   return g_fast.ranks.find(prod)->second;
+}
+
+// best 5 of 7 (lower is better): one lookup, ~15x faster than the 21 five-card evaluations of the reference
+inline int eval7(const int* cards7) { return eval7_fast(cards7); }
+
+// best 5-card hand of n = 5..7 cards (treys-compatible), for games that show down on fewer board cards
+int eval_best(const int* cards, int n) {
+  if (n == 7) return eval7(cards);
+  uint32_t c[7];
+  for (int i = 0; i < n; ++i) c[i] = treys_card(cards[i]);
+  if (n == 5) return eval5(c[0], c[1], c[2], c[3], c[4]);
+  int best = 7462;  // n == 6: leave one out
+  for (int skip = 0; skip < 6; ++skip) {
+    uint32_t h[5];
+    int k = 0;
+    for (int i = 0; i < 6; ++i)
+      if (i != skip) h[k++] = c[i];
+    best = std::min(best, eval5(h[0], h[1], h[2], h[3], h[4]));
+  }
+  return best;
 }
 
 // P(seat 0 wins) and P(tie) at a showdown on `final_cards` board cards of which `n_known` are dealt: over every
@@ -3087,11 +3090,11 @@ PYBIND11_MODULE(headsup_cpp, m) {
     if (cards.size() < 5 || cards.size() > 7) throw std::runtime_error("need 5..7 cards");
     return eval_best(cards.data(), int(cards.size()));
   });
-  m.def("eval7_fast", [](std::vector<int> cards) {
+  m.def("eval7_reference", [](std::vector<int> cards) {
     if (cards.size() != 7) throw std::runtime_error("need 7 cards");
     check_cards(cards);
-    return eval7_fast(cards.data());
-  }, "rank of the best five of seven cards (as eval7), by one table lookup");
+    return eval7_reference(cards.data());
+  }, "rank of the best five of seven cards by evaluating all 21 five-card hands (what eval7's tables are built from)");
   m.def("showdown_equity", [](std::vector<int> h0, std::vector<int> h1, std::vector<int> board, int final_cards, long samples, uint64_t seed) {
     if (h0.size() != 2 || h1.size() != 2 || final_cards < 3 || final_cards > 5 || int(board.size()) > final_cards)
       throw std::invalid_argument("cards: two hands of two cards and a board of at most final_cards (3..5) cards");

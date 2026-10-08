@@ -26,6 +26,8 @@ def _brute_force(h0, h1, board, final_cards=5):
 
 
 def test_fast_seven_card_evaluator_matches_the_reference():
+    """eval7 is one table lookup (flush by suit mask, else by rank multiset); the tables are built from the
+    21-combination reference evaluator."""
     cpp = native.module()
     rng = np.random.default_rng(0)
     hands = [rng.permutation(52)[:7] for _ in range(20000)]
@@ -39,7 +41,7 @@ def test_fast_seven_card_evaluator_matches_the_reference():
     hands.append(np.array([12, 0, 1, 2, 3, 20, 33]))  # the wheel, suited
     for h in hands:
         cards = [int(c) for c in h]
-        assert cpp.eval7_fast(cards) == cpp.eval7(cards), cards
+        assert cpp.eval7(cards) == cpp.eval7_reference(cards), cards
 
 
 def test_showdown_equity_is_the_exact_average_over_the_runouts():
