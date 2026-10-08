@@ -81,12 +81,17 @@ def _side_stream(device):
     return _SIDE_STREAMS[device]
 
 
-def _optimise(model, opt, loss_fn, steps, grad_clip=1.0):
+def _optimise(model, opt, loss_fn, steps, grad_clip=1.0, sync_every=0, sync_fn=None):
     """``steps`` optimiser steps on ``loss_fn()`` (which samples its own minibatch on the model's
     device), gradient-norm clipping as the papers.  On CUDA the whole step - sampling, forward,
     backward, clipping, fused Adam - is captured once in a CUDA graph and replayed: the small games'
-    networks are launch-bound (5 ms -> ~0.3-0.7 ms per step).  Returns the last loss."""
-    params = list(model.parameters())
+    networks are launch-bound (5 ms -> ~0.3-0.7 ms per step).  ``model`` / ``opt`` may be lists (several
+    networks with disjoint parameters stepped on one loss); ``sync_fn`` is called after step 1 and then
+    after every ``sync_every``-th step (a target-network copy: in-place, so the graph sees it).
+    Returns the last loss."""
+    models = list(model) if isinstance(model, (list, tuple)) else [model]
+    opts = list(opt) if isinstance(opt, (list, tuple)) else [opt]
+    params = [p for m in models for p in m.parameters()]
     cuda = params[0].is_cuda
 
     def step():
@@ -94,28 +99,39 @@ def _optimise(model, opt, loss_fn, steps, grad_clip=1.0):
         loss.backward()
         if grad_clip:
             torch.nn.utils.clip_grad_norm_(params, grad_clip, foreach=cuda)
-        opt.step()
-        opt.zero_grad(set_to_none=not cuda)  # the graph needs the gradient buffers to stay in place
+        for o in opts:
+            o.step()
+        for o in opts:
+            o.zero_grad(set_to_none=not cuda)  # the graph needs the gradient buffers to stay in place
         return loss
 
-    model.train()
+    def after(done):
+        if sync_every and (done - 1) % sync_every == 0:
+            sync_fn()
+
+    for m in models:
+        m.train()
     loss = None
     if not cuda or steps <= 4:
-        for _ in range(steps):
+        for i in range(steps):
             loss = step()
+            after(i + 1)
     else:
         side = _side_stream(params[0].device)
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):  # warm-up outside the graph (allocates the gradient / optimiser state)
-            for _ in range(3):
+            for i in range(3):
                 step()
+                after(i + 1)
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):  # recorded, not executed
             loss = step()
-        for _ in range(steps - 3):
+        for i in range(steps - 3):
             graph.replay()
-    model.eval()
+            after(i + 4)
+    for m in models:
+        m.eval()
     return float(loss.item()) if loss is not None else float("nan")
 
 

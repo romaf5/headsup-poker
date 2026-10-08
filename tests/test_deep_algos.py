@@ -215,3 +215,22 @@ def test_leduc_report_rows_and_unknown_algorithms(tmp_path):
     (tmp_path / "e_s0.json").write_text(json.dumps({"curve": [{"iteration": 10, "average": 0.1, "nodes_touched": 1e6}]}))
     with pytest.raises(ValueError, match="escher"):
         table([("dreamp", "escher", "ESCHER", str(tmp_path / "e_s*.json"))], "dreamp", (1e6,))
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_optimise_steps_several_networks_and_syncs(device):
+    import torch
+
+    from headsup.algos.deep import _adam, _optimise
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("no CUDA")
+    torch.manual_seed(0)
+    a, b = torch.nn.Linear(3, 1).to(device), torch.nn.Linear(3, 1).to(device)
+    x = torch.randn(64, 3, device=device)
+    ya, yb = x.sum(1, keepdim=True), -x.sum(1, keepdim=True)
+    calls = []
+    loss = _optimise([a, b], [_adam(a, 3e-2), _adam(b, 3e-2)], lambda: (a(x) - ya).pow(2).mean() + (b(x) - yb).pow(2).mean(),
+                     300, grad_clip=0, sync_every=50, sync_fn=lambda: calls.append(1))
+    assert loss < 0.05  # both regressions were optimised
+    assert len(calls) == 6  # after steps 1, 51, 101, 151, 201, 251
