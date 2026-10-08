@@ -226,7 +226,7 @@ exception: the official values are a flag away, the defaults were measured on Le
 - Restricted to the Leduc family (`headsup/games/leduc.py`): one private card per player, at most two betting
   rounds, a last-round tree that does not depend on the first round's betting. The constructor asserts it.
 
-## Tests (`tests/test_rebel.py`, 37 tests, about 12 s on CPU; the report's test is in `tests/test_deep_algos.py`)
+## Tests (`tests/test_rebel.py`, 38 tests, 15-20 s on CPU; the report's test is in `tests/test_deep_algos.py`)
 
 A convergence test cannot tell most one-line mistakes apart, so the pieces are tested directly:
 
@@ -250,7 +250,8 @@ A convergence test cannot tell most one-line mistakes apart, so the pieces are t
 - The last round asks no network; the paper's chance targets ask it exactly once per agent, after a card.
 - The loss on hand-made numbers, the network's layers and small initial output, the learning-rate schedule.
 - The exact mixture equals a brute-force mixture of `Playthrough` policies over the game tree; the sampled
-  mixture equals the mixture of its own playthroughs; a playthrough keeps one stopping step per subgame.
+  mixture equals the mixture of its own playthroughs; a playthrough keeps one stopping step per subgame; the
+  unsafe policy is the average strategy with the last round solved at its ranges.
 - Kuhn end to end (exploitability = Linear CFR's), evaluation keys, an evaluation does not change the training
   trajectory, a short training lowers the value error, checkpoint round trip continues bit-identically on CPU,
   snapshots and loaded solvers do not share optimiser state, the CLI trains / resumes / calibrates.
@@ -277,33 +278,99 @@ References (none is an official ReBeL-on-Leduc result):
 | pinouche/poker_self_play (third party, single seed, unverified) | its ReBeL variant (DCFR, leaves after the card, gadget re-solving), trained net at 300 / 1 000 / 3 000 / 10 000 test-time iterations | 58.5 / 46.6 / 26.9 / 16.4 |
 | the same | its exact leaf solving | 57.1 / 49.7 / 39.2 / 29.3 |
 | Student of Games, Fig. 3A (read off the plot by a survey) | another algorithm (GT-CFR with learned value and policy), 100 / 1 000 simulations | about 105 / 22 |
-| our SD-CFR / DREAM / Deep PDCFR+ reproductions on Leduc | exploitability of the average strategy | 44-90 |
+| our SD-CFR / DREAM / Deep PDCFR+ reproductions on Leduc | exploitability of the average strategy | 44-77 |
 
 ## Compute
 
-Measured on the shared 64-core box under load (load average 35-70), one process, 2 threads, T = 1024:
+Measured on the shared 64-core box (load average 40 from other jobs), one process with 2 threads, T = 1024:
 
 | part | time |
 |---|---|
-| root solve, 1024 steps with 5 leaf queries each | 0.45 s |
-| 2048 playthroughs: about 1 900 last-round solves of 1024 steps in one batch (about 1 us per subgame and step) | 1.9-2.2 s |
-| 50 minibatches of 512 | 0.2-0.3 s |
-| one epoch (`--leaf-targets net`): about 7 600 examples = 3 800 PBSs | about 2.7 s: 2 800 examples/s |
-| one evaluation (15 360 last-round solves of 1022 steps, three best responses) | 35-40 s |
-| search with exact leaf values, T = 1024 (`--oracle`) | 212 s |
+| root solve, 1024 steps with 5 leaf queries each | 0.5 s |
+| 2048 playthroughs: about 1 900 last-round solves of 1024 steps in one batch (0.9 us per subgame and step) | 1.6-1.7 s |
+| 200 minibatches of 512 | 1.2 s |
+| one epoch: 7 600 examples = 3 800 PBSs at first (92 % of the playthroughs reach the board card), about 5 300 later | 3.3-3.4 s; generation alone: 3 500 examples/s = 1 750 PBSs/s |
+| one evaluation (15 360 last-round solves of 1022 steps in one batch, three best responses) | 25 s |
+| search with exact leaf values, T = 1024 (`--oracle`): 1 024 x 30 last-round solves | 212 s |
 
-A run of 1 000 epochs (the official Liar's Dice length: 50 000 minibatches, about 7.6 M examples) with an
-evaluation every 25 epochs takes about 45 min of training plus 25 min of evaluations: 70-80 minutes per seed on
-one core. `--leaf-targets solve` needs six solves per example: `--games 512` keeps an epoch at about 3 s (1 000
-examples).
+A run of 300 epochs (60 000 minibatches, 1.6 M examples) with an evaluation every 20 epochs: 17 min of training
+plus 7 min of evaluations, about 25 minutes per seed on one core; the development run below took 29 minutes next
+to other jobs. Three seeds fit on three cores. The official Liar's Dice length (1 000 epochs of 50 minibatches)
+takes about 40 minutes plus its evaluations. `--leaf-targets solve` needs six solves per example: `--games 512`
+keeps an epoch near 4 s (1 000 examples).
 
-If the 1024 steps were too expensive: `--iters 256` makes generation and evaluation four times cheaper; with
-exact leaf values the search then reaches about 50 mA/g instead of 22 (the brief's calibration), which bounds what
-a network trained and played that way can do.
+If 1024 steps were too expensive: `--iters 256` makes generation and evaluation four times cheaper; with exact
+leaf values the search then reaches about 50 mA/g instead of 22 (the brief's calibration), which bounds what a
+network trained and played that way can do. It was not needed.
 
-## Result (2026-10-08, development measurements; the validation runs are still to come)
+The solver's cost is memory traffic, not Python: a first version with the subgame axis first (gathers along a
+middle axis) needed 9 us per subgame and step; subgame-last arrays with whole-block gathers need 0.9.
 
-See the hand-back of the implementation session and `python -m headsup.algos.leduc_report` once the runs
-`runs/leduc_rebel/leduc_s*.json` exist. Measured during development (seed 0, defaults unless noted):
+## Result (2026-10-08: development measurements, seed 0; the three-seed validation runs come after the hand-back)
 
-RESULT_PLACEHOLDER
+**Search alone, exact leaf values** (`--oracle`, exact exploitability in mA/g):
+
+| T | random-iterate mixture | 1 024 sampled playthroughs | unsafe search | root value | the brief's prototype (mixture / unsafe) |
+|---|---|---|---|---|---|
+| 64 | 126.8 | - | 143.1 | -0.191 | 134.9 / 165.9 |
+| 128 | 73.8 | - | 93.4 | -0.136 | 80.1 / 92.6 |
+| 1024 | 22.1 | 24.8 | 54.5 | -0.099 | 21.8 / 53.5 |
+
+Criterion 1 is met at T = 1024. The prototype's small-T numbers are not reproducible to the digit by any
+independent implementation, for two reasons that were both checked: (a) it passes a range without mass down as
+zeros, so the opponent of a player who never takes a line plays uniformly at random below it, where the official
+code - and this solver - make the range uniform; (b) with (a) emulated and textbook regret matching the two
+implementations agree to 1e-14 for the first three root steps and then drift apart by a factor 10-100 per step:
+CFR-D with exact leaf solves amplifies rounding differences, and the exploitability at T = 64 moves by about 5 %
+with the order of floating-point operations.
+
+**Training, `--leaf-targets net` (the paper's targets), default settings.** Exact exploitability of the policy
+played, of 1 024 sampled playthroughs, of unsafe search (mA/g); value-net RMS error on the probe set and of the
+leaf values fed to the evaluated search (milli-antes):
+
+| epoch | 1 | 35 | 70 | 100 | 120 | 160 | 200 | 220 | 240 | 260 | 280 | 300 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| policy played (exact) | 1026 | 40.5 | 52.3 | 49.4 | 29.8 | 29.6 | 30.3 | 24.4 | 24.8 | 25.3 | 25.1 | 26.2 |
+| 1 024 sampled playthroughs | 1024 | 40.7 | 53.6 | 53.4 | 30.2 | 31.3 | 44.3 | 26.3 | 27.1 | 28.1 | 26.4 | 26.9 |
+| unsafe search | 920 | 60.8 | 60.1 | 57.6 | 56.9 | 52.8 | 52.6 | 53.1 | 54.9 | 50.6 | 51.2 | 50.9 |
+| value error, probe | 1032 | 244 | 221 | 205 | 193 | 180 | 174 | 165 | 169 | 160 | 161 | 161 |
+| value error, fed to the search | 768 | 68 | 65 | 56 | 52 | 54 | 57 | 49 | 46 | 49 | 44 | 47 |
+
+The mean of the last three evaluations is 25.5 mA/g: 1.15 times the exact-leaf search (22.1), against the
+criterion of 2. The learning rate was halved at epochs 100 and 200; each halving lowers the plateau (about 45,
+30, 25). This run was resumed three times while the code was still being polished (the solver's arithmetic was
+reordered in between), so the final code will not reproduce it bit for bit; a fresh run of the final code and
+CLI defaults (80 epochs, 5.7 minutes) gave 994 / 113 / 56 / 41 / 29 mA/g at epochs 1 / 20 / 40 / 60 / 80, with a
+probe error of 991 / 333 / 264 / 237 / 220 milli-antes: the same course.
+
+The same setup with the official Liar's Dice schedule (50 minibatches per epoch, 3e-4 constant up to epoch 400):
+214 / 91 / 63 / 65 / 45 / 33 / 49 / 46 / 40 / 40 / 39 mA/g at epochs 40 / 80 / ... / 240 / 260 / 280 / 300 / 320 /
+340 (probe error 415 -> 217 milli-antes); stopped there.
+
+`--leaf-targets solve` (exact targets before the card; 512 playthroughs per epoch, still with 50 minibatches and
+3e-4): 34.8 / 35.0 / 26.7 / 27.6 / 42.1 / 29.3 mA/g at epochs 40 / 80 / 120 / 160 / 200 / 240, from 160 000 examples.
+That is close to the default run's level (27-42 against 25) with a tenth of the examples and a fifth of the
+minibatches; `net` stays the default because it is the paper's method and gets there too.
+
+What limits the network is its fit, not the data: at epoch 280 of the official-schedule run the error on the
+probe set was 0.33 antes for the values after the card, 0.20 for the bootstrapped targets before the card made
+from them, and 0.23 for the network's own answers before the card. After cards the PBS makes unlikely (below
+15 %) the error was 0.4, after likely ones 0.27: the self-play rarely deals them, the chance average asks for all
+six.
+
+**Sampled against exact evaluation.** The paper's protocol is a noisy upper bound of the exact number. With exact
+leaf values at T = 64 (12 draws each): K = 16: 244 +- 14, K = 64: 158 +- 5, K = 256: 136.0 +- 2.4, K = 1024:
+128.9 +- 1.0 mA/g against 126.8 exact, single K = 1024 draws scatter by 3.5. At T = 1024 a root iterate is drawn
+only twice on average: in the training table above the K = 1024 number lies up to 14 mA/g above the exact one
+(and at two of the run's evaluations 1-2 below).
+
+**Mutation check.** One-line mutants of `rebel.py`, each run against `tests/test_rebel.py` in its own copy of the
+package. First pass: 120 mutants, 115 killed. Of the five survivors one was equivalent (a reordered sum), one
+showed dead state (the torch generator was saved and restored although nothing draws from it after the network's
+initialisation: removed), three were real gaps (all subgames of a sampled playthrough sharing one stopping step,
+the regret-floor setting not reaching the solvers, the root value's normalisation) and got assertions. Final
+pass on the final code: 130 mutants, 129 killed; the survivor (the unsafe comparison policy's last round solved
+for half the steps) got its own test and is killed too.
+
+**Not verified:** `--device cuda:0` (the session was CPU-only by instruction); seeds other than 0; the hold'em
+stages of the brief.

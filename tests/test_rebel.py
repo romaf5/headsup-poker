@@ -566,6 +566,32 @@ def test_sampled_mixture_averages_its_playthroughs():
     assert len(set(out["stop0"].tolist())) > 1 and len(np.unique(out["stop1"])) > 1
 
 
+def test_unsafe_policy_is_the_average_strategy_with_its_own_ranges():
+    """The comparison policy: the root solve's average strategy, and below every leaf and card the last round's
+    average after T steps from the ranges the AVERAGE reaches the leaf with."""
+    s = _leduc(iters=8)
+    search = s.search(leaf_fn=s.exact_leaf(4))
+    table = s.policies(search)["unsafe"].table
+    average = search.average()
+    t0, t1 = s.tree0, s.tree1
+    for d, n in enumerate(t0.dec):
+        for h in range(H):
+            np.testing.assert_allclose(table[(int(t0.player[n]), h, None, 0, t0.hist[n])], average[0, d, :, h], atol=1e-12)
+    beliefs = search.leaf_beliefs(average)[0]
+    checked = 0
+    for leaf, card in ((0, 1), (2, 4), (4, 0)):
+        sub = s.solver(deal_board(beliefs[leaf][None], card), np.array([leaf]), np.array([card])).run(8)
+        tree, sigma = s.trees1[leaf], sub.average()[0]
+        for d, n in enumerate(tree.dec):
+            for h in range(H):
+                key = (int(t1.player[n]), h, card, 1, tree.hist[n])
+                if key in table:  # hands the average strategy brings here
+                    np.testing.assert_allclose(table[key], sigma[d, :, h], atol=1e-12)
+                    checked += 1
+    assert checked > 60
+    assert np.abs(sub.average() - s.solver(sub.beliefs, np.array([4]), np.array([0])).run(4).average()).max() > 0.01
+
+
 def test_playthrough_draws_one_stop_per_subgame_and_keeps_it():
     s = _leduc(iters=8)
     search = s.search()
