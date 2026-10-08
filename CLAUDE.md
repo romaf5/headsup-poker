@@ -73,7 +73,9 @@ python -m pytest tests -q                                    # ~270 tests, ~7 mi
   SD-CFR bank: thin the queried bank (`--model-iterates 32`; the bound stays valid).
 - Measure, don't anecdote: 400k+ hands for head-to-head, 20k+ LBR pairs, report ± SE. Played-hands tools use all-in
   EV by default (`--raw` off): hands all-in before the last card count with their expectation over the runouts
-  (`Engine.allin_ev`, Python + C++; `showdown_stage` = the round whose betting ended the hand at a showdown).
+  (`Engine.allin_ev`, Python + C++; `showdown_stage` = the round whose betting ended the hand at a showdown). LBR and
+  the browser table also average showdowns over the opponent's range (`range_ev`; needs the opponent's strategy for
+  all 1326 hands: `probs` on hand-substituted observations, or `all_hands_probs` of a search player).
 
 ## Machine / operations (64-core WSL2 box, 2 × RTX 3090, 94 GB RAM)
 

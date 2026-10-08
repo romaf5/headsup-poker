@@ -60,6 +60,9 @@ paper's hyperparameters and network (`--net deepcfr`: Appendix C with the 3x wid
 `deepcfr.evaluate`) count it with its expectation over the board cards still to come instead of the one runout that
 was dealt (exact on the flop and turn, 1,000 sampled runouts pre-flop): the same mean with a smaller standard error.
 `--raw` turns it off. In code: `engine.allin_ev()`, `play_hands(..., allin_ev=True)`, `headsup.cards.showdown_equity`.
+LBR goes one step further: it tracks the opponent's range anyway, so a showdown counts with its expectation over
+that range as well (only with an exact opponent model, i.e. not with `--model-iterates`); standard deviation per
+hand against the random bot: 65 chips dealt, 24 with all-in EV, 13 with the range.
 
 **Luck-adjusted results at the browser table.** Besides the runout, a showdown has a second piece of luck: which of
 the hands it plays this way the bot happened to hold. The table values every showdown against all of them, weighted
