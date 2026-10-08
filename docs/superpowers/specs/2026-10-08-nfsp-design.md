@@ -229,21 +229,25 @@ Three seeds per preset; our value at `x` is the mean of the evaluations within +
 
 First curves, measured in pieces of at most ten minutes through checkpoints (mA/g; ours: mean +- sd over seeds):
 
-| Leduc, `paper`, iterations | 1e3 | 1e4 | 1e5 | 2e5 | 5e5 | 9.5e5 |
-|---|---|---|---|---|---|---|
-| paper, Fig. 1a | 1880 | 1040 | 430 | 257 | 158 | 130 |
-| ours, seeds 0-2 | 2136 +- 44 | 1249 +- 82 | 310 +- 50 | 212 +- 78 | 130 +- 54 | 106 +- 38 |
+| Leduc, `paper`, iterations | 1e3 | 1e4 | 1e5 | 2e5 | 5e5 | 1e6 | 1.15e6 |
+|---|---|---|---|---|---|---|---|
+| paper, Fig. 1a | 1880 | 1040 | 430 | 257 | 158 | 128 | 118 |
+| ours, seeds 0-2 | 2136 +- 44 | 1249 +- 82 | 310 +- 50 | 212 +- 78 | 130 +- 54 | 106 +- 39 | 106 +- 39 |
 
-| Leduc, `dream`, nodes | 1.3e6 | 5e6 | 1e7 | 2e7 |
-|---|---|---|---|---|
-| DREAM paper, Fig. 2 (NFSP) | 909 | 403 | ~250 | 147 |
-| ours, seed 0 | 841 | 396 | 261 | 167 |
+| Leduc, `dream`, nodes | 1.3e6 | 5e6 | 1e7 | 2e7 | 2.6e7 |
+|---|---|---|---|---|---|
+| DREAM paper, Fig. 2 (NFSP) | 909 | 403 | ~250 | 147 | 127 |
+| ours, seed 0 | 841 | 396 | 261 | 167 | 155 |
 
 Kuhn (one seed): `paper` 301 / 109 / 10 / 8 mA/g at 1e3 / 1e4 / 1e5 / 2e5 iterations; `dream` 117 / 128 / 25 at
 1e3 / 1e4 / 4e4.
 
-Not verified: `paper` beyond 1e6 iterations (the 3e6 criterion), `dream` beyond 2.4e7 nodes (both of its criteria),
-and the seed-to-seed spread, which is large (at 1e6 iterations: 86 / 87 / 146).
+Not verified, and where it may fail:
+
+- `paper` at 3e6 iterations. The runs stand at 1.27e6: 80 / 82 / 158 mA/g, nearly flat since 8e5 (seed 2 since 6e5);
+  the criterion is 50-113. The seed-to-seed spread is large.
+- `dream` at 1e8 and 3.2e8 nodes. The one run stands at 2.9e7 nodes and has moved between 150 and 164 mA/g since
+  2.3e7, where the published curve falls from 136 to 119.
 
 ## Compute
 
