@@ -12,8 +12,10 @@ Two presets (docs/superpowers/specs/2026-10-08-nfsp-design.md lists every differ
 * ``dream`` - the DREAM authors' NFSP (EricSteinberger/DREAM, Leduc_NFSP.py): Deep-CFR-style nets with a dueling Q
   head, Double DQN, SGD (0.1 / 0.01) with gradient clipping, eps = 0.06 / (1 + 0.01 sqrt(iteration)).
 
-Rewards are in the DREAM code's unit (utilities / 2.6 in Leduc) in both: the paper does not state its unit, and with
-antes its learning rate of 0.1 leaves half of the Q networks' hidden units dead (``--reward-scale 1``).
+Rewards are in the DREAM code's unit (utilities / 2.6 in Leduc) in both.  The paper does not state its unit: for
+``paper`` this is a calibration on three seeds (in antes, ``--reward-scale 1``, the Leduc curves stopped near 250 mA/g).
+Dividing by c is the same run as antes with the first-layer step of Q divided by c^2 (a learning rate of 0.0148 instead
+of 0.1) and Q's initial output layer multiplied by c.
 An iteration is 128 environment steps (one decision at each of 128 parallel tables) followed by 2 SGD steps per network.
 Small games only: the tree is compiled to arrays, memories hold infoset indices, and the networks are numpy arrays
 with a hand-written backward pass (a torch autograd step on these networks takes 3-6 times as long).
