@@ -167,10 +167,14 @@ class GameConfig:
 
 
 DEFAULT_GAME = GameConfig()
-# DeepCFR paper, Appendix A: blinds 50/100, raises of $100 in rounds 1-2 ($200 in 3-4), at most 3 raises
-# per round in rounds 1-2 (4 in 3-4), no all-in (stacks are never a constraint); FHP = the first two rounds
-FHP = GameConfig(stack_size=100_000, small_blind=50, big_blind=100, limit=(100, 100), raise_caps=(3, 3), num_rounds=2, all_in=False)
-HULH = GameConfig(stack_size=100_000, small_blind=50, big_blind=100, limit=(100, 100, 200, 200), raise_caps=(3, 3, 4, 4), num_rounds=4, all_in=False)
+# The limit games of the DeepCFR paper (Appendix A): blinds 50/100, raises of $100 in rounds 1-2 ($200 in 3-4), no
+# all-in (stacks are never a constraint); FHP = the first two rounds.  Every round is capped at FOUR BETS: pre-flop
+# the big blind is the first, so 3 raises; post-flop the opening bet is one of them, so a bet and 3 raises = 4 raise
+# actions.  (Appendix A's "at most three raises" read literally gives a flop of a bet and two raises - not the game
+# of the paper: only the four-bet flop reproduces the abstraction sizes in its Fig. 2, 39,949 / 367,549 / 3,643,549 /
+# 234M infoset-actions, and HULH's 3.19e14 infosets of Bowling et al. 2015; PokerRL's Flop3Holdem has it too.)
+FHP = GameConfig(stack_size=100_000, small_blind=50, big_blind=100, limit=(100, 100), raise_caps=(3, 4), num_rounds=2, all_in=False)
+HULH = GameConfig(stack_size=100_000, small_blind=50, big_blind=100, limit=(100, 100, 200, 200), raise_caps=(3, 4, 4, 4), num_rounds=4, all_in=False)
 
 
 def action_label(game, action, verbose=False):

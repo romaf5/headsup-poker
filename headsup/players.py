@@ -97,7 +97,8 @@ def regret_matching_torch(adv, legal, fallback="uniform"):
     """Batched regret matching (torch): ``adv`` (..., N, A), ``legal`` bool (N, A).
 
     Illegal actions get probability 0; when no legal advantage is positive the ``fallback``
-    plays uniform over the legal actions or the highest legal advantage (``argmax``).
+    plays uniform over the legal actions or the highest legal advantage (``argmax``; exactly tied
+    best actions share the probability - the untrained all-zero network plays uniformly).
     Mirrors ``regret_matching`` in headsup/cpp/headsup_cpp.cpp and headsup/deepcfr/traverse.py.
     """
     import torch
@@ -108,7 +109,8 @@ def regret_matching_torch(adv, legal, fallback="uniform"):
     pos = adv.clamp(min=0.0)
     total = pos.sum(dim=-1, keepdim=True)
     if fallback == "argmax":
-        fb = torch.nn.functional.one_hot(adv.argmax(dim=-1), adv.shape[-1]).to(adv.dtype)
+        tied = (adv == adv.max(dim=-1, keepdim=True).values).to(adv.dtype)
+        fb = tied / tied.sum(dim=-1, keepdim=True).clamp(min=1.0)
     else:
         allowed = legal.to(adv.dtype)
         fb = allowed / allowed.sum(dim=-1, keepdim=True)

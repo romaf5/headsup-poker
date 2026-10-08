@@ -31,7 +31,10 @@ python -m pytest tests -q                                    # ~115 tests, ~8 mi
   check). `engine.legal_mask()` (Python + C++) == `legal_mask_from_obs(obs, game)`; with
   `mask_redundant` (auto-on for custom sizes) raises duplicating another action are masked and
   traversals give them their twin's target. Limit games (FHP / HULH): `limit` raise increments,
-  `raise_caps` per round, `num_rounds`, `all_in=False`, 100 000-chip stacks.
+  `raise_caps` per round, `num_rounds`, `all_in=False`, 100 000-chip stacks. FHP = caps (3, 4), HULH = (3, 4, 4, 4):
+  four bets per round (pre-flop the big blind is the first). Runs made before 2026-10-08 used (3, 3) / (3, 3, 4, 4);
+  their checkpoints and models keep their own game (stored config), but their numbers are not the papers' game.
+  A round has at most 6 actions (the observation's history slots): NL raise cap <= 5, limit caps <= 4.
 - Observation `float32[80]`: [0:6] hand, [6:21] board (rank+1, suit+1, card+1; hole cards and flop
   sorted by id — LBR's hand substitution and one-hot cards rely on it), [21] stage, [22] big blind,
   [23:31] pot-normalised bet / stack features (stack capped at 1000 chips), [31:79] bet history
@@ -50,9 +53,14 @@ python -m pytest tests -q                                    # ~115 tests, ~8 mi
 
 ## Algorithm notes
 
-- DeepCFR advantage loss `mean(t · (pred − target)²)` grows ~linearly with t by construction; watch
-  `eval_*` and `advantage/*/mse_unweighted` instead. `--preset paper` = paper hyperparameters.
-- The paper's "98 948 parameters" is not reproducible from its Appendix C code at any integer width.
+- DeepCFR fits weight a sample of iteration t by 2t/T (`--loss-weights paper`, the paper's 5.3; the loss is O(1)).
+  With `--loss-weights raw` (all runs before 2026-10-08; inherited when such a checkpoint is resumed) the loss grows
+  ~linearly with t and the clip at 1 rescales every step: watch `eval_*` and `advantage/*/mse_unweighted` there.
+  `--preset paper` = paper hyperparameters + `--net deepcfr` + argmax fallback.
+- The paper's "98 948 parameters" = 23 d² + 74 d + 4 at d = 64: Appendix C with the card branch 3 d wide (as in the
+  authors' code bases). `--net deepcfr` is that network (plus Appendix C's card tables, minus an unused 4th output);
+  `--net paper` is Appendix C as printed (d-wide card branch, extra inputs) and is kept for the models trained with it.
+- First iteration: untrained nets output zeros and the argmax fallback shares exact ties, i.e. plays uniformly.
 - Search: pre-river subgames use *sampled* MCCFR where LCFR beats DCFR / CFR+ / PCFR+ (measured); the
   river uses full-width vector CFR where DCFR / CFR+ / PCFR+ win. Do not add regret flooring to the
   sampled solver. `search:` players are slow (~1-2 s/decision): evaluate on 1-2k hands.

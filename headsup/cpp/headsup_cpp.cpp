@@ -400,7 +400,7 @@ inline void relu(float* x, int n) {
 }
 
 enum Features { AGGREGATED = 0, HISTORY = 1, BOTH_FEATURES = 2 };
-enum Arch { CURRENT = 0, PAPER = 1 };
+enum Arch { CURRENT = 0, PAPER = 1, DEEPCFR = 2 };
 enum Cards { EMBED = 0, ONEHOT = 1 };
 constexpr int MAX_DIM = 256;                       // widest supported hidden layer
 constexpr int CARD_CLASSES = NUM_CARDS + 1;        // one-hot classes per card slot (0 = no card)
@@ -413,8 +413,9 @@ inline int slot_offset(int s) { return s < 7 ? 3 * s : OPP_CARDS_OFFSET + 3 * (s
 // Mirrors headsup.model.BaseModel for every variant (see the docstring there).
 struct Model {
   int dim = 64, obs_dim = OBS_DIM_AGGREGATED, num_actions = 4;
-  bool opp_cards = false;  // history-input network: + the opponent's hole cards as a fifth card group
+  bool opp_cards = false;  // history-input network: + the opponent's hole cards as one more card group
   int n_slots = 7, n_groups = 4;
+  int group_of_slot[9] = {0, 0, 1, 1, 1, 2, 3, 4, 4};  // hole, flop, turn, river, (opponent's cards); -1 = no input of this net
   int features = AGGREGATED, arch = CURRENT, cards = EMBED;
   bool rm_argmax = false;  // regret-matching fallback: highest advantage instead of uniform
   std::vector<int> bet_index;
@@ -429,13 +430,15 @@ struct Model {
 
   void forward(const float* obs, float* out) const {
     const int D = dim;
-    float c1[MAX_DIM], c2[MAX_DIM];
+    const int H = card_fc[1].in;  // width of the first two card layers (dim; the DeepCFR paper's net: 3 dim)
+    float c1[3 * MAX_DIM], c2[3 * MAX_DIM];
     // 1. card branch
     if (cards == EMBED) {
       float x[5 * MAX_DIM];
       std::memset(x, 0, sizeof(float) * n_groups * D);
       for (int s = 0; s < n_slots; ++s) {
-        const int g = GROUP_OF_SLOT[s], tbl = per_group ? g : 0, o = slot_offset(s);
+        const int g = group_of_slot[s], tbl = per_group ? g : 0, o = slot_offset(s);
+        if (g < 0) continue;
         // index features are clamped as in the torch model (a corrupted or terminal observation must not read
         // outside the embedding tables)
         const int r = clampi(int(obs[o]), 0, 13), su = clampi(int(obs[o + 1]), 0, 4), c = clampi(int(obs[o + 2]), 0, NUM_CARDS);
@@ -447,15 +450,15 @@ struct Model {
       }
       card_fc[0].apply(x, c1);
     } else {  // Linear on concatenated one-hot cards == bias + sum of the selected weight columns
-      std::memcpy(c1, onehot_b.data(), sizeof(float) * D);
+      std::memcpy(c1, onehot_b.data(), sizeof(float) * H);
       for (int s = 0; s < n_slots; ++s) {
-        const float* row = onehot_t.data() + (size_t(s) * CARD_CLASSES + clampi(int(obs[slot_offset(s) + 2]), 0, NUM_CARDS)) * D;
-        for (int i = 0; i < D; ++i) c1[i] += row[i];
+        const float* row = onehot_t.data() + (size_t(s) * CARD_CLASSES + clampi(int(obs[slot_offset(s) + 2]), 0, NUM_CARDS)) * H;
+        for (int i = 0; i < H; ++i) c1[i] += row[i];
       }
     }
-    relu(c1, D);
+    relu(c1, H);
     card_fc[1].apply(c1, c2);
-    relu(c2, D);
+    relu(c2, H);
     card_fc[2].apply(c2, c1);
     relu(c1, D);  // c1 = card features
 
@@ -538,8 +541,12 @@ Linear to_linear(const py::dict& d, const std::string& prefix, int in, int out) 
   return l;
 }
 
-std::vector<int> bet_feature_indices(int features, int arch) {
+std::vector<int> bet_feature_indices(int features, int arch, int num_rounds) {
   std::vector<int> idx;
+  if (arch == DEEPCFR) {  // the bet history of the game's rounds, nothing else
+    for (int i = HISTORY_OFFSET; i < HISTORY_OFFSET + num_rounds * (HISTORY_DIM / 4); ++i) idx.push_back(i);
+    return idx;
+  }
   if (features == AGGREGATED || features == BOTH_FEATURES)
     for (int i = 23; i < OBS_DIM_AGGREGATED; ++i) idx.push_back(i);
   if (features == HISTORY || features == BOTH_FEATURES) {
@@ -565,24 +572,35 @@ std::shared_ptr<Model> model_from_dict(const py::dict& d) {
   m->dim = cfg["dim"].cast<int>();
   if (m->dim < 2 || m->dim > MAX_DIM) throw std::runtime_error("dim must be in [2, " + std::to_string(MAX_DIM) + "]");
   m->features = features == "aggregated" ? AGGREGATED : features == "history" ? HISTORY : features == "both" ? BOTH_FEATURES : -1;
-  m->arch = arch == "current" ? CURRENT : arch == "paper" ? PAPER : -1;
+  m->arch = arch == "current" ? CURRENT : arch == "paper" ? PAPER : arch == "deepcfr" ? DEEPCFR : -1;
   m->cards = cards == "embed" ? EMBED : cards == "onehot" ? ONEHOT : -1;
   if (m->features < 0 || m->arch < 0 || m->cards < 0) throw std::runtime_error("unknown model config values");
   m->rm_argmax = rm == "argmax";
   m->num_actions = 4;
+  int num_rounds = 4;
   if (cfg.contains("game")) {
     py::dict game = cfg["game"].cast<py::dict>();
     const bool all_in = !game.contains("all_in") || game["all_in"].is_none() || game["all_in"].cast<bool>();
     m->num_actions = int(py::len(game["bet_sizes"])) + 2 + (all_in ? 1 : 0);
+    if (game.contains("num_rounds") && !game["num_rounds"].is_none()) num_rounds = game["num_rounds"].cast<int>();
   }
+  if (num_rounds < 2 || num_rounds > 4) throw std::runtime_error("unsupported number of rounds");
   if (m->num_actions < 3 || m->num_actions > MAX_ACTIONS) throw std::runtime_error("unsupported number of actions");
   m->opp_cards = cfg.contains("opp_cards") && !cfg["opp_cards"].is_none() && cfg["opp_cards"].cast<bool>();
   m->n_slots = m->opp_cards ? 9 : 7;
-  m->n_groups = m->opp_cards ? 5 : 4;
+  // card groups: hole, flop, turn, river (the deepcfr arch: only the board rounds the game has), then the opponent's cards
+  const int board_groups = m->arch == DEEPCFR ? num_rounds : 4;
+  m->n_groups = board_groups + (m->opp_cards ? 1 : 0);
+  for (int s = 0; s < 9; ++s) {
+    const int g = GROUP_OF_SLOT[s];
+    m->group_of_slot[s] = g == 4 ? (m->opp_cards ? board_groups : -1) : (g < board_groups ? g : -1);
+  }
+  if (m->arch == DEEPCFR && m->features != HISTORY) throw std::runtime_error("the deepcfr architecture reads the history features");
   m->obs_dim = m->opp_cards ? OBS_DIM_WITH_OPP : m->features == AGGREGATED ? OBS_DIM_AGGREGATED : OBS_DIM_HISTORY;
-  m->bet_index = bet_feature_indices(m->features, m->arch);
-  m->per_group = m->arch == PAPER;
+  m->bet_index = bet_feature_indices(m->features, m->arch, num_rounds);
+  m->per_group = m->arch != CURRENT;
   const int D = m->dim;
+  const int H = m->arch == DEEPCFR ? 3 * D : D;  // width of the first two card layers
   if (m->cards == EMBED) {
     if (m->per_group) {
       for (int g = 0; g < m->n_groups; ++g) {
@@ -596,14 +614,14 @@ std::shared_ptr<Model> model_from_dict(const py::dict& d) {
       m->suit_emb[0] = to_vec(d, "card_model.cards_embeddings.suit_embedding.weight", 5 * D);
       m->card_emb[0] = to_vec(d, "card_model.cards_embeddings.card_embedding.weight", 53 * D);
     }
-    m->card_fc[0] = to_linear(d, "card_model.fc1", m->n_groups * D, D);
+    m->card_fc[0] = to_linear(d, "card_model.fc1", m->n_groups * D, H);
   } else {
-    Linear oh = to_linear(d, "card_model.onehot", m->n_slots * CARD_CLASSES, D);
-    m->onehot_t = std::move(oh.wt);  // (7 * CARD_CLASSES, D): row i = weights of one-hot input i
+    Linear oh = to_linear(d, "card_model.onehot", m->n_slots * CARD_CLASSES, H);
+    m->onehot_t = std::move(oh.wt);  // (7 * CARD_CLASSES, H): row i = weights of one-hot input i
     m->onehot_b = oh.b;
   }
-  m->card_fc[1] = to_linear(d, "card_model.fc2", D, D);
-  m->card_fc[2] = to_linear(d, "card_model.fc3", D, D);
+  m->card_fc[1] = to_linear(d, "card_model.fc2", H, H);
+  m->card_fc[2] = to_linear(d, "card_model.fc3", H, D);
   if (m->arch == CURRENT) {
     m->stage_emb = to_vec(d, "stage_and_order_model.stage_embedding.weight", 4 * D);
     m->first_emb = to_vec(d, "stage_and_order_model.first_to_act_embedding.weight", 2 * D);
@@ -620,7 +638,8 @@ std::shared_ptr<Model> model_from_dict(const py::dict& d) {
 }
 
 // regret matching over the legal actions; when no legal advantage is positive: uniform over the
-// legal actions, or (argmax_fallback, DeepCFR paper) the highest legal advantage with probability 1
+// legal actions, or (argmax_fallback, DeepCFR paper) the highest legal advantage with probability 1 - exactly tied
+// best actions share it, so the untrained all-zero network plays uniformly (as the authors do before the first net)
 inline void regret_matching(const float* adv, float* sigma, const bool* legal, int n, bool argmax_fallback = false) {
   float total = 0.0f;
   for (int a = 0; a < n; ++a) {
@@ -628,12 +647,15 @@ inline void regret_matching(const float* adv, float* sigma, const bool* legal, i
     total += sigma[a];
   }
   if (total <= 1e-6f) {
+    int tied = 0;
     if (argmax_fallback) {
       int best = -1;
       for (int a = 0; a < n; ++a)
         if (legal[a] && (best < 0 || adv[a] > adv[best])) best = a;
-      for (int a = 0; a < n; ++a) sigma[a] = a == best ? 1.0f : 0.0f;
-    } else {
+      for (int a = 0; a < n; ++a) tied += legal[a] && best >= 0 && adv[a] == adv[best];
+      for (int a = 0; a < n && tied; ++a) sigma[a] = (legal[a] && adv[a] == adv[best]) ? 1.0f / tied : 0.0f;
+    }
+    if (!tied) {  // the uniform fallback (also for non-finite outputs, which compare equal to nothing)
       int cnt = 0;
       for (int a = 0; a < n; ++a) cnt += legal[a];
       for (int a = 0; a < n; ++a) sigma[a] = legal[a] ? 1.0f / cnt : 0.0f;
@@ -680,7 +702,7 @@ struct Memory {
   int obs_dim = OBS_DIM;  // width stored per sample (= the networks' input width)
   int num_actions = 4;
   std::vector<float> obs, t, target;
-  std::vector<uint8_t> legal;  // advantage samples: the legal-action mask (for fits on legal actions only)
+  std::vector<uint8_t> legal;  // advantage and strategy samples: the legal-action mask (for fits on legal actions only)
   void add(const float* o, float tt, const float* tg, const bool* lg = nullptr) {
     obs.insert(obs.end(), o, o + obs_dim);
     t.push_back(tt);
@@ -731,7 +753,7 @@ struct Traverser {
       adv.add(obs, t, va, legal);
       return mean;
     }
-    strat.add(obs, t, sigma);
+    strat.add(obs, t, sigma, legal);
     e.step(sample(sigma, n, rng));
     return traverse(e);
   }
@@ -805,7 +827,7 @@ py::tuple run_traversals(std::shared_ptr<Model> net0, std::shared_ptr<Model> net
   return py::make_tuple(to_array(tr.adv.obs, na, od), to_array(tr.adv.t, na, 1),
                         to_array(tr.adv.target, na, nact), to_array(tr.strat.obs, ns, od),
                         to_array(tr.strat.t, ns, 1), to_array(tr.strat.target, ns, nact), tr.nodes,
-                        to_bool_array(tr.adv.legal, na, nact));
+                        to_bool_array(tr.adv.legal, na, nact), to_bool_array(tr.strat.legal, ns, nact));
 }
 
 
@@ -960,7 +982,7 @@ struct TrajectorySampler {
         for (int k = 0; k < n; ++k)
           if (legal[k] && pick-- == 0) { a = k; break; }
       } else {
-        strat.add(obs, t, sigma);  // the opponent plays sigma: its infosets are visited in proportion to its own reach
+        strat.add(obs, t, sigma, legal);  // the opponent plays sigma: its infosets are visited in proportion to its own reach
         a = sample(sigma, n, rng);
       }
       e.step(a);
@@ -1050,7 +1072,7 @@ py::tuple run_escher_regrets(std::shared_ptr<Model> net0, std::shared_ptr<Model>
   return py::make_tuple(to_array(ts.adv.obs, na, ts.adv.obs_dim), to_array(ts.adv.t, na, 1), to_array(ts.adv.target, na, nact),
                         to_array(ts.strat.obs, ns, ts.strat.obs_dim), to_array(ts.strat.t, ns, 1), to_array(ts.strat.target, ns, nact),
                         to_array(ts.val.obs, nv, OBS_DIM_WITH_OPP), to_array(ts.val.t, nv, 1), to_array(ts.val.target, nv, nact), ts.nodes,
-                        to_bool_array(ts.adv.legal, na, nact));
+                        to_bool_array(ts.adv.legal, na, nact), to_bool_array(ts.strat.legal, ns, nact));
 }
 
 // ------------------------------------------------------------------ vectorised env

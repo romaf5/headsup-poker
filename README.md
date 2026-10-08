@@ -27,8 +27,8 @@ Opponents: `pluribus` (blueprint + real-time search), `tab` (blueprint), `cfr` (
 | game | flag | rules |
 |---|---|---|
 | NL abstraction | default | stacks 100, blinds 1/2, fold / call / min-raise / all-in, 3rd raise → all-in; `--bet-sizes 0.5,1,2` for pot-fraction raises |
-| FHP | `--game fhp` | limit, blinds 50/100, bets 100, two rounds, showdown after the flop (DeepCFR paper) |
-| HULH | `--game hulh` | limit, bets 100 / 100 / 200 / 200, four rounds |
+| FHP | `--game fhp` | limit, blinds 50/100, bets 100, four bets per round (3 raises pre-flop; a bet and 3 raises on the flop), two rounds, showdown after the flop (DeepCFR paper) |
+| HULH | `--game hulh` | limit, bets 100 / 100 / 200 / 200, four bets per round, four rounds |
 | Leduc, Kuhn | `headsup.games` | small games with exact exploitability |
 
 ## Algorithms
@@ -43,7 +43,8 @@ Opponents: `pluribus` (blueprint + real-time search), `tab` (blueprint), `cfr` (
 
 Trainer outputs: `policy.pth` (spec `cfr:<path>`), `iterates.pt` (SD-CFR average, spec
 `sdcfr:<path>`), `checkpoint.pt` (`--resume`), TensorBoard logs. `--game fhp --preset paper` uses the
-paper's hyperparameters; `python -m headsup.deepcfr.train -h` lists the network / budget options.
+paper's hyperparameters and network (`--net deepcfr`: Appendix C with the 3x wider card branch behind its
+"98,948 parameters"); `python -m headsup.deepcfr.train -h` lists the network / budget options.
 
 ## Evaluation
 
@@ -114,10 +115,22 @@ Tabular references: CFR+ 0.24, DCFR 0.15 mA/g at 1000 iterations.
 | tabular blueprint, 20 M it., 40 min (`models/blueprint_nlhe.pt`) | **0.60 ± 0.09** | **+0.87 ± 0.04** vs the DeepCFR net |
 | Pluribus-mode search on the blueprint | −0.78 ± 0.39 | within noise of the blueprint |
 
-FHP (DeepCFR paper: 37 mbb/g total exploitability at ~3e8 nodes touched): our Deep CFR policy after 450 iterations
-(1.1e8 nodes) is at 80 mbb/g total (exact best response over all flops); the curve flattens there. Masked outputs
-and the paper's parameter count make no difference; longer runs are in progress. Best-response exploitability of
-the NL strategies is being re-measured (the earlier estimates missed the board chance factor).
+FHP (DeepCFR paper: 37 mbb/g total exploitability at ~3e8 nodes touched). The paper's game has four bets per round;
+until 2026-10-08 our flop stopped at a bet and two raises (Appendix A's "three raises" read literally). Only the
+four-bet flop reproduces the abstraction sizes in the paper's Fig. 2 (169 x 21 + buckets x 182 = 39,949 / 367,549 /
+3,643,549 infoset-actions, 234,199,693 lossless), and on it our exact tabular Linear CFR (`python -m
+headsup.algos.fhp_cfr`) follows the paper's dashed reference line:
+
+| iteration | 20 | 30 | 50 |
+|---|---|---|---|
+| paper, Linear CFR (digitised) | 118 | 65 | 31 |
+| ours, four-bet flop | 115 | 65 | 32 |
+| ours, earlier three-bet flop | 116 | 60 | 28 |
+
+(total exploitability, mbb/g). The Deep CFR numbers measured on the earlier game (80 mbb/g total after 450
+iterations) are not comparable with the paper and are being re-run with the paper's network and loss weights.
+Best-response exploitability of the NL strategies is being re-measured (the earlier estimates missed the board
+chance factor).
 
 ## Layout
 

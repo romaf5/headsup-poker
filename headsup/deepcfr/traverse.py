@@ -27,7 +27,8 @@ from headsup.numpy_model import NumpyModel
 def regret_matching(adv, eps=1e-6, fold_allowed=True, fallback="uniform", legal=None):
     """Regret matching over the legal actions (``legal`` bool mask; default: all but FOLD unless
     ``fold_allowed``); ``fallback`` when no legal advantage is positive: ``uniform`` over the
-    legal actions, or ``argmax`` = the highest legal advantage (DeepCFR paper)."""
+    legal actions, or ``argmax`` = the highest legal advantage (DeepCFR paper); exactly tied best actions share
+    the probability, so the untrained all-zero network plays uniformly (as the authors do before the first net)."""
     adv = np.asarray(adv, dtype=np.float32)
     if legal is None:
         legal = np.ones(len(adv), dtype=bool)
@@ -38,7 +39,9 @@ def regret_matching(adv, eps=1e-6, fold_allowed=True, fallback="uniform", legal=
     if total <= eps:
         sigma = np.zeros(len(adv), dtype=np.float32)
         if fallback == "argmax":
-            sigma[int(np.argmax(np.where(legal, adv, -np.inf)))] = 1.0
+            best = np.where(legal, adv, -np.inf)
+            tied = best == best.max()
+            sigma[tied] = 1.0 / tied.sum()
         else:
             sigma[legal] = 1.0 / legal.sum()
         return sigma
@@ -50,7 +53,7 @@ class Samples:
     obs: np.ndarray
     t: np.ndarray
     target: np.ndarray
-    legal: np.ndarray | None = None  # advantage samples: bool[N, num_actions] legal-action masks
+    legal: np.ndarray | None = None  # advantage and strategy samples: bool[N, num_actions] legal-action masks
 
     def __len__(self):
         return len(self.t)
@@ -97,6 +100,13 @@ class _Memory:
         )
 
 
+def sample_action(probs, u):
+    """The action a draw ``u`` in [0, 1) selects - never one with probability 0: the partial sums can stop short
+    of 1, and the remainder belongs to the last action WITH probability (the C++ samplers' rule)."""
+    a = int(np.searchsorted(np.cumsum(probs), u, side="right"))
+    return a if a < len(probs) else int(np.flatnonzero(np.asarray(probs) > 0)[-1])
+
+
 def traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats=None):
     """Recursive external-sampling traversal; returns the traverser's expected value."""
     if engine.done:
@@ -122,9 +132,8 @@ def traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats=None):
         mean = float(np.dot(sigma, values))
         adv_mem.add(obs, t, values - mean, legal)
         return mean
-    strat_mem.add(obs, t, sigma)
-    a = int(np.searchsorted(np.cumsum(sigma), rng.random(), side="right"))
-    engine.step(min(a, n - 1))
+    strat_mem.add(obs, t, sigma, legal)
+    engine.step(sample_action(sigma, rng.random()))
     return traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats)
 
 
@@ -152,7 +161,7 @@ def dream_trajectory(engine, traverser, nets, baseline, t, epsilon, rng, own_rea
     if stats is not None:
         stats["nodes"] += 1
     xi = (epsilon * legal / legal.sum() + (1.0 - epsilon) * sigma) if p == traverser else sigma
-    a = min(int(np.searchsorted(np.cumsum(xi), rng.random(), side="right")), n - 1)
+    a = sample_action(xi, rng.random())
     hist = history_rows(engine)
     b = baseline(hist)
     child = engine.clone()
@@ -263,7 +272,7 @@ class TraversalRunner:
             ]
             outs = [f.result() for f in futs]
             adv = Samples.concat([Samples(o[0], o[1], o[2], o[7]) for o in outs])
-            strat = Samples.concat([Samples(o[3], o[4], o[5]) for o in outs])
+            strat = Samples.concat([Samples(o[3], o[4], o[5], o[8]) for o in outs])
             nodes = sum(o[6] for o in outs)
         else:
             futs = [
@@ -317,5 +326,5 @@ class TraversalRunner:
         nets = self._cpp_models(weights[0], weights[1], value_weights)
         outs = self._fan_out(lambda k, s: self._cpp.run_escher_regrets(nets[0], nets[1], nets[2], traverser, k, float(t), s, self._cfg),
                              n_trajectories, seed)
-        return (Samples.concat([Samples(o[0], o[1], o[2], o[10]) for o in outs]), Samples.concat([Samples(o[3], o[4], o[5]) for o in outs]),
+        return (Samples.concat([Samples(o[0], o[1], o[2], o[10]) for o in outs]), Samples.concat([Samples(o[3], o[4], o[5], o[11]) for o in outs]),
                 Samples.concat([Samples(o[6], o[7], o[8]) for o in outs]), sum(o[9] for o in outs))

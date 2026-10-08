@@ -17,20 +17,50 @@ MIXED_GAME = GameConfig(bet_sizes=("min", 1.0), raise_cap=4, mask_redundant=True
 
 
 def test_limit_games_fhp_hulh():
-    assert FHP.num_actions == 3 and FHP.all_in_action is None and FHP.num_rounds == 2 and FHP.cap(1) == 3
-    assert HULH.num_actions == 3 and HULH.limit == (100, 100, 200, 200) and HULH.cap(3) == 4
+    assert FHP.num_actions == 3 and FHP.all_in_action is None and FHP.num_rounds == 2
+    assert FHP.raise_caps == (3, 4) and HULH.raise_caps == (3, 4, 4, 4) and HULH.limit == (100, 100, 200, 200)
     e = HeadsUpPoker(rng=np.random.default_rng(0), game=FHP)
     e.reset()
     assert e.bets == [50, 100] and e.raise_amount(2) == 150
-    for k in range(3):  # three raises are allowed per round ...
+    for k in range(3):  # pre-flop: three raises on top of the big blind (four bets) ...
         assert e.legal_mask()[2]
         e.step(2)
-    assert not e.legal_mask()[2] and e.consecutive_raises == 3  # ... the fourth is not
+    assert not e.legal_mask()[2] and e.consecutive_raises == 3  # ... the next is not allowed
     e.step(1)
     assert int(e.stage) == 1 and e.pot == 800 and len(e.visible_board) == 3
+    for k in range(4):  # flop: a bet and three raises (four bets as well: the opening bet is not in a blind)
+        assert e.legal_mask()[2]
+        e.step(2)
+    assert not e.legal_mask()[2] and e.pot == 800 + 100 + 200 + 200 + 200
     e.step(1)
-    e.step(1)  # check / check on the flop -> showdown on 5 cards
-    assert e.done and int(e.stage) == 4 and abs(e.rewards[0]) in (0, 400)
+    assert e.done and abs(e.rewards[0]) in (0, 800)
+
+
+def test_fhp_is_the_game_of_the_deep_cfr_paper():
+    """The sizes in the legend of Deep CFR's Fig. 2 pin the betting rule down: 169 x 21 + buckets x 182
+    infoset-actions = 39,949 / 367,549 / 3,643,549 for 200 / 2,000 / 20,000 flop buckets (the paper: 40,000 /
+    368,000 / 3,644,000) and 234,199,693 lossless (234M).  With a flop of a bet and two raises none of them comes out."""
+    nodes, pairs = [0, 0], [0, 0]
+
+    def walk(e):
+        if e.done:
+            return
+        mask = np.flatnonzero(e.legal_mask())
+        nodes[int(e.stage)] += 1
+        pairs[int(e.stage)] += len(mask)
+        for a in mask:
+            c = e.clone()
+            c.step(int(a))
+            walk(c)
+
+    e = HeadsUpPoker(game=FHP)
+    e.reset(list(range(9)))
+    walk(e)
+    assert nodes == [8, 70] and pairs == [21, 182]
+    assert [169 * pairs[0] + b * pairs[1] for b in (200, 2_000, 20_000, 1_286_792)] == [39_949, 367_549, 3_643_549, 234_199_693]
+
+
+def test_limit_games_are_zero_sum_with_bounded_pots():
     rng = np.random.default_rng(1)
     for game in (FHP, HULH):
         e = HeadsUpPoker(rng=rng, game=game)

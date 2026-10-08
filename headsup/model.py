@@ -9,9 +9,13 @@ outputs one value per action.  Variants (``BaseModel(**config)``):
   history (obs[31:79]: HISTORY_ROUNDS x HISTORY_SLOTS x [size / pot, occurred]) plus stack / pot
   and pot / 1000; ``both`` = all of them.
 * ``arch``: ``current`` = card branch + stage/position embedding branch + bet branch (3 x dim
-  into the trunk); ``paper`` = Figure 1 of Brown et al. (2019): card branch + bet branch only
-  (2 x dim into the trunk), one card embedding per card group (hole, flop, turn, river), the
-  position flag appended to the bet features.
+  into the trunk); ``paper`` = Figure 1 of Brown et al. (2019) as its Appendix C prints it: card
+  branch + bet branch only (2 x dim into the trunk), one card embedding per card group (hole, flop,
+  turn, river), the position flag appended to the bet features; ``deepcfr`` = the network the paper
+  trained (5.1: "98,948 parameters"): Appendix C with the card branch 3 x dim wide (groups x dim ->
+  3 dim -> 3 dim -> dim, as in both of the authors' code bases), card groups and bet history of the
+  game's rounds only (FHP: hole + flop, 24 bet inputs), nothing but the bet history in the bet branch,
+  and "no card" embedded as zero.  Its inputs are fixed (``features`` is always ``history``).
 * ``cards``: ``embed`` = rank + suit + card embeddings summed per card group (DeepCFR);
   ``onehot`` = concatenated one-hot cards straight into the first card layer (SD-CFR paper).
 * ``dim``: width of every hidden layer and embedding (64 = ~68k / 66k parameters).
@@ -43,7 +47,7 @@ OBS_DIM_WITH_OPP = OBS_DIM + 6
 EMBEDDING_DIM = 64  # default width
 
 FEATURES = ("aggregated", "history", "both")
-ARCHS = ("current", "paper")
+ARCHS = ("current", "paper", "deepcfr")
 CARDS = ("embed", "onehot")
 RM_FALLBACKS = ("uniform", "argmax")
 DEFAULT_CONFIG = dict(features="aggregated", arch="current", cards="embed", dim=EMBEDDING_DIM, rm_fallback="uniform",
@@ -64,6 +68,8 @@ def normalize_config(config=None, **overrides):
         raise ValueError(f"cards must be one of {CARDS}, got {cfg['cards']!r}")
     if cfg["rm_fallback"] not in RM_FALLBACKS:
         raise ValueError(f"rm_fallback must be one of {RM_FALLBACKS}, got {cfg['rm_fallback']!r}")
+    if cfg["arch"] == "deepcfr":
+        cfg["features"] = "history"  # this architecture defines its inputs
     cfg["dim"] = int(cfg["dim"])
     cfg["opp_cards"] = bool(cfg["opp_cards"])
     return cfg
@@ -89,8 +95,19 @@ def history_observation(obs, opp_cards):
     return np.concatenate([obs, feats], axis=1)
 
 
-def bet_feature_indices(features, arch):
+def card_groups(arch, num_rounds=4, opp_cards=False):
+    """Card slots of every embedding group: hole, flop, turn, river (the ``deepcfr`` arch: only the board
+    rounds the game has), then the opponent's hole cards for history-input networks."""
+    groups = [[0, 1], [2, 3, 4], [5], [6]]
+    if arch == "deepcfr":
+        groups = groups[:num_rounds]
+    return groups + ([[7, 8]] if opp_cards else [])
+
+
+def bet_feature_indices(features, arch, num_rounds=4):
     """Observation indices fed to the bet branch (mirrored by the numpy and C++ forward passes)."""
+    if arch == "deepcfr":  # Appendix C: nn.Linear(n_bets * 2, dim) - the bet history of the game's rounds, nothing else
+        return list(range(HISTORY_OFFSET, HISTORY_OFFSET + num_rounds * (HISTORY_DIM // 4)))
     idx = []
     if features in ("aggregated", "both"):
         idx += list(range(23, OBS_DIM_AGGREGATED))
@@ -104,13 +121,15 @@ def bet_feature_indices(features, arch):
 
 
 class CardEmbedding(nn.Module):
-    """rank + suit + card embeddings of every card slot; index 0 = no card (padding row)."""
+    """rank + suit + card embeddings of every card slot; index 0 = no card - a learned row, or with ``pad``
+    an all-zero row that is not trained (Appendix C: "zero out 'no card' embeddings")."""
 
-    def __init__(self, dim):
+    def __init__(self, dim, pad=False):
         super().__init__()
-        self.rank_embedding = nn.Embedding(RANKS + 1, dim)
-        self.suit_embedding = nn.Embedding(SUITS + 1, dim)
-        self.card_embedding = nn.Embedding(RANKS * SUITS + 1, dim)
+        padding = 0 if pad else None
+        self.rank_embedding = nn.Embedding(RANKS + 1, dim, padding_idx=padding)
+        self.suit_embedding = nn.Embedding(SUITS + 1, dim, padding_idx=padding)
+        self.card_embedding = nn.Embedding(RANKS * SUITS + 1, dim, padding_idx=padding)
 
     def forward(self, cards):  # cards: (B, n, 3) long
         return self.rank_embedding(cards[..., 0]) + self.suit_embedding(cards[..., 1]) + self.card_embedding(cards[..., 2])
@@ -128,38 +147,40 @@ def _group_sums(emb):
 
 
 class CardModel(nn.Module):
-    """Card branch: 3 layers; input = summed embeddings per group or concatenated one-hot cards."""
+    """Card branch: 3 layers; input = summed embeddings per group or concatenated one-hot cards.
 
-    def __init__(self, dim=EMBEDDING_DIM, cards="embed", per_group=False, opp_cards=False):
+    ``groups``: card slots per embedding group (:func:`card_groups`); ``hidden``: width of the first two layers
+    (the DeepCFR paper's network: 3 x dim); ``pad``: "no card" embeds as zero."""
+
+    def __init__(self, dim=EMBEDDING_DIM, cards="embed", per_group=False, opp_cards=False, groups=None, hidden=None, pad=False):
         super().__init__()
         self.cards = cards
         self.per_group = per_group
         self.opp_cards = opp_cards
-        n_groups, n_slots = (5, 9) if opp_cards else (4, 7)
+        self.groups = groups if groups is not None else card_groups("paper", opp_cards=opp_cards)
+        hidden = hidden or dim
+        n_slots = 9 if opp_cards else 7
         if cards == "embed":
             if per_group:  # DeepCFR paper: one embedding per card group
-                self.group_embeddings = nn.ModuleList([CardEmbedding(dim) for _ in range(n_groups)])
+                self.group_embeddings = nn.ModuleList([CardEmbedding(dim, pad) for _ in self.groups])
             else:
-                self.cards_embeddings = CardEmbedding(dim)
-            self.fc1 = nn.Linear(n_groups * dim, dim)
+                self.cards_embeddings = CardEmbedding(dim, pad)
+            self.fc1 = nn.Linear(len(self.groups) * dim, hidden)
         else:  # SD-CFR paper: one-hot cards, so the first layer is the (only) embedding
-            self.onehot = nn.Linear(n_slots * CARD_CLASSES, dim)
-        self.fc2 = nn.Linear(dim, dim)
-        self.fc3 = nn.Linear(dim, dim)
+            self.onehot = nn.Linear(n_slots * CARD_CLASSES, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.fc3 = nn.Linear(hidden, dim)
         self.act = nn.ReLU()
 
     def forward(self, cards):  # (B, 7 or 9, 3) long
         if self.cards == "embed":
             if self.per_group:
-                g = self.group_embeddings
-                groups = [
-                    g[0](cards[:, 0]) + g[0](cards[:, 1]),
-                    g[1](cards[:, 2]) + g[1](cards[:, 3]) + g[1](cards[:, 4]),
-                    g[2](cards[:, 5]),
-                    g[3](cards[:, 6]),
-                ]
-                if self.opp_cards:
-                    groups.append(g[4](cards[:, 7]) + g[4](cards[:, 8]))
+                groups = []
+                for emb, slots in zip(self.group_embeddings, self.groups):  # elementwise adds (see _group_sums)
+                    total = emb(cards[:, slots[0]])
+                    for s in slots[1:]:
+                        total = total + emb(cards[:, s])
+                    groups.append(total)
                 x = torch.cat(groups, dim=1)
             else:
                 emb = self.cards_embeddings(cards)
@@ -204,7 +225,8 @@ class BetsModel(nn.Module):
 class BaseModel(nn.Module):
     """Maps a batch of observations (B, >= obs_dim) to per-action logits / advantages (B, num_actions)."""
 
-    def __init__(self, features=None, arch=None, cards=None, dim=None, rm_fallback=None, game=None, config=None, opp_cards=None):
+    def __init__(self, features=None, arch=None, cards=None, dim=None, rm_fallback=None, game=None, config=None, opp_cards=None,
+                 zero_head=True):
         super().__init__()
         cfg = normalize_config(config, features=features, arch=arch, cards=cards, dim=dim, rm_fallback=rm_fallback, game=game,
                                opp_cards=opp_cards)
@@ -216,14 +238,16 @@ class BaseModel(nn.Module):
         self.obs_dim = obs_dim_for(self.features, self.opp_cards)
         self.num_actions = self.game.num_actions
         d = self.dim
-        idx = bet_feature_indices(self.features, self.arch)
+        idx = bet_feature_indices(self.features, self.arch, self.game.num_rounds)
         self.register_buffer("bet_index", torch.tensor(idx, dtype=torch.long), persistent=False)
         # upper bounds of the integer features (rank+1, suit+1, card+1 per card slot); indices are
         # clamped in forward() so that a corrupted sample in a 20M-row GPU memory (seen once: a
         # single flipped bit on a non-ECC card) cannot trigger a device-side assert and kill a run
         self.register_buffer("card_max", torch.tensor([RANKS, SUITS, RANKS * SUITS], dtype=torch.long), persistent=False)
 
-        self.card_model = CardModel(d, self.cards_mode, per_group=self.arch == "paper", opp_cards=self.opp_cards)
+        wide = self.arch == "deepcfr"
+        self.card_model = CardModel(d, self.cards_mode, per_group=self.arch != "current", opp_cards=self.opp_cards,
+                                    groups=card_groups(self.arch, self.game.num_rounds, self.opp_cards), hidden=3 * d if wide else d, pad=wide)
         if self.arch == "current":
             self.stage_and_order_model = StageAndOrderModel(d)
         self.bets_model = BetsModel(len(idx), d)
@@ -233,9 +257,9 @@ class BaseModel(nn.Module):
         self.comb2 = nn.Linear(d, d)
         self.comb3 = nn.Linear(d, d)
         self.action_head = nn.Linear(d, self.num_actions)
-        # zero head -> uniform initial strategy
-        nn.init.zeros_(self.action_head.weight)
-        nn.init.zeros_(self.action_head.bias)
+        if zero_head:  # all-zero outputs: the uniform initial strategy (refits may start from a random head instead)
+            nn.init.zeros_(self.action_head.weight)
+            nn.init.zeros_(self.action_head.bias)
 
     @staticmethod
     def normalize(z):

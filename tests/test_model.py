@@ -4,6 +4,7 @@ import torch
 
 from headsup import native
 from headsup.engine import HeadsUpPoker
+from headsup.game import FHP
 from headsup.model import BaseModel, count_parameters, load_model
 from headsup.numpy_model import NumpyModel
 from headsup.paths import DEFAULT_POLICY_PATH
@@ -18,6 +19,9 @@ VARIANTS = [
     dict(features="history", opp_cards=True),
     dict(features="history", arch="paper", opp_cards=True),
     dict(features="both", cards="onehot", opp_cards=True),
+    dict(arch="deepcfr"),
+    dict(arch="deepcfr", game=FHP, rm_fallback="argmax"),
+    dict(arch="deepcfr", game=FHP, dim=32, opp_cards=True),
 ]
 
 
@@ -125,3 +129,39 @@ def test_cpp_model_matches_numpy():
     cm = native.make_model(model.numpy_weights())
     np.testing.assert_allclose(cm.forward(obs), ref, atol=1e-4)
     np.testing.assert_allclose(cm.forward(obs[3]), ref[3], atol=1e-4)
+
+
+def test_deepcfr_paper_network():
+    """The network behind the DeepCFR paper's "98,948 parameters" (5.1): Appendix C with a card branch 3 x dim wide
+    (as in both of the authors' code bases).  params(d) = 23 d^2 + 74 d + 4 gives that count at d = 64 and the model
+    sizes of the paper's Fig. 3; ours has Appendix C's 52-card tables on top (the count implies rank + suit tables
+    only, which cannot tell As Kh from Ah Ks) and FHP's three outputs instead of four."""
+    for d in (8, 32, 64, 128):
+        m = BaseModel(arch="deepcfr", game=FHP, dim=d)
+        card = (2 * d * 3 * d + 3 * d) + (3 * d * 3 * d + 3 * d) + (3 * d * d + d)  # 2 groups -> 3d -> 3d -> d
+        bet = (24 * d + d) + (d * d + d)  # 2 rounds x 6 actions x (size, occurred), nothing else
+        trunk = (2 * d * d + d) + 2 * (d * d + d)
+        tables = 2 * (13 + 4 + 52 + 3) * d  # per group: rank, suit, card (+ one all-zero "no card" row each)
+        assert count_parameters(m) == card + bet + trunk + tables + (3 * d + 3)
+        assert count_parameters(m) == (23 * d * d + 74 * d + 4) + 2 * (52 + 3) * d - (d + 1)  # the paper's family + card tables - 4th output
+    m = BaseModel(arch="deepcfr", game=FHP)
+    assert 23 * 64 * 64 + 74 * 64 + 4 == 98_948
+    assert m.features == "history" and m.obs_dim == 79 and m.num_actions == 3 and len(m.bet_index) == 24
+    assert BaseModel(arch="deepcfr", features="aggregated").config["features"] == "history"  # the arch defines its inputs
+    nl = BaseModel(arch="deepcfr")  # four rounds: four card groups, 48 bet inputs
+    assert len(nl.bet_index) == 48 and nl.card_model.fc1.in_features == 4 * 64 and nl.card_model.fc1.out_features == 192
+    # "no card" contributes nothing and is not trained (Appendix C: embs * valid)
+    obs = torch.from_numpy(random_observations(256))
+    with torch.no_grad():
+        torch.nn.init.normal_(m.action_head.weight, std=0.5)
+    opt = torch.optim.SGD(m.parameters(), lr=0.1)
+    m(obs).pow(2).mean().backward()
+    opt.step()
+    for emb in m.card_model.group_embeddings:
+        for table in (emb.rank_embedding, emb.suit_embedding, emb.card_embedding):
+            assert torch.all(table.weight[0] == 0) and table.weight[1:].abs().sum() > 0
+    # the turn and river slots are no input of a two-round game's network
+    other = obs.clone()
+    other[:, 15:21] = 0
+    with torch.no_grad():
+        torch.testing.assert_close(m(obs), m(other))

@@ -10,7 +10,7 @@ batch (B, >= obs_dim); wider observations are truncated to the network's ``obs_d
 import numpy as np
 
 from headsup.game import GameConfig
-from headsup.model import CARD_CLASSES, bet_feature_indices, normalize_config, obs_dim_for
+from headsup.model import CARD_CLASSES, bet_feature_indices, card_groups, normalize_config, obs_dim_for
 
 
 def _relu(x):
@@ -28,17 +28,18 @@ class NumpyModel:
         self.num_actions = self.game.num_actions
         self.opp_cards = self.config["opp_cards"]
         self.obs_dim = obs_dim_for(self.features, self.opp_cards)
-        self.bet_index = np.asarray(bet_feature_indices(self.features, self.arch), dtype=np.int64)
+        self.bet_index = np.asarray(bet_feature_indices(self.features, self.arch, self.game.num_rounds), dtype=np.int64)
+        self.groups = card_groups(self.arch, self.game.num_rounds, self.opp_cards)  # card slots per embedding group
 
         if self.cards == "embed":
-            if self.arch == "paper":
+            if self.arch != "current":  # one embedding set per card group
                 self.group_emb = [
                     (
                         w[f"card_model.group_embeddings.{g}.rank_embedding.weight"],
                         w[f"card_model.group_embeddings.{g}.suit_embedding.weight"],
                         w[f"card_model.group_embeddings.{g}.card_embedding.weight"],
                     )
-                    for g in range(5 if self.opp_cards else 4)
+                    for g in range(len(self.groups))
                 ]
             else:
                 self.emb = (
@@ -72,16 +73,8 @@ class NumpyModel:
 
     def _card_branch(self, cards):  # (B, 7, 3) int
         if self.cards == "embed":
-            if self.arch == "paper":
-                g = self.group_emb
-                groups = [
-                    self._embed(g[0], cards[:, 0]) + self._embed(g[0], cards[:, 1]),
-                    self._embed(g[1], cards[:, 2]) + self._embed(g[1], cards[:, 3]) + self._embed(g[1], cards[:, 4]),
-                    self._embed(g[2], cards[:, 5]),
-                    self._embed(g[3], cards[:, 6]),
-                ]
-                if self.opp_cards:
-                    groups.append(self._embed(g[4], cards[:, 7]) + self._embed(g[4], cards[:, 8]))
+            if self.arch != "current":
+                groups = [sum(self._embed(tables, cards[:, s]) for s in slots) for tables, slots in zip(self.group_emb, self.groups)]
                 x = np.concatenate(groups, axis=1)
             else:
                 emb = self._embed(self.emb, cards)

@@ -494,3 +494,173 @@ def test_resume_with_another_algorithm_and_new_learning_rate(tmp_path, capsys):
     assert [g["lr"] for o in trainer.value_opts for g in o.param_groups] == [0.0003, 0.0003]
     assert not set(first) & {trainer._seed() for _ in range(4)}
     trainer.runner.close()
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_resume_continues_in_the_checkpoints_game_not_in_the_presets(tmp_path, monkeypatch):
+    """A resumed run rebuilt its game from the preset NAME: after a preset changes (FHP's flop cap), an older
+    checkpoint must keep training in the game its networks and memories belong to."""
+    import headsup.deepcfr.train as train
+    import headsup.games.holdem as holdem
+    from headsup.game import FHP
+
+    old_fhp = FHP.with_(raise_caps=(3, 3))
+    monkeypatch.setitem(holdem.PRESETS, "fhp", old_fhp)
+    out = tmp_path / "run"
+    train.main(["--game", "fhp", "--algo", "sdcfr", "--iterations", "1", "--checkpoint-every", "1", "--out", str(out)] + _TINY)
+    monkeypatch.setitem(holdem.PRESETS, "fhp", FHP)  # the preset moves on
+    trainer = train.DeepCFRTrainer(train.cli_args(["--resume", str(out / "checkpoint.pt"), "--iterations", "2"] + _TINY))
+    assert trainer.game.raise_caps == (3, 3) and trainer.game == old_fhp
+    trainer.load_checkpoint(str(out / "checkpoint.pt"))
+    trainer.runner.close()
+
+
+def test_paper_preset_selects_the_papers_network():
+    import headsup.deepcfr.train as train
+
+    a = train.cli_args(["--preset", "paper", "--game", "fhp"])
+    assert (a.net, a.rm_fallback, a.loss_weights) == ("deepcfr", "argmax", "paper")
+    assert train.cli_args([]).net == "current"
+    assert train.cli_args(["--preset", "paper", "--net", "paper"]).net == "paper"  # an explicit flag wins
+
+
+def test_loss_weights_are_rescaled_by_two_over_T():
+    """Paper 5.3: "we rescale all the batch weights by 2/T".  With the raw weights t the loss and its gradient grow
+    with the iteration, and the gradient clip at 1 rescales every single step (measured: norms 25-460)."""
+    from headsup.deepcfr.train import loss_weight_scale, train_advantage_net
+
+    assert loss_weight_scale(450, 1.0) == pytest.approx(2 / 450) and loss_weight_scale(450, 1.0, "raw") == 1.0
+    assert loss_weight_scale(10, 2.0) == pytest.approx(3 / 100)  # t^p: the weights average ~1 over iterations 1..T
+    assert loss_weight_scale(0, 1.0) == 1.0  # before the first iteration
+    rng = np.random.default_rng(0)
+    obs = rng.random((200, 31), dtype=np.float32)
+    obs[:, :23] = rng.integers(0, 3, (200, 23))
+    target = np.tile(np.array([1.0, -1.0, 1.0, -1.0], np.float32), (200, 1))
+    first = {}
+    for mode in ("paper", "raw"):
+        buf = ReservoirBuffer(1000, "cpu", obs_dim=31, seed=0)
+        buf.add(obs, np.full(200, 40.0, np.float32), target)
+        losses = []
+        torch.manual_seed(0)
+        train_advantage_net(buf, "cpu", steps=2, batch_size=64, compile=False, iteration=40, loss_weights=mode, zero_head=True,
+                            log=lambda tag, value, step: losses.append((tag, value)))
+        first[mode] = next(v for tag, v in losses if tag.endswith("/loss"))
+    assert first["paper"] == pytest.approx(2.0, rel=1e-4) and first["raw"] == pytest.approx(40.0, rel=1e-4)  # (2 / T) t = 2 at t = T
+
+
+def test_refits_start_from_a_random_head():
+    """Paper 5.2: every network is trained "from scratch ... starting from a random initialization"; only the first
+    strategy needs the all-zero output (ours started every refit with a zero head)."""
+    from headsup.deepcfr.train import train_advantage_net
+
+    assert not BaseModel().action_head.weight.any() and BaseModel(zero_head=False).action_head.weight.abs().mean() > 0.01
+    w = [BaseModel().numpy_weights(), BaseModel().numpy_weights()]
+    adv, _, _ = run_traversals_python(w, 0, 50, 1.0, seed=0)
+    buf = ReservoirBuffer(10000, "cpu", obs_dim=31, seed=0)
+    buf.add(adv.obs, adv.t, adv.target)
+    net, _ = train_advantage_net(buf, "cpu", steps=1, batch_size=64, compile=False, target_scale=None)
+    assert net.action_head.weight.abs().mean() > 0.01  # one step from a zero head moves each weight by ~lr = 0.001
+    empty, _ = train_advantage_net(ReservoirBuffer(100, "cpu", obs_dim=31, seed=0), "cpu", steps=1, batch_size=64, compile=False)
+    assert not empty.action_head.weight.any()  # no samples yet: the uniform net
+
+
+def test_policy_fit_follows_the_authors(monkeypatch):
+    """Constant learning rate (StepLR x0.9 every 2 % of the fit left 20 % of the lr integral), gradient clipping, and
+    with legal masks a softmax over the legal actions only (as the strategy is used)."""
+    import headsup.deepcfr.train as train
+
+    w = [BaseModel().numpy_weights(), BaseModel().numpy_weights()]
+    _, strat, _ = run_traversals_python(w, 0, 100, 1.0, seed=0)
+    buf = ReservoirBuffer(10000, "cpu", obs_dim=31, seed=0)
+    buf.add(strat.obs, strat.t, strat.target)
+    seen = []
+    step = train._run_step
+
+    def spy(fwd, model, opt, obs, t, target, loss_fn, grad_clip, legal=None):
+        seen.append((opt.param_groups[0]["lr"], grad_clip))
+        return step(fwd, model, opt, obs, t, target, loss_fn, grad_clip, legal)
+
+    monkeypatch.setattr(train, "_run_step", spy)
+    train.train_policy_net(buf, "cpu", epochs=None, steps=120, batch_size=32, compile=False, progress=False)
+    assert len(seen) == 120 and set(seen) == {(1e-3, 1.0)}
+    logits = torch.tensor([[5.0, 0.0, 0.0], [0.0, 1.0, 1.0]])
+    target = torch.tensor([[0.0, 0.5, 0.5], [0.0, 0.5, 0.5]])
+    legal = torch.tensor([[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]])
+    t = torch.ones(2)
+    assert float(train._policy_loss(masked=True)(logits, t, target, legal)) == pytest.approx(0.0, abs=1e-12)
+    assert float(train._policy_loss()(logits, t, target)) > 0.1
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_masked_loss_also_masks_the_policy_fit(tmp_path):
+    """--masked-loss: the strategy memory keeps the legal masks of its samples and the policy net is fitted with them."""
+    from headsup.deepcfr.train import main as train_main
+
+    train_main(["--game", "fhp", "--algo", "both", "--masked-loss", "--net", "deepcfr", "--iterations", "2", "--checkpoint-every", "1",
+                "--out", str(tmp_path)] + _TINY)
+    state = torch.load(tmp_path / "checkpoint.pt", map_location="cpu", weights_only=True)
+    legal, target = state["strat_memory"]["legal"], state["strat_memory"]["target"]
+    assert legal.shape == target.shape and legal.shape[1] == 3 and legal[:, 1].all() and not legal[:, 0].all()
+    assert not target[legal == 0].any()  # a strategy never plays a masked action
+    assert (tmp_path / "policy.pth").exists()
+
+
+def test_python_samplers_never_pick_a_zero_probability_action():
+    """The reference samplers mirror the C++ rule: when the partial sums stop short of the draw, the remainder
+    belongs to the last action WITH probability (min(index, n - 1) picked the illegal last action)."""
+    from headsup.deepcfr.traverse import sample_action
+
+    p = np.array([0.5, 0.49999994, 0.0], dtype=np.float32)
+    assert sample_action(p, 0.99999999) == 1 and sample_action(p, 0.2) == 0 and sample_action(p, 0.7) == 1
+    assert sample_action(np.array([0.0, 1.0, 0.0]), 0.0) == 1
+    if native.available():
+        rng = np.random.default_rng(0)
+        for _ in range(300):
+            q = rng.random(4).astype(np.float32) * (rng.random(4) < 0.7)
+            if q.sum() == 0:
+                continue
+            q /= q.sum()
+            u = float(np.float32(rng.random()))
+            a = sample_action(q, u)
+            assert q[a] > 0 and abs(a - native.module().sample_index(q, u)) <= (abs(np.cumsum(q) - u).min() < 1e-6)
+
+
+def test_argmax_fallback_plays_uniformly_over_exactly_tied_actions():
+    """The "argmax" fallback of the DeepCFR paper leaves ties undefined; taking the first index made the untrained
+    (all-zero) network fold to every bet in iteration 1.  The authors play uniformly before the first network
+    exists: exact ties share the probability, anything else is the single best action as before."""
+    from headsup.algos.deep import regret_matching_np, regret_matching_rows
+    from headsup.players import regret_matching_torch
+
+    cases = [  # advantages, legal, expected
+        ([0.0, 0.0, 0.0, 0.0], [1, 1, 1, 1], [0.25, 0.25, 0.25, 0.25]),
+        ([0.0, 0.0, 0.0, 0.0], [0, 1, 1, 1], [0, 1 / 3, 1 / 3, 1 / 3]),
+        ([-1.0, -1.0, -3.0, -2.0], [1, 1, 1, 1], [0.5, 0.5, 0, 0]),
+        ([-1.0, -0.5, -3.0, -0.5], [1, 0, 1, 1], [0, 0, 0, 1]),  # the tied best action that is legal
+        ([-1.0, -3.0, -2.0, -0.5], [1, 1, 1, 1], [0, 0, 0, 1]),
+        ([1.0, 3.0, -2.0, 0.0], [1, 1, 1, 1], [0.25, 0.75, 0, 0]),
+    ]
+    for adv, legal, want in cases:
+        adv, legal = np.array(adv, np.float32), np.array(legal, bool)
+        np.testing.assert_allclose(regret_matching(adv, legal=legal, fallback="argmax"), want, atol=1e-7)
+        np.testing.assert_allclose(regret_matching_torch(torch.tensor(adv)[None], legal[None], "argmax")[0].numpy(), want, atol=1e-7)
+        np.testing.assert_allclose(regret_matching_np(adv.astype(np.float64), legal, True), want, atol=1e-7)
+        np.testing.assert_allclose(regret_matching_rows(adv.astype(np.float64)[None], legal[None], True)[0], want, atol=1e-7)
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_untrained_networks_play_uniformly_in_the_first_iteration():
+    """C++ and Python samplers: with untrained argmax-fallback networks the opponent's strategy rows are uniform over
+    the legal actions (they were "fold facing a bet, else check": seat 1 got no samples against the untrained seat 0)."""
+    from headsup.game import FHP
+
+    cpp = native.module()
+    w = BaseModel(arch="deepcfr", game=FHP, rm_fallback="argmax").numpy_weights()
+    net = native.make_model(w)
+    decks = np.stack([np.random.default_rng(i).permutation(52)[:9] for i in range(40)]).astype(np.int32)
+    out = cpp.run_traversals(net, net, 1, 40, 1.0, 0, native.engine_config(game=FHP), decks)
+    sigma, legal = np.asarray(out[5]), np.asarray(out[8])
+    assert len(sigma) > 0 and len(out[0]) > 0  # the traverser reaches its own decisions
+    np.testing.assert_allclose(sigma, legal / legal.sum(1, keepdims=True), atol=1e-7)
+    _, strat, _ = run_traversals_python([w, w], 1, 40, 1.0, seed=0, decks=decks)
+    np.testing.assert_allclose(strat.target, strat.legal / strat.legal.sum(1, keepdims=True), atol=1e-7)

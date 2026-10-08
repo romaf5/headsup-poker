@@ -70,25 +70,39 @@ def _run_step(fwd, model, opt, obs, t, target, loss_fn, grad_clip, legal=None):
     return loss
 
 
+def loss_weight_scale(iteration, power=1.0, mode="paper"):
+    """Factor on the sample weights t^power of a fit made at iteration T.
+
+    ``paper``: (power + 1) / T^power - for linear weights the paper's "we rescale all the batch weights by 2/T"
+    (5.3).  The weights then average ~1 over the iterations 1..T, the loss stays O(1) and the gradient clip acts on
+    outliers; with the ``raw`` weights (factor 1) the gradient norm grows with T and the clip at 1 rescales every
+    step (measured on FHP at T = 450: norms 25-460 against 0.1-1.8)."""
+    if mode == "raw" or iteration < 1:
+        return 1.0
+    return (power + 1.0) / float(iteration) ** power
+
+
 def _weighted_mse(pred, t, target):
     return (t[:, None] * (pred - target).pow(2)).mean()
 
 
-def _power_weighted_mse(power, masked=False):
-    """Sample weight t^power instead of t (linear CFR); DCFR uses alpha = 1.5 for regrets.  ``masked``: the loss
-    takes a 4th argument, the legal masks, and covers the legal actions only."""
+def _power_weighted_mse(power, masked=False, scale=1.0):
+    """Sample weight ``scale`` t^power (power 1 = linear CFR; DCFR uses alpha = 1.5 for regrets).  ``masked``: the
+    loss takes a 4th argument, the legal masks, and covers the legal actions only."""
     if masked:
-        return lambda pred, t, target, legal: (t.pow(power)[:, None] * legal * (pred - target).pow(2)).mean()
-    if power == 1.0:
+        return lambda pred, t, target, legal: (scale * t.pow(power)[:, None] * legal * (pred - target).pow(2)).mean()
+    if power == 1.0 and scale == 1.0:
         return _weighted_mse
-    return lambda pred, t, target: (t.pow(power)[:, None] * (pred - target).pow(2)).mean()
+    return lambda pred, t, target: (scale * t.pow(power)[:, None] * (pred - target).pow(2)).mean()
 
 
 def train_advantage_net(
     buffer, device, steps, batch_size, lr=1e-3, grad_clip=1.0, log=None, tag="", compile=True, log_step_offset=0, log_every=100,
-    model_config=None, weight_power=1.0, target_scale="auto", masked=False,
+    model_config=None, weight_power=1.0, target_scale="auto", masked=False, iteration=0, loss_weights="paper", zero_head=False,
 ):
-    """Fresh network fitted to (obs -> regrets) with iteration-weighted MSE (weight t^weight_power).
+    """Fresh network fitted to (obs -> regrets) with iteration-weighted MSE (weight t^weight_power, rescaled for
+    the fit of ``iteration`` as ``loss_weights`` says: :func:`loss_weight_scale`).  The network starts "from a
+    random initialization" (paper 5.2) unless ``zero_head``.
 
     ``target_scale``: the regrets are divided by it for the fit and the output layer is multiplied
     by it afterwards, so the network still predicts chips.  From a zero-initialised head, Adam's
@@ -111,13 +125,13 @@ def train_advantage_net(
             sq = sample.pow(2) * legal[0] if masked else sample.pow(2)
             target_scale = max(float((sq.sum() / (legal[0].sum() if masked else sq.numel())).sqrt()), 1e-6)
     scale = float(target_scale or 1.0)
-    model = BaseModel(config=model_config).to(device)
     if len(buffer) == 0:  # no samples yet (e.g. the opponent folds every hand before this seat acts): uniform net
-        return model.eval(), float("nan")
+        return BaseModel(config=model_config).to(device).eval(), float("nan")
+    model = BaseModel(config=model_config, zero_head=zero_head).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     model.train()
     fwd = maybe_compile(model, compile)
-    loss_fn = _power_weighted_mse(weight_power, masked)
+    loss_fn = _power_weighted_mse(weight_power, masked, loss_weight_scale(iteration, weight_power, loss_weights))
     loss = None
     for step, (obs, t, target, *legal) in enumerate(buffer.prefetch(batch_size, steps, with_legal=masked)):
         legal = legal[0] if legal else None
@@ -145,47 +159,59 @@ def train_advantage_net(
     return model, final_loss
 
 
-def _policy_loss(power=1.0):
-    def loss(logits, t, target):
-        probs = torch.softmax(logits, dim=-1)
-        w = t if power == 1.0 else t.pow(power)
-        return (w[:, None] * (probs - target).pow(2)).mean()
+def _policy_loss(power=1.0, masked=False, scale=1.0):
+    """Weighted squared error between softmax(logits) and the stored strategy (weight ``scale`` t^power).  ``masked``:
+    a 4th argument, the legal masks - the softmax runs over the legal actions only, as the strategy is used."""
+    def weights(t):
+        return scale * (t if power == 1.0 else t.pow(power))
+
+    if masked:
+        def loss(logits, t, target, legal):
+            probs = torch.softmax(logits.masked_fill(legal == 0, -1e20), dim=-1)
+            return (weights(t)[:, None] * (probs - target).pow(2)).mean()
+    else:
+        def loss(logits, t, target):
+            return (weights(t)[:, None] * (torch.softmax(logits, dim=-1) - target).pow(2)).mean()
 
     return loss
 
 
-def train_policy_net(buffer, device, epochs, batch_size, lr=1e-3, gamma=0.9, log=None, progress=True, compile=True,
-                     model_config=None, steps=None, weight_power=1.0):
+def train_policy_net(buffer, device, epochs, batch_size, lr=1e-3, lr_decay=None, log=None, progress=True, compile=True,
+                     model_config=None, steps=None, weight_power=1.0, grad_clip=1.0, masked=False, iteration=0, loss_weights="paper"):
     """Average-strategy network: softmax(logits) fitted to stored strategies (weighted MSE, weight
-    t^weight_power: 1 = linear CFR average, 2 = DCFR's quadratic strategy weighting).
+    t^weight_power: 1 = linear CFR average, 2 = DCFR's quadratic strategy weighting; rescaled as the advantage
+    fits are, :func:`loss_weight_scale`).  ``masked``: softmax over each sample's legal actions (the buffer's masks).
 
-    ``epochs`` passes over the memory (learning rate x ``gamma`` after each), or a fixed number
-    of ``steps`` (then the schedule is spread over 50 equal chunks).
+    ``epochs`` passes over the memory, or a fixed number of ``steps``.  The learning rate is constant and the
+    gradient norm clipped, as in the authors' code ("no lr decay"); ``lr_decay`` = the factor per epoch (per 2 %
+    of the steps) of a step schedule (0.9 was the default here before: it leaves 20 % of the lr integral).
     """
-    model = BaseModel(config=model_config).to(device)
+    model = BaseModel(config=model_config, zero_head=False).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     if steps is None:
         steps_per_epoch = max(1, len(buffer) // batch_size)
         steps = epochs * steps_per_epoch
     else:
         steps_per_epoch = max(1, steps // 50)
-    scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=steps_per_epoch, gamma=gamma)
+    scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=steps_per_epoch, gamma=lr_decay) if lr_decay else None
     model.train()
     fwd = maybe_compile(model, compile)
-    loss_fn = _policy_loss(weight_power)
+    loss_fn = _policy_loss(weight_power, masked, loss_weight_scale(iteration, weight_power, loss_weights))
     it = tqdm(range(steps), desc="policy", disable=not progress, leave=False)
-    batches = buffer.prefetch(batch_size, steps)
+    batches = buffer.prefetch(batch_size, steps, with_legal=masked)
     for step in it:
-        obs, t, target = next(batches)
+        obs, t, target, *legal = next(batches)
+        legal = legal[0] if legal else None
         try:
-            loss = _run_step(fwd, model, opt, obs, t, target, loss_fn, None)
+            loss = _run_step(fwd, model, opt, obs, t, target, loss_fn, grad_clip, legal)
         except Exception as exc:
             if fwd is model:
                 raise
             print(f"compiled step failed ({type(exc).__name__}); falling back to eager")
             fwd = model
-            loss = _run_step(fwd, model, opt, obs, t, target, loss_fn, None)
-        scheduler.step()
+            loss = _run_step(fwd, model, opt, obs, t, target, loss_fn, grad_clip, legal)
+        if scheduler is not None:
+            scheduler.step()
         if step % 100 == 0 or step == steps - 1:
             value = loss.item()
             it.set_postfix(loss=f"{value:.5f}")
@@ -216,7 +242,9 @@ class DeepCFRTrainer:
         # DeepCFR-style average policy net (+ the iterate bank for evaluation).
         self.use_deepcfr = self.algo in ("deepcfr", "both", "escher")
         self.use_sdcfr = self.algo in ("sdcfr", "both", "dream", "escher")
-        if args.game and args.game not in ("nlhe", "holdem"):  # limit presets (FHP / HULH)
+        if getattr(args, "game_config", None):  # a resumed run: the checkpoint's own game, whatever the presets are now
+            self.game = GameConfig.from_dict(args.game_config)
+        elif args.game and args.game not in ("nlhe", "holdem"):  # limit presets (FHP / HULH)
             from headsup.games.holdem import make_holdem
 
             self.game = make_holdem(args.game)
@@ -237,7 +265,8 @@ class DeepCFRTrainer:
             for i in range(2)
         ]
         self.strat_memory = (
-            ReservoirBuffer(args.strat_capacity, mem_dev, obs_dim=obs_dim, target_dim=num_actions, seed=args.seed + 2, sample_device=self.device)
+            ReservoirBuffer(args.strat_capacity, mem_dev, obs_dim=obs_dim, target_dim=num_actions, seed=args.seed + 2, sample_device=self.device,
+                            legal_dim=num_actions if self.masked_loss else 0)
             if self.use_deepcfr else None
         )
         # SD-CFR: keep every iteration's advantage net (iterate 0 = the untrained, uniform net)
@@ -439,7 +468,9 @@ class DeepCFRTrainer:
                 raise RuntimeError("--masked-loss: the traversal returned no legal masks")
             self.adv_memory[seat].add(adv.obs, adv.t, adv.target, adv.legal if self.masked_loss else None)
             if self.strat_memory is not None and strat is not None:
-                self.strat_memory.add(strat.obs, strat.t, strat.target)
+                if self.masked_loss and len(strat) and strat.legal is None:
+                    raise RuntimeError("--masked-loss: the traversal returned no legal masks for the strategy samples")
+                self.strat_memory.add(strat.obs, strat.t, strat.target, strat.legal if self.masked_loss else None)
 
             t0 = time.perf_counter()
             self.nets[seat], final_loss = train_advantage_net(
@@ -454,6 +485,8 @@ class DeepCFRTrainer:
                 log_step_offset=(self.iteration - 1) * a.value_steps,
                 model_config=self.model_config,
                 weight_power=a.regret_power,
+                iteration=self.iteration,
+                loss_weights=a.loss_weights,
                 target_scale=None if a.target_scale == "none" else ("auto" if a.target_scale == "auto" else float(a.target_scale)),
                 masked=self.masked_loss,
             )
@@ -558,7 +591,7 @@ class DeepCFRTrainer:
         a = self.args
         policy = train_policy_net(
             self.strat_memory, self.device, a.policy_eval_epochs, a.batch_size, a.lr, compile=not a.no_compile, progress=False,
-            model_config=self.model_config, weight_power=a.strategy_power,
+            model_config=self.model_config, weight_power=a.strategy_power, **self._policy_fit_options(),
         )
         scores = evaluate_model(policy, self.device, a.iterate_eval_hands, seed=a.seed)
         for k, v in scores.items():
@@ -566,12 +599,18 @@ class DeepCFRTrainer:
         return scores
 
     # -- policy ----------------------------------------------------------------------
+    def _policy_fit_options(self):
+        a = self.args
+        return dict(lr_decay=a.policy_lr_decay, masked=self.masked_loss and self.strat_memory.legal is not None,
+                    iteration=self.iteration, loss_weights=a.loss_weights)
+
     def train_policy(self):
         a = self.args
         t0 = time.perf_counter()
         policy = train_policy_net(
             self.strat_memory, self.device, a.policy_epochs, a.policy_batch_size or a.batch_size, a.lr, log=self.log,
             compile=not a.no_compile, model_config=self.model_config, steps=a.policy_steps, weight_power=a.strategy_power,
+            **self._policy_fit_options(),
         )
         synchronize(self.device)
         path = os.path.join(a.out, "policy.pth")
@@ -712,7 +751,14 @@ def build_parser():
     p.add_argument("--target-scale", default="auto",
                    help="advantage-net fits: divide the regrets by this (auto = their RMS) and scale the output layer back; 'none' = raw chips")
     p.add_argument("--masked-loss", action=argparse.BooleanOptionalAction, default=False,
-                   help="advantage-net loss on legal actions only (the SD-CFR / DREAM / ESCHER authors' nets zero illegal outputs)")
+                   help="losses on legal actions only: the advantage nets' illegal outputs are not fitted and the policy net's softmax "
+                        "runs over the legal actions (the SD-CFR / DREAM / ESCHER authors' nets mask them)")
+    p.add_argument("--loss-weights", default=None, choices=["paper", "raw"],
+                   help="sample weights of the fits at iteration T: paper = t rescaled by 2/T (DeepCFR 5.3; default) | raw = t "
+                        "(the loss and its gradient grow with T; the behaviour before 2026-10-08)")
+    p.add_argument("--policy-lr-decay", type=float, default=None,
+                   help="policy-net fit: learning-rate factor per epoch (per 2 %% of --policy-steps); default: constant lr, as the "
+                        "authors (0.9 = the earlier schedule here)")
     p.add_argument("--regret-power", type=float, default=1.0,
                    help="advantage samples of iteration t weigh t^power in the fit (1 = linear CFR; DCFR-style alpha = 1.5)")
     p.add_argument("--strategy-power", type=float, default=1.0,
@@ -723,7 +769,9 @@ def build_parser():
     # network variant (see headsup.model.BaseModel)
     p.add_argument("--features", default="aggregated", choices=FEATURES,
                    help="bet features: aggregated (8 pot-normalised totals) | history (DeepCFR per-street bet history) | both")
-    p.add_argument("--net", default="current", choices=ARCHS, help="architecture: current (3 branches) | paper (Brown et al. Fig. 1)")
+    p.add_argument("--net", default=None, choices=ARCHS,
+                   help="architecture: current (3 branches; default) | paper (Brown et al. Fig. 1 as Appendix C prints it) | deepcfr (the "
+                        "network the paper trained: Appendix C with a 3x wider card branch, 98,948-parameter family; --preset paper)")
     p.add_argument("--cards", default="embed", choices=CARDS, help="card input: embed (rank+suit+card embeddings) | onehot (SD-CFR)")
     p.add_argument("--dim", type=int, default=64, help="hidden / embedding width")
     p.add_argument("--rm-fallback", default=None, choices=RM_FALLBACKS,
@@ -770,6 +818,10 @@ def resolve_args(args):
         args.policy_epochs = PRESETS["default"]["policy_epochs"]
     if getattr(args, "rm_fallback", None) is None:
         args.rm_fallback = "argmax" if args.preset == "paper" else "uniform"
+    if getattr(args, "net", None) is None:
+        args.net = "deepcfr" if args.preset == "paper" else "current"
+    if getattr(args, "loss_weights", None) is None:
+        args.loss_weights = "paper"
     return args
 
 
@@ -777,7 +829,9 @@ RESUME_INHERITED = ("algo", "traversals", "adv_capacity", "strat_capacity", "val
                     "policy_steps", "policy_batch_size", "regret_power", "strategy_power", "epsilon", "q_steps", "q_batch",
                     "q_capacity", "value_trajectories", "eval_hands", "eval_every", "policy_eval_every", "lbr_every", "lbr_hands",
                     "lbr_final_hands", "lbr_tables", "lbr_model_iterates", "seed", "lr", "target_scale", "value_epsilon", "masked_loss",
-                    "checkpoint_every")
+                    "checkpoint_every", "loss_weights", "policy_lr_decay")
+# what a checkpoint written before a hyperparameter existed was trained with (a resumed run continues as it began)
+RESUME_LEGACY = {"loss_weights": "raw", "policy_lr_decay": 0.9}
 
 
 def cli_args(argv=None):
@@ -796,6 +850,8 @@ def cli_args(argv=None):
         for key in RESUME_INHERITED:
             if key in saved and key not in given:
                 setattr(args, key, saved[key])
+            elif key not in saved and key not in given and key in RESUME_LEGACY:
+                setattr(args, key, RESUME_LEGACY[key])
         if "policy_epochs" in given and "policy_steps" not in given:
             args.policy_steps = None  # an explicit epoch count beats the checkpoint's step count (steps win when both are set)
         if "out" not in given:
@@ -809,6 +865,7 @@ def cli_args(argv=None):
         args.bet_sizes, args.raise_cap = ",".join(str(s) for s in game.bet_sizes), game.raise_cap
         args.mask_redundant = "on" if game.mask_redundant else "off"
         args.game = "fhp" if game.limit and game.num_rounds == 2 else "hulh" if game.limit else "nlhe"
+        args.game_config = game.to_dict()  # the name is a label; the trainer builds exactly this game
     return args
 
 

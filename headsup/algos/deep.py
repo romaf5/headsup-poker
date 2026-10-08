@@ -197,9 +197,10 @@ def regret_matching_rows(adv, legal, argmax_fallback=False):
     """Row-wise :func:`regret_matching_np` for (..., A) arrays."""
     pos = np.where(legal, np.maximum(adv, 0.0), 0.0)
     total = pos.sum(-1, keepdims=True)
-    if argmax_fallback:
-        fb = np.zeros_like(pos)
-        np.put_along_axis(fb, np.argmax(np.where(legal, adv, -np.inf), axis=-1)[..., None], 1.0, axis=-1)
+    if argmax_fallback:  # the best legal action; exactly tied ones (the untrained all-zero net) share the probability
+        best = np.where(legal, adv, -np.inf)
+        fb = (best == best.max(-1, keepdims=True)).astype(pos.dtype)
+        fb /= fb.sum(-1, keepdims=True)
     else:
         fb = legal / legal.sum(-1, keepdims=True)
     return np.where(total > 1e-12, pos / np.maximum(total, 1e-300), fb)
@@ -211,9 +212,9 @@ def regret_matching_np(adv, legal, argmax_fallback=False):
     if total > 1e-12:
         return pos / total
     if argmax_fallback:
-        p = np.zeros_like(pos)
-        p[int(np.argmax(np.where(legal, adv, -np.inf)))] = 1.0
-        return p
+        best = np.where(legal, adv, -np.inf)
+        p = (best == best.max()).astype(pos.dtype)
+        return p / p.sum()
     p = legal.astype(np.float64)
     return p / p.sum()
 
