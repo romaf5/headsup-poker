@@ -785,3 +785,23 @@ def test_fit_options_reach_the_fit_and_are_inherited_on_resume(tmp_path, monkeyp
     assert seen and set(seen) == {("cosine", 0.5)}
     a = train.cli_args(["--resume", str(out / "checkpoint.pt")])
     assert (a.lr_schedule, a.weight_average) == ("cosine", 0.5)
+
+
+def test_policy_fit_has_its_own_learning_rate(tmp_path, monkeypatch):
+    """--lr sets both fits; a larger rate with a cosine schedule suits the advantage fit, and --policy-lr keeps the
+    average-strategy fit (constant rate) at its own."""
+    import headsup.deepcfr.train as train
+
+    assert train.cli_args(_TINY).policy_lr is None
+    seen = {}
+    fits = {"adv": train.train_advantage_net, "policy": train.train_policy_net}
+    monkeypatch.setattr(train, "train_advantage_net", lambda *a, **kw: (seen.setdefault("adv", a[4]), fits["adv"](*a, **kw))[1])
+    monkeypatch.setattr(train, "train_policy_net", lambda *a, **kw: (seen.setdefault("policy", a[4]), fits["policy"](*a, **kw))[1])
+    out = tmp_path / "run"
+    train.main(["--algo", "both", "--iterations", "1", "--checkpoint-every", "1", "--lr", "0.003", "--policy-lr", "0.0005",
+                "--out", str(out)] + _TINY)
+    assert seen == {"adv": 0.003, "policy": 0.0005}
+    assert train.cli_args(["--resume", str(out / "checkpoint.pt")]).policy_lr == 0.0005
+    seen.clear()
+    train.main(["--algo", "both", "--iterations", "1", "--lr", "0.003", "--out", str(tmp_path / "run2")] + _TINY)
+    assert seen == {"adv": 0.003, "policy": 0.003}  # default: the same rate

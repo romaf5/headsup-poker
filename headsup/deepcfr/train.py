@@ -638,7 +638,8 @@ class DeepCFRTrainer:
         """Quick average-strategy fit (few epochs) vs simple bots: the signal CFR actually improves."""
         a = self.args
         policy = train_policy_net(
-            self.strat_memory, self.device, a.policy_eval_epochs, a.batch_size, a.lr, compile=not a.no_compile, progress=False,
+            self.strat_memory, self.device, a.policy_eval_epochs, a.batch_size, a.policy_lr or a.lr, compile=not a.no_compile,
+            progress=False,
             model_config=self.model_config, weight_power=a.strategy_power, **self._policy_fit_options(),
         )
         scores = evaluate_model(policy, self.device, a.iterate_eval_hands, seed=a.seed)
@@ -656,7 +657,7 @@ class DeepCFRTrainer:
         a = self.args
         t0 = time.perf_counter()
         policy = train_policy_net(
-            self.strat_memory, self.device, a.policy_epochs, a.policy_batch_size or a.batch_size, a.lr, log=self.log,
+            self.strat_memory, self.device, a.policy_epochs, a.policy_batch_size or a.batch_size, a.policy_lr or a.lr, log=self.log,
             compile=not a.no_compile, model_config=self.model_config, steps=a.policy_steps, weight_power=a.strategy_power,
             **self._policy_fit_options(),
         )
@@ -806,6 +807,7 @@ def build_parser():
     p.add_argument("--loss-weights", default=None, choices=["paper", "raw"],
                    help="sample weights of the fits at iteration T: paper = t rescaled by 2/T (DeepCFR 5.3; default) | raw = t "
                         "(the loss and its gradient grow with T; the behaviour before 2026-10-08)")
+    p.add_argument("--policy-lr", type=float, default=None, help="learning rate of the average-strategy fit (default: --lr)")
     p.add_argument("--lr-schedule", default="constant", choices=["constant", "cosine"],
                    help="advantage-net fit: constant learning rate (the paper) | cosine from --lr to 0 (less refit noise)")
     p.add_argument("--weight-average", type=float, default=0.0,
@@ -888,7 +890,7 @@ RESUME_INHERITED = ("algo", "traversals", "adv_capacity", "strat_capacity", "val
                     "policy_steps", "policy_batch_size", "regret_power", "strategy_power", "epsilon", "q_steps", "q_batch",
                     "q_capacity", "value_trajectories", "eval_hands", "eval_every", "policy_eval_every", "lbr_every", "lbr_hands",
                     "lbr_final_hands", "lbr_tables", "lbr_model_iterates", "seed", "lr", "target_scale", "value_epsilon", "masked_loss",
-                    "checkpoint_every", "loss_weights", "policy_lr_decay", "lr_schedule", "weight_average")
+                    "checkpoint_every", "loss_weights", "policy_lr_decay", "lr_schedule", "weight_average", "policy_lr")
 # what a checkpoint written before a hyperparameter existed was trained with (a resumed run continues as it began)
 RESUME_LEGACY = {"loss_weights": "raw", "policy_lr_decay": 0.9}
 
