@@ -342,7 +342,7 @@ class NFSPSolver:
         unknown = sorted(set(overrides) - set(PRESETS[preset]))
         if unknown:
             raise TypeError(f"unknown settings {', '.join(unknown)} (known: {', '.join(PRESETS[preset])})")
-        self.game, self.preset = game, preset
+        self.game, self.preset, self.seed = game, preset, seed
         self.tree = tree = tree if tree is not None else Tree(game)
         self.config = cfg = {**PRESETS[preset], **overrides}
         if cfg["reward_scale"] is None:
@@ -521,7 +521,7 @@ class NFSPSolver:
     def state_dict(self):
         """The whole state, copied: a solver that loads it continues exactly as this one would."""
         return {
-            "game": self.game.name, "preset": self.preset, "config": dict(self.config),
+            "game": self.game.name, "preset": self.preset, "seed": self.seed, "config": dict(self.config),
             "iteration": self.iteration, "nodes_touched": self.nodes_touched, "episodes": self.episodes, "q_updates": list(self.q_updates),
             "Q": [n.state_dict() for n in self.Q], "Pi": [n.state_dict() for n in self.Pi], "target_q": [t.copy() for t in self.target_q],
             "rl_memory": [m.state_dict() for m in self.rl_memory], "sl_memory": [m.state_dict() for m in self.sl_memory],
@@ -530,7 +530,10 @@ class NFSPSolver:
         }
 
     def load_state_dict(self, state):
-        mine, theirs = {"game": self.game.name, **self.config}, {"game": state["game"], **state["config"]}
+        # the seed is part of a run's identity: continued under another one, the run would repeat under a false label
+        # (checkpoints written before the seed was stored are taken as this solver's)
+        mine = {"game": self.game.name, "seed": self.seed, **self.config}
+        theirs = {"game": state["game"], "seed": state.get("seed", self.seed), **state["config"]}
         if mine != theirs:
             diff = ", ".join(f"{k} = {theirs.get(k)!r} (here: {mine.get(k)!r})" for k in mine if mine[k] != theirs.get(k))
             raise ValueError(f"the checkpoint was written with other settings: {diff}")

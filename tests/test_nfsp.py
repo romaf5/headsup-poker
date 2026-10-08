@@ -691,8 +691,8 @@ def test_checkpoint_continues_identically_and_shares_nothing(preset, tmp_path):
     snap = a.state_dict()
     torch.save(snap, tmp_path / "ck.pt")
     kept = copy.deepcopy(snap)
-    b = _solver(preset, seed=99, **kw).load_state_dict(torch.load(tmp_path / "ck.pt", weights_only=False))  # through a file
-    c = _solver(preset, seed=7, **kw).load_state_dict(snap)  # in memory
+    b = _solver(preset, seed=0, **kw).load_state_dict(torch.load(tmp_path / "ck.pt", weights_only=False))  # through a file
+    c = _solver(preset, seed=0, **kw).load_state_dict(snap)  # in memory
     assert (b.iteration, b.nodes_touched, b.episodes, b.q_updates) == (40, 40 * 128, a.episodes, a.q_updates)
     a.iterate(25)
     assert _same(snap, kept)  # a snapshot does not follow its solver ...
@@ -708,6 +708,28 @@ def test_checkpoint_continues_identically_and_shares_nothing(preset, tmp_path):
         _solver(preset, **{**kw, "eta": 0.2}).load_state_dict(snap)
     with pytest.raises(ValueError, match="settings"):
         _solver("dream" if preset == "paper" else "paper", **kw).load_state_dict(snap)
+
+
+def test_the_seed_determines_the_run():
+    a, b, c = (_solver("paper", seed=seed) for seed in (0, 0, 1))
+    assert (a.seed, c.seed) == (0, 1)
+    assert np.array_equal(a.Q[0].theta, b.Q[0].theta) and not np.array_equal(a.Q[0].theta, c.Q[0].theta)  # the networks
+    assert np.array_equal(a.node, b.node) and not np.array_equal(a.node, c.node)  # the deals
+    assert np.array_equal(a.br, b.br) and not np.array_equal(a.br, c.br)  # the modes
+    for s in (a, b, c):
+        s.iterate(5)
+    assert _same(a.state_dict(), b.state_dict()) and not _same(a.state_dict(), c.state_dict())
+
+
+def test_a_checkpoint_of_another_seed_is_refused():
+    """Continuing a seed-0 checkpoint as "seed 1" reproduced the seed-0 run under the other label."""
+    state = _solver("paper", seed=0).iterate(2).state_dict()
+    assert state["seed"] == 0
+    with pytest.raises(ValueError, match="settings.*seed = 0 .here: 1."):
+        _solver("paper", seed=1).load_state_dict(state)
+    assert _solver("paper", seed=0).load_state_dict(state).iteration == 2
+    before = {k: v for k, v in state.items() if k != "seed"}  # a checkpoint written before the seed was stored: accepted
+    assert _solver("paper", seed=1).load_state_dict(before).iteration == 2
 
 
 def test_cli_writes_the_curve_and_resumes(tmp_path, capsys):
