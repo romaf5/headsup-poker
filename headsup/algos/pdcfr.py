@@ -20,6 +20,7 @@ vectorised pass.
 """
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -290,6 +291,18 @@ def baseline_target(reward, done, next_q, next_sigma):
     return reward + (1.0 - done) * (next_q * next_sigma).sum(1)
 
 
+def _load_optimiser(opt, saved):
+    """Load an optimiser's state without sharing tensors with ``saved`` (two solvers must never step one Adam)
+    and without taking over the checkpoint's device-dependent switches: fused / capturable are what ``_adam``
+    chose for THIS solver's device (a CPU-written checkpoint would leave a CUDA solver's persistent optimiser
+    non-capturable inside the CUDA graph)."""
+    saved = copy.deepcopy(saved)
+    for group, mine in zip(saved["param_groups"], opt.param_groups):
+        for key in ("fused", "capturable", "foreach"):
+            group[key] = mine.get(key)
+    opt.load_state_dict(saved)
+
+
 class PDCFRSolver:
     def __init__(self, game, variant="pdcfr+", traversals=10_000, epsilon=0.6, alpha=None, gamma=None, discount_offset=None,
                  adv_steps=750, adv_batch=2048, q_steps=1000, q_batch=2048, q_capacity=1_000_000, q_sync=50,
@@ -466,8 +479,10 @@ class PDCFRSolver:
         mem = self.q_memory
         return {
             "variant": self.variant, "iteration": self.iteration, "episodes": self.episodes, "nodes_touched": self.nodes_touched,
-            "R": [cpu(n) for n in self.R], "opt_R": [o.state_dict() for o in self.opt_R],
-            "r": [cpu(n) for n in self.r] if self.r else None, "opt_r": [o.state_dict() for o in self.opt_r] if self.r else None,
+            # deep copies: an optimiser's state_dict() hands out its live tensors (a snapshot must not keep changing)
+            "R": [cpu(n) for n in self.R], "opt_R": [copy.deepcopy(o.state_dict()) for o in self.opt_R],
+            "r": [cpu(n) for n in self.r] if self.r else None,
+            "opt_r": [copy.deepcopy(o.state_dict()) for o in self.opt_r] if self.r else None,
             "q_state": self.q_state, "q_tab": self.q_tab.copy(), "sigma": self.sigma.copy(),
             "q_memory": {"pos": mem.pos, "size": mem.size, **{k: v[: mem.size].copy() for k, v in mem.data.items()}},
             "strat_memory": self.strat_memory.state_dict(), "strat_rng": self.strat_memory.rng.bit_generator.state,
@@ -480,11 +495,11 @@ class PDCFRSolver:
         self.iteration, self.episodes, self.nodes_touched = int(state["iteration"]), int(state["episodes"]), int(state["nodes_touched"])
         for net, opt, sd, osd in zip(self.R, self.opt_R, state["R"], state["opt_R"]):
             net.load_state_dict(sd)
-            opt.load_state_dict(osd)
+            _load_optimiser(opt, osd)
         if self.r:
             for net, opt, sd, osd in zip(self.r, self.opt_r, state["r"], state["opt_r"]):
                 net.load_state_dict(sd)
-                opt.load_state_dict(osd)
+                _load_optimiser(opt, osd)
         self.q_state, self.q_tab, self.sigma = state["q_state"], state["q_tab"].copy(), state["sigma"].copy()
         mem, saved = self.q_memory, state["q_memory"]
         mem.pos, mem.size = int(saved["pos"]), int(saved["size"])

@@ -203,7 +203,7 @@ def test_kuhn_converges(variant):
     assert (s.alpha, s.gamma, s.offset) == ((2.0, 2.0, 1.5) if variant == "dcfr+" else (2.3, 2.0, 1.0))
     s.iterate(15)
     ev = s.evaluate()
-    assert ev["average"] < 0.09 and np.isfinite(ev["current"]), ev  # uniform: 0.458; measured 0.019 / 0.042 (0.018 / 0.020 at 30 iterations)
+    assert ev["average"] < 0.12 and np.isfinite(ev["current"]), ev  # uniform: 0.458; 24 seeds: 0.019-0.067 (dcfr+), 0.014-0.060 (pdcfr+)
     assert s.iteration == 15 and s.episodes == 15 * 2 * 1000 and s.nodes_touched > s.episodes * 3
     pol = s.average_policy()
     for probs in pol.table.values():
@@ -229,8 +229,27 @@ def test_tiny_budget_and_untrained_solver():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_runs_on_cuda():
+    """The CUDA-graph path: the replayed baseline fit must see the in-place target copies (a stale target gives an
+    error of 0.5), the persistent Adam must count across graphs, and a GPU checkpoint must resume on the GPU."""
+    import io
+
+    def steps(solver):
+        return [int(next(iter(o.state.values()))["step"]) for o in solver.opt_R]
+
+    s = PDCFRSolver(make_game("kuhn"), "pdcfr+", q_steps=600, q_batch=512, seed=0, device="cuda")
+    _fill_baseline_memory(s)
+    s._fit_baseline(1)
+    exact, legal = _exact_action_values(s, 1)
+    assert np.abs((s.q_tab - exact)[legal]).max() < 2e-3
     s = _small("pdcfr+", traversals=500, device="cuda").iterate(3)
-    assert np.isfinite(s.evaluate()["average"]) and np.isfinite(s.q_tab).all()
+    assert np.isfinite(s.evaluate()["average"]) and np.isfinite(s.q_tab).all() and steps(s) == [3 * s.adv_steps] * 2
+    buf = io.BytesIO()
+    torch.save(s.state_dict(), buf)
+    buf.seek(0)
+    b = _small("pdcfr+", traversals=500, device="cuda").load_state_dict(torch.load(buf, map_location="cpu", weights_only=False))
+    assert all(g["fused"] and g["capturable"] for o in b.opt_R + b.opt_r for g in o.param_groups)
+    b.iterate(1)
+    assert steps(b) == [4 * b.adv_steps] * 2 and np.isfinite(b.evaluate()["average"])
 
 
 def test_checkpoint_resume_and_variant_mismatch(tmp_path):
@@ -266,3 +285,182 @@ def test_cli_writes_a_curve_and_resumes(tmp_path, capsys):
     main(args + ["--episodes", "2400"])  # resumes at iteration 4 and runs to 6
     assert "resumed from" in capsys.readouterr().out
     assert [c["iteration"] for c in json.load(open(tmp_path / "run.json"))["curve"]] == [1, 2, 3, 4, 6]
+
+
+# ---- the solver's wiring (final review: a mutant of each of these lines survived the tests above) ----------------
+def _exact_action_values(s, t):
+    """Player 0's exact action values at every decision node under the strategies iteration t + 1 would play."""
+    import headsup.algos.pdcfr as P
+
+    tree = s.tree
+    v0 = tree.values(s._strategy_table(P.discount(t + 1, s.alpha, s.offset))) / s.scale
+    dec = np.flatnonzero(tree.dec >= 0)
+    return np.where(tree.legal[dec], v0[np.maximum(tree.child[dec], 0)], 0.0), tree.legal[dec]
+
+
+def _fill_baseline_memory(s, episodes=20_000):
+    tree, rng = s.tree, np.random.default_rng(0)
+    mixed = np.where(tree.info_legal, rng.random(tree.info_legal.shape) + 0.2, 0.0)
+    mixed /= mixed.sum(1, keepdims=True)
+    for p in (0, 1):  # transitions of both traversers under a fully mixed profile
+        d = sample_episodes(tree, mixed, s.q_tab, p, episodes, 0.6, rng, s.scale)
+        s.q_memory.add(node=d["q_node"], action=d["q_action"], next=d["q_next"], next_info=d["q_next_info"], reward=d["q_reward"], done=d["q_done"])
+
+
+@pytest.mark.parametrize("variant", ["dcfr+", "pdcfr+"])
+def test_fitted_baseline_equals_the_exact_action_values(variant):
+    """The whole baseline pipeline at once: the buffer's conventions (player 0's reward, next node and infoset), the
+    expected-SARSA target under the NEXT strategy of whoever acts next, and the target-network sync."""
+    s = PDCFRSolver(make_game("kuhn"), variant, q_steps=600, q_batch=512, seed=0)
+    _fill_baseline_memory(s)
+    s._fit_baseline(1)
+    exact, legal = _exact_action_values(s, 1)
+    assert np.abs((s.q_tab - exact)[legal]).max() < 2e-3  # measured <= 1e-4; a wrong sign / policy / stale target: >= 0.5
+
+
+@pytest.mark.parametrize("variant", ["dcfr+", "pdcfr+"])
+def test_advantage_fit_is_the_authors_loss_on_the_persistent_networks(variant, monkeypatch):
+    import copy
+
+    import headsup.algos.pdcfr as P
+
+    s = _small(variant, traversals=300, adv_steps=40, adv_batch=64, q_steps=40, q_batch=64).iterate(2)  # non-trivial networks
+    d = discount(3, s.alpha, s.offset)
+    data = sample_episodes(s.tree, s._strategy_table(d), s.q_tab, 0, 300, s.epsilon, s.rng, s.scale)
+    fixed = torch.arange(64) % len(data["adv_info"])
+    got = {}
+    monkeypatch.setattr(P, "_batch_index", lambda n, b, dev: fixed)
+    monkeypatch.setattr(P, "_optimise", lambda nets, opts, loss_fn, steps, **kw: got.update(nets=nets, opts=opts, loss_fn=loss_fn, steps=steps, kw=kw))
+    before = copy.deepcopy(s.R[0])  # the authors' target model: the net as the previous fit left it
+    s._fit_advantage(0, data, d)
+    x = torch.as_tensor(s.tree.info_obs[data["adv_info"]])[fixed]
+    mask = torch.as_tensor(s.tree.info_legal[data["adv_info"]], dtype=torch.float32)[fixed]
+    adv = torch.as_tensor(data["adv"], dtype=torch.float32)[fixed]
+
+    def want():
+        with torch.no_grad():
+            loss = (s.R[0](x) * mask - (torch.clamp(before(x) * mask, min=0.0) * d + adv)).pow(2).mean()
+            if variant == "pdcfr+":  # the prediction net: this iteration's advantages only, on the same minibatch
+                loss = loss + (s.r[0](x) * mask - adv).pow(2).mean()
+        return float(loss)
+
+    assert float(got["loss_fn"]().detach()) == pytest.approx(want(), rel=1e-5)
+    with torch.no_grad():  # the target stays the pre-fit network while R moves
+        s.R[0][-1].bias.add_(0.3)
+    assert float(got["loss_fn"]().detach()) == pytest.approx(want(), rel=1e-5)
+    assert got["steps"] == s.adv_steps and got["nets"][0] is s.R[0] and got["opts"][0] is s.opt_R[0]  # never re-created
+    if variant == "pdcfr+":
+        assert got["nets"][1] is s.r[0] and got["opts"][1] is s.opt_r[0]
+    # the "w/o adv" ablation divides the sampled advantages by the traverser's sampling reach
+    s.reach_weighted = True
+    before = copy.deepcopy(s.R[0])
+    s._fit_advantage(0, data, d)
+    adv = torch.as_tensor(data["adv"] / data["adv_reach"][:, None], dtype=torch.float32)[fixed]
+    assert float(got["loss_fn"]().detach()) == pytest.approx(want(), rel=1e-5)
+    assert not np.allclose(data["adv_reach"], 1.0)
+
+
+def test_iteration_schedule_discounts_alternation_and_baseline_sync(monkeypatch):
+    import headsup.algos.pdcfr as P
+
+    s = _small("pdcfr+", traversals=300, adv_steps=60, q_steps=20, policy_steps=20)
+    fits, sampled, base = [], [], []
+    fit, episodes, optimise = s._fit_advantage, P.sample_episodes, P._optimise
+
+    def spy_fit(p, data, d):
+        fits.append((p, d))
+        return fit(p, data, d)
+
+    def spy_episodes(tree, sigma, q, traverser, *a, **kw):  # the strategies must come from the networks as they are NOW
+        sampled.append(np.array_equal(sigma, s._strategy_table(discount(s.iteration, s.alpha, s.offset))))
+        return episodes(tree, sigma, q, traverser, *a, **kw)
+
+    def spy_optimise(nets, opts, loss_fn, steps, **kw):
+        if "sync_fn" in kw:
+            base.append((steps, kw["sync_every"]))
+        return optimise(nets, opts, loss_fn, steps, **kw)
+
+    s._fit_advantage = spy_fit
+    monkeypatch.setattr(P, "sample_episodes", spy_episodes)
+    monkeypatch.setattr(P, "_optimise", spy_optimise)
+    s.iterate(3)
+    assert fits == [(p, discount(t, s.alpha, s.offset)) for t in (1, 2, 3) for p in (0, 1)]  # d_t, not d_(t+1)
+    assert all(sampled) and len(sampled) == 6  # player 1's episodes already use player 0's updated networks
+    assert base == [(s.q_steps, s.q_sync)] * 6 and s.q_sync == 50  # the target net is synced every 50 steps
+    assert [int(next(iter(o.state.values()))["step"]) for o in s.opt_R] == [3 * s.adv_steps] * 2  # one Adam per net, for good
+    stamps = s.strat_memory.t[: len(s.strat_memory)].cpu().numpy().ravel()
+    assert set(stamps.tolist()) == {1.0, 2.0, 3.0}  # strategy samples carry their iteration
+
+
+@pytest.mark.parametrize("variant", ["dcfr+", "pdcfr+"])
+def test_each_player_plays_its_own_networks(variant):
+    s = _small(variant)
+    A = s.game.num_actions
+    bias = np.stack([np.arange(A, 0, -1.0), np.arange(1.0, A + 1)])  # player 0 prefers the first actions, player 1 the last
+    with torch.no_grad():  # zero-initialised heads: the output is the bias
+        for player in (0, 1):
+            s.R[player][-1].bias.copy_(torch.as_tensor(bias[player], dtype=torch.float32))
+    sigma = s._strategy_table(0.5)
+    want = bias[s.tree.info_player] * s.tree.info_legal
+    np.testing.assert_allclose(sigma, want / want.sum(1, keepdims=True), atol=1e-6)
+    assert set(s.tree.info_player.tolist()) == {0, 1}
+
+
+def test_average_policy_weights_the_iterations(monkeypatch):
+    """The average-policy net is fitted with weights (2 t / T)^gamma: two iterations with contradictory strategies."""
+    s = _small("dcfr+", policy_steps=1500)
+    tree, A = s.tree, s.game.num_actions
+    first = np.eye(A)[np.argmax(tree.info_legal, axis=1)]
+    last = np.eye(A)[A - 1 - np.argmax(tree.info_legal[:, ::-1], axis=1)]
+    assert (first != last).any(axis=1).all()
+    n = len(first)
+    for t, target in ((1, first), (4, last)):
+        for _ in range(20):
+            s.strat_memory.add(tree.info_obs, np.full(n, t, np.float32), target, tree.info_legal)
+    s.iteration = 4
+    w1, w4 = (2 * 1 / 4) ** s.gamma, (2 * 4 / 4) ** s.gamma
+    want = (w1 * first + w4 * last) / (w1 + w4)  # 0.06 on the iteration-1 action; unweighted: 0.5
+    table = s.average_policy().table
+    got = np.stack([table[k] for k in tree.info_keys])
+    assert np.abs(got - want).max() < 0.05, np.abs(got - want).max()
+
+
+def test_reinit_prediction_switch_replaces_the_prediction_net():
+    quick = dict(traversals=200, adv_steps=10, q_steps=10)
+    s = _small("pdcfr+", **quick)
+    nets, opts = list(s.r), list(s.opt_r)
+    s.iterate(1)
+    assert all(a is b for a, b in zip(nets, s.r)) and all(a is b for a, b in zip(opts, s.opt_r))  # default: never re-initialised
+    s = _small("pdcfr+", **quick, reinit_prediction=True)
+    nets, opts = list(s.r), list(s.opt_r)
+    s.iterate(1)
+    assert not any(a is b for a, b in zip(nets, s.r)) and not any(a is b for a, b in zip(opts, s.opt_r))
+
+
+def test_state_dict_is_a_snapshot_and_solvers_never_share_optimiser_state():
+    """state_dict() handed out the optimisers' live tensors: a snapshot kept changing, and after an in-memory
+    load two solvers stepped each other's Adam."""
+    def steps(solver):
+        return [int(next(iter(o.state.values()))["step"]) for o in solver.opt_R]
+
+    a = _small("pdcfr+", traversals=200, adv_steps=10, q_steps=10).iterate(1)
+    snap = a.state_dict()
+    b = _small("pdcfr+", traversals=200, adv_steps=10, q_steps=10).load_state_dict(snap)
+    a.iterate(1)
+    assert int(snap["opt_R"][0]["state"][0]["step"]) == 10 and steps(a) == [20, 20] and steps(b) == [10, 10]
+    b.iterate(2)
+    assert steps(a) == [20, 20] and steps(b) == [30, 30]
+
+
+def test_loading_keeps_this_solvers_optimiser_switches():
+    """fused / capturable belong to the device the solver runs on: a checkpoint written on another device type
+    must not switch them (a CPU checkpoint left a CUDA solver's persistent Adam non-capturable inside the CUDA graph)."""
+    a = _small("pdcfr+", traversals=200, adv_steps=10, q_steps=10).iterate(1)
+    state = a.state_dict()
+    for group in [g for key in ("opt_R", "opt_r") for o in state[key] for g in o["param_groups"]]:
+        group["fused"], group["capturable"] = True, True  # as written by a CUDA solver
+    b = _small("pdcfr+", traversals=200, adv_steps=10, q_steps=10)
+    fresh = [(g.get("fused"), g.get("capturable")) for o in b.opt_R + b.opt_r for g in o.param_groups]
+    b.load_state_dict(state)
+    assert [(g.get("fused"), g.get("capturable")) for o in b.opt_R + b.opt_r for g in o.param_groups] == fresh
+    b.iterate(1)
