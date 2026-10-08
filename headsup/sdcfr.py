@@ -233,7 +233,10 @@ class SDCFRPlayer:
             p = sig[self.chosen[idx], torch.arange(len(ids), device=self.bank.device)]
         else:
             w = (self.reach[idx] * self.bank.weights).T.unsqueeze(-1)  # (T, B, 1)
-            p = (w * sig).sum(0) / w.sum(0).clamp(min=1e-12)
+            # off every iterate's path (possible with a thinned bank, or after an opponent-modelled action no iterate
+            # takes): the unconditioned weights, not a row of zeros
+            w = torch.where(w.sum(0, keepdim=True) > 0, w, self.bank.weights.to(w.dtype).view(-1, 1, 1).expand_as(w))
+            p = (w * sig).sum(0) / w.sum(0)
         self._last_sig = sig
         return p.float().cpu().numpy()
 

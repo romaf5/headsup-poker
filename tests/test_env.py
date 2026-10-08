@@ -106,3 +106,25 @@ def test_play_hands_refuses_an_agent_of_another_tree():
     assert pot.num_actions == DEFAULT_GAME.num_actions
     with pytest.raises(ValueError, match="different game"):
         play_hands(make_vec_env(4, "call", seed=0, game=DEFAULT_GAME), RandomPlayer(seed=0, game=pot), 8)
+
+
+def test_mask_illegal_normalises_rows_with_tiny_legal_mass():
+    """A policy with (almost) all its mass on an illegal action: the legal remainder is renormalised (it was divided
+    by max(sum, 1e-12), leaving a row that sums to far less than one)."""
+    from headsup.engine import HeadsUpPoker
+    from headsup.players import mask_illegal
+
+    e = HeadsUpPoker(rng=np.random.default_rng(0))
+    e.reset()
+    e.step(1)  # the small blind calls: the big blind has nothing to call, FOLD is illegal
+    obs = e.observation()[None]
+    probs = mask_illegal(np.array([[1.0, 2e-14, 6e-14, 0.0]]), obs)
+    assert probs[0, 0] == 0.0 and probs.sum() == pytest_approx(1.0) and probs[0, 2] == pytest_approx(0.75)
+    probs = mask_illegal(np.array([[1.0, 0.0, 0.0, 0.0]]), obs)  # nothing legal left: uniform over the legal actions
+    np.testing.assert_allclose(probs[0], [0.0, 1 / 3, 1 / 3, 1 / 3])
+
+
+def pytest_approx(x):
+    import pytest
+
+    return pytest.approx(x, rel=1e-9)

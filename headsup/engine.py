@@ -66,11 +66,14 @@ def legal_mask_from_obs(obs, game=DEFAULT_GAME, with_twins=False):
     """bool[N, num_actions]: the engine's ``legal_mask`` recomputed from observations (computed once
     per distinct public state: to-call, pot, stack, raise count and round); with ``with_twins`` also
     int[N, num_actions]: the action the engine executes for each (itself when legal)."""
+    if game.limit is None and game.stack_size > STACK_FEATURE_CAP:
+        raise ValueError(f"the legal raises of a no-limit game with {game.stack_size}-chip stacks cannot be recovered from "
+                         f"observations: the stack feature saturates at {STACK_FEATURE_CAP} chips")
     obs = np.asarray(obs)
     to_call, pot, stack, raises = public_state_from_obs(obs)
     stage = np.rint(obs[:, 21]).astype(np.int64)
-    # one integer key per distinct (to-call, pot, stack, raises, round) - all small non-negative ints
-    keys = (((to_call * 4096 + pot) * 4096 + stack) * 64 + raises) * 8 + stage
+    # one integer key per distinct (to-call, pot, stack, raises, round): 18 + 18 + 17 + 6 + 3 bits
+    keys = ((((to_call << 18 | pot) << 17 | stack) << 6 | raises) << 3) | stage
     uniq, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
     both = [game.legal_mask(int(to_call[i]), int(pot[i]), int(stack[i]), int(raises[i]), with_twins=True,
                             round_index=min(int(stage[i]), game.num_rounds - 1)) for i in first]

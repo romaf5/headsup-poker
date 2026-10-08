@@ -144,3 +144,18 @@ def test_sdcfr_as_opponent_with_subset_ids():
     env = PokerVecEnv(64, opp, seed=0)
     r = play_hands(env, AlwaysCallPlayer(), 2000)
     assert len(r) == 2000 and opp.known.sum() <= 64
+
+
+def test_exact_average_off_every_iterates_path_is_still_a_distribution():
+    """After actions that no iterate of the (thinned) bank would take, every iterate's reach is zero: the average
+    falls back to the unconditioned weights instead of returning an all-zero row (sampled as FOLD)."""
+    nets, bank = _bank(3)
+    player = SDCFRPlayer(bank, mode="exact", seed=0)
+    obs = _observations(8)
+    ids = np.arange(8)
+    player.probs(obs, ids)
+    player.reach[:8] = 0.0
+    probs = player.probs(obs, ids)
+    np.testing.assert_allclose(probs.sum(1), 1.0, atol=1e-6)
+    player.reach[:8] = 1.0
+    np.testing.assert_allclose(probs, player.probs(obs, ids), atol=1e-6)  # = the plain weighted average

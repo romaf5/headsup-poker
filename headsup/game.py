@@ -25,21 +25,22 @@ from dataclasses import asdict, dataclass, replace
 MAX_ACTIONS = 8  # mirrored by headsup_cpp (MAX_ACTIONS): up to 5 raise sizes
 
 
+MAX_BET_SIZE = 100.0  # pot fractions above this are not bets anyone means (and overflow the chip arithmetic)
+
+
 def parse_bet_sizes(text):
-    """``"min"`` | ``"0.5,1,2"`` | ``"min,1"`` -> tuple of "min" / floats (as given, in order)."""
-    if isinstance(text, (list, tuple)):
-        return tuple("min" if s == "min" else float(s) for s in text)
-    sizes = []
-    for part in str(text).split(","):
-        part = part.strip()
-        if not part:
-            continue
-        sizes.append("min" if part == "min" else float(part))
+    """``"min"`` | ``"0.5,1,2"`` | ``"min,1"`` | a list / tuple -> tuple of "min" / floats (as given, in order).
+    Sizes are pot fractions in (0, MAX_BET_SIZE]: the C++ engine encodes "min" and limit bets as negative sizes."""
+    parts = list(text) if isinstance(text, (list, tuple)) else [p.strip() for p in str(text).split(",") if p.strip()]
+    sizes = tuple("min" if s == "min" else float(s) for s in parts)
     if not sizes:
         raise ValueError("at least one bet size is needed")
     if len(sizes) + 3 > MAX_ACTIONS:
         raise ValueError(f"at most {MAX_ACTIONS - 3} bet sizes are supported")
-    return tuple(sizes)
+    for s in sizes:
+        if s != "min" and not 0.0 < s <= MAX_BET_SIZE:  # also rejects nan
+            raise ValueError(f"bet size {s!r} is not a pot fraction in (0, {MAX_BET_SIZE:g}]")
+    return sizes
 
 
 @dataclass(frozen=True)
@@ -68,7 +69,8 @@ class GameConfig:
             if len(self.raise_caps) != self.num_rounds:
                 raise ValueError("raise_caps needs one entry per round")
         assert 0 < self.small_blind < self.big_blind < self.stack_size
-        assert 1 <= self.num_rounds <= 4
+        if not 2 <= self.num_rounds <= 4:
+            raise ValueError("num_rounds must be 2 (showdown after the flop), 3 or 4")
 
     @property
     def num_raises(self):

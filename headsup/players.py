@@ -89,7 +89,7 @@ def mask_illegal(probs, obs, game=DEFAULT_GAME):
     probs[~legal] = 0.0
     s = probs.sum(axis=1, keepdims=True)
     uniform = legal / legal.sum(axis=1, keepdims=True)
-    probs[:] = np.where(s > 0, probs / np.maximum(s, 1e-12), uniform)
+    probs[:] = np.where(s > 0, probs / np.where(s > 0, s, 1.0), uniform)
     return probs
 
 

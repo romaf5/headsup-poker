@@ -254,3 +254,39 @@ def test_fixed_bots_put_their_mass_on_the_executed_action():
     p = bot.probs(e.observation(e.current)[None])[0]
     assert not e.legal_mask()[2] and p[1] == 1.0 and p.sum() == 1.0
     assert bot(e.observation(e.current)[None])[0] == 1
+
+
+def test_bet_sizes_and_rounds_are_validated():
+    """Sizes collide with the C++ sentinels (-1 = min, -2 = limit: a segfault) or overflow chip arithmetic when they
+    are not sane pot fractions; more than five overflow the fixed-size action arrays (the tuple form was unchecked)."""
+    from headsup.game import GameConfig, parse_bet_sizes
+
+    assert parse_bet_sizes("min,0.5,1") == ("min", 0.5, 1.0) and parse_bet_sizes((0.5, "min")) == (0.5, "min")
+    for bad in ("-2", "0", "1e9", "nan", (0.5, -1.0), (0.25, 0.5, 0.75, 1, 1.5, 2), "0.25,0.5,0.75,1,1.5,2"):
+        with pytest.raises(ValueError):
+            parse_bet_sizes(bad)
+    with pytest.raises(ValueError):
+        GameConfig(bet_sizes=(0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4))
+    with pytest.raises(ValueError):
+        GameConfig(num_rounds=1)  # neither engine supports a single round
+
+
+def test_legal_mask_from_obs_keys_and_stack_cap():
+    from headsup.engine import OBS_DIM, STACK_FEATURE_CAP, legal_mask_from_obs
+    from headsup.game import GameConfig
+
+    def row(to_call, pot, stack=1000, raises=0, stage=1):
+        x = np.zeros(OBS_DIM, np.float32)
+        x[29], x[23], x[28], x[79], x[21] = pot / 1000, to_call / pot, stack / pot, raises, stage
+        return x
+
+    # two public states whose (to-call, pot) pairs collided in the packed key: a pot above 4095 chips
+    obs = np.stack([row(0, 4196), row(1, 100)])
+    masks = legal_mask_from_obs(obs, HULH)
+    assert not masks[0, 0] and masks[1, 0]  # fold only when facing a bet
+    np.testing.assert_array_equal(masks[::-1], legal_mask_from_obs(obs[::-1], HULH))
+    # no-limit: beyond the stack feature's cap the legal raises cannot be recovered from an observation
+    big = GameConfig(stack_size=STACK_FEATURE_CAP + 500, small_blind=5, big_blind=10)
+    with pytest.raises(ValueError, match="stack"):
+        legal_mask_from_obs(np.stack([row(10, 30)]), big)
+    legal_mask_from_obs(np.stack([row(10, 30)]), GameConfig(stack_size=STACK_FEATURE_CAP, small_blind=5, big_blind=10))
