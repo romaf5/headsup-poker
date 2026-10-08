@@ -223,7 +223,7 @@ function render() {
   const net = $("#net"); net.textContent = st.hands ? fmt(st.total, true) : "–"; net.className = "value " + (st.total > 0 ? "pos" : st.total < 0 ? "neg" : "");
   const avgTop = $("#avg-top"); avgTop.textContent = st.hands ? fmt(st.avg, true) : "–"; avgTop.className = "value " + (st.avg > 0 ? "pos" : st.avg < 0 ? "neg" : "");
   $("#hands").textContent = st.hands;
-  $("#subtitle").textContent = `vs ${s.bot.label} · blinds ${s.settings.small_blind}/${s.settings.big_blind} · stacks ${s.settings.stack_size} · hand #${s.hand_number}`;
+  $("#subtitle").textContent = `vs ${s.bot.label} · blinds ${s.settings.small_blind}/${s.settings.big_blind} · stacks ${s.settings.stack_size} · hand #${s.hand_number}` + (s.warning ? ` · ⚠ ${s.warning}` : "");
 
   // seats
   $("#bot-name").textContent = s.bot.label;

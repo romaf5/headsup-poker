@@ -104,3 +104,40 @@ def test_http_api_roundtrip():
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_table_follows_the_bots_trained_game_and_warns_when_overridden(tmp_path):
+    """By default the table uses the stacks, blinds and raise cap the bot was trained with (it used fixed
+    defaults, silently seating e.g. a raise-cap-4 bot at a raise-cap-3 table); an explicit override is reported."""
+    from headsup.game import GameConfig
+    from headsup.model import BaseModel
+
+    path = tmp_path / "cap4.pth"
+    BaseModel(game=GameConfig(raise_cap=4, stack_size=200, small_blind=5, big_blind=10)).save(path)
+    s = GameSession(opponent=f"cfr:{path}", advisor=None, seed=0)
+    assert (s.game.raise_cap, s.game.stack_size, s.game.small_blind, s.game.big_blind) == (4, 200, 5, 10)
+    assert s.settings["raise_cap"] == 4 and s.settings["stack_size"] == 200 and s.state()["warning"] is None
+    s = GameSession(opponent=f"cfr:{path}", advisor=None, seed=0, raise_cap=3)
+    assert s.game.raise_cap == 3 and "raise cap 4" in s.state()["warning"]
+    assert GameSession(opponent="call", advisor=None, seed=0).state()["warning"] is None  # bots without a trained tree
+
+
+def test_limit_game_models_are_refused_with_a_clear_message(tmp_path):
+    from headsup.game import FHP
+    from headsup.model import BaseModel
+
+    path = tmp_path / "fhp.pth"
+    BaseModel(features="history", arch="paper", game=FHP).save(path)
+    with pytest.raises(ValueError, match="limit games are not supported"):
+        GameSession(opponent=f"cfr:{path}", advisor=None, seed=0)
+
+
+def test_fold_with_nothing_to_call_is_logged_as_the_check_it_is():
+    s = GameSession(opponent="call", advisor=None, seed=0)
+    play_out(s)
+    s.next_hand()  # the human is the big blind now: the calling bot limps first
+    while s.bot_to_act:
+        s.bot_step()
+    s.act("fold")  # nothing to call: the engine executes a check
+    mine = [entry for entry in s.log if entry["seat"] == "you"][-1]
+    assert not s.hand_over and mine["text"] == "checks"

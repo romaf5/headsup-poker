@@ -116,10 +116,10 @@ class GameSession:
         self,
         opponent="cfr",
         advisor=DEFAULT_POLICY_PATH,
-        stack_size=100,
-        small_blind=1,
-        big_blind=2,
-        raise_cap=3,
+        stack_size=None,
+        small_blind=None,
+        big_blind=None,
+        raise_cap=None,
         seed=None,
         deterministic=False,
         device=None,
@@ -127,29 +127,27 @@ class GameSession:
         self.lock = threading.RLock()
         if advisor and os.path.abspath(str(advisor)) == os.path.abspath(DEFAULT_POLICY_PATH):
             advisor = "cfr"
-        self.settings = dict(
-            opponent=opponent,
-            advisor=advisor,
-            stack_size=int(stack_size),
-            small_blind=int(small_blind),
-            big_blind=int(big_blind),
-            raise_cap=int(raise_cap),
-            seed=seed,
-            deterministic=bool(deterministic),
-        )
+        self.settings = dict(opponent=opponent, advisor=advisor, seed=seed, deterministic=bool(deterministic))
         self.device = device
         self.rng = np.random.default_rng(seed)
         self.opponent = make_player(player_spec(opponent), device=device, deterministic=deterministic, seed=int(self.rng.integers(2**31)))
         self.opponent_name = opponent
-        # the table plays the bot's action tree (bet sizes); stacks / blinds / raise cap from the settings -
-        # except for bots on a fixed public tree (tabular blueprint, search), which only know their own game
-        bot_game = getattr(self.opponent, "game", DEFAULT_GAME)
+        # the table plays the bot's game: its action tree (bet sizes) and, unless the settings say otherwise, the
+        # stacks / blinds / raise cap it was trained with.  Bots on a fixed public tree (tabular blueprint, search)
+        # only know their own game: for them the settings are ignored.
+        bot_game = getattr(self.opponent, "game", None) or DEFAULT_GAME
+        if bot_game.limit is not None:
+            raise ValueError("limit games are not supported by the browser table (its controls are no-limit: "
+                             f"bet sizes and all-in); {opponent!r} plays {bot_game.tree_dict()}")
+        asked = dict(stack_size=stack_size, small_blind=small_blind, big_blind=big_blind, raise_cap=raise_cap)
         if type(self.opponent).__name__ in ("TabularPlayer", "SearchPlayer"):
-            stack_size, small_blind, big_blind, raise_cap = bot_game.stack_size, bot_game.small_blind, bot_game.big_blind, bot_game.raise_cap
-            self.settings.update(stack_size=stack_size, small_blind=small_blind, big_blind=big_blind, raise_cap=raise_cap)
-        self.game = bot_game.with_(
-            stack_size=int(stack_size), small_blind=int(small_blind), big_blind=int(big_blind), raise_cap=int(raise_cap)
-        )
+            asked = dict.fromkeys(asked)
+        table = {k: int(v) if v is not None else getattr(bot_game, k) for k, v in asked.items()}
+        self.settings.update(table)
+        self.game = bot_game.with_(**table)
+        changed = [f"{k.replace('_', ' ')} {getattr(bot_game, k)}" for k in table if getattr(self.opponent, "game", None) is not None
+                   and table[k] != getattr(bot_game, k)]
+        self.warning = f"the bot was trained with {', '.join(changed)}: at this table it is off its training game" if changed else None
         self.engine = HeadsUpPoker(game=self.game, rng=np.random.default_rng(self.rng.integers(2**63)))
         self.action_names = [action_label(self.game, a) for a in range(self.game.num_actions)]
         self.action_labels = ["Fold", "Check/Call"] + [
@@ -190,9 +188,9 @@ class GameSession:
         to_call = before["stage_bets"][o] - before["stage_bets"][seat]
         stack = before["stacks"][seat]
         action = int(action)
-        if action == Action.FOLD:
+        if action == Action.FOLD and to_call > 0:
             return "folds", 0
-        if action == Action.CHECK_CALL:
+        if action in (Action.FOLD, Action.CHECK_CALL):  # a fold with nothing to call is executed as a check
             amt = min(to_call, stack)
             return ("checks", 0) if amt == 0 else (f"calls {amt}", amt)
         if self.game.is_raise(action):
@@ -429,6 +427,7 @@ class GameSession:
             "history": self.hand_records[-30:][::-1],
             "stats": self.stats(),
             "settings": self.settings,
+            "warning": self.warning,
             "advisor": {"loaded": self.advisor is not None, "name": self.settings["advisor"], "error": self.advisor_error},
         }
 
