@@ -103,3 +103,16 @@ def test_info_state_is_perfect_recall(name):
             walk(s.child(a))
 
     walk(game.new_initial_state())
+
+
+# measured (antes): Kuhn after 200 iterations 0.0012 / 0.0000, Leduc after 100 iterations 0.0086 / 0.0204 (DCFR 0.0078, PCFR+ 0.0198)
+@pytest.mark.parametrize("variant,bound", [("dcfr+", 0.012), ("pdcfr+", 0.027)])
+def test_discounted_plus_variants_converge(variant, bound):
+    """DCFR+ / PDCFR+ (Xu et al. 2024, arXiv 2404.13891): discounted regrets floored at zero, predictive strategy."""
+    kuhn = make_game("kuhn")
+    avg = CFR(kuhn, variant).iterate(200).average_policy()
+    assert exploitability(kuhn, avg)[0] < 0.003
+    assert expected_value(kuhn, avg) == pytest.approx(-1 / 18, abs=0.003)
+    leduc = make_game("leduc")
+    assert exploitability(leduc, CFR(leduc, variant).iterate(100).average_policy())[0] < bound
+    assert CFR(kuhn, "dcfr").gamma == 2.0 and CFR(kuhn, "dcfr+").gamma == 4.0 and CFR(kuhn, "pdcfr+").alpha == 2.3

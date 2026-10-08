@@ -3,7 +3,8 @@
 ``CFR``: full-width counterfactual regret minimisation with alternating updates and the usual
 variants: ``vanilla`` (Zinkevich et al. 2007), ``lcfr`` (linear weights), ``cfr+`` (regret floor,
 linear averaging; Tammelin 2014), ``dcfr`` (Brown & Sandholm 2019: alpha 1.5, beta 0, gamma 2),
-``pcfr+`` (predictive RM+, quadratic averaging; Farina, Kroer & Sandholm 2021).
+``pcfr+`` (predictive RM+, quadratic averaging; Farina, Kroer & Sandholm 2021), ``dcfr+`` / ``pdcfr+`` (Xu et al.
+2024: discounted regrets floored at zero, PDCFR+ plays the predicted regret; alpha 1.5 / 2.3, gamma 4 / 5).
 ``MCCFR``: Monte-Carlo CFR (Lanctot et al. 2009) with external or outcome sampling, linear
 weighting, and Pluribus' regret-based pruning (Brown & Sandholm 2019, Science: actions with very
 negative regret are skipped on 95 % of the traversals) - the algorithm behind Pluribus' blueprint.
@@ -50,16 +51,30 @@ class _Tables:
         return TabularPolicy(self.game, table)
 
 
+_DISCOUNTS = {"dcfr": (1.5, 2.0), "dcfr+": (1.5, 4.0), "pdcfr+": (2.3, 5.0)}  # default (alpha, gamma) per variant
+
+
 class CFR(_Tables):
-    def __init__(self, game, variant="cfr+", alpha=1.5, beta=0.0, gamma=2.0):
+    def __init__(self, game, variant="cfr+", alpha=None, beta=0.0, gamma=None):
         super().__init__(game)
-        assert variant in ("vanilla", "lcfr", "cfr+", "dcfr", "pcfr+")
+        assert variant in ("vanilla", "lcfr", "cfr+", "dcfr", "pcfr+", "dcfr+", "pdcfr+")
         self.variant = variant
-        self.alpha, self.beta, self.gamma = alpha, beta, gamma
+        a, g = _DISCOUNTS.get(variant, (1.5, 2.0))
+        self.alpha, self.beta, self.gamma = (a if alpha is None else alpha), beta, (g if gamma is None else gamma)
         self._legal = {}
+
+    def _plus_discount(self, t):
+        """(P)DCFR+ regret discount d_t = (t-1)^alpha / ((t-1)^alpha + 1); d_1 = 0."""
+        x = float(t - 1) ** self.alpha
+        return x / (x + 1.0)
 
     def _sigma(self, key, legal):
         r = self._get(self.regret, key)
+        if self.variant == "pdcfr+":  # the predicted next regret: [R d + the last instantaneous regret]^+
+            last = self.last_regret.get(key)
+            if last is not None:
+                return regret_matching(np.maximum(r * self._plus_discount(self.iteration) + last, 0.0), legal)
+            return regret_matching(r, legal)
         pred = self.last_regret.get(key) if self.variant == "pcfr+" else None
         return regret_matching(r, legal, pred)
 
@@ -93,15 +108,26 @@ class CFR(_Tables):
 
     def _update(self, inst, own):
         t = self.iteration
+        plus = self.variant in ("dcfr+", "pdcfr+")
         for key, r in inst.items():
             R = self._get(self.regret, key)
             if self.variant in ("vanilla", "dcfr"):
                 R += r
             elif self.variant == "lcfr":
                 R += t * r
+            elif plus:  # discount the floored regrets, add, floor at zero
+                np.maximum(R * self._plus_discount(t) + r, 0.0, out=R)
+                self.last_regret[key] = r
             else:  # cfr+ / pcfr+: regret floor at zero once per iteration
                 np.maximum(R + r, 0.0, out=R)
                 self.last_regret[key] = r
+        if plus:  # X_t = X_{t-1} ((t-1)/t)^gamma + reach * sigma_t
+            decay = ((t - 1) / t) ** self.gamma
+            for key, (reach_p, sigma) in own.items():
+                S = self._get(self.strategy_sum, key)
+                S *= decay
+                S += reach_p * sigma
+            return
         weight = {"vanilla": 1.0, "dcfr": 1.0, "lcfr": t, "cfr+": t, "pcfr+": t * t}[self.variant]
         for key, (reach_p, sigma) in own.items():
             self._get(self.strategy_sum, key)[:] += weight * reach_p * sigma
