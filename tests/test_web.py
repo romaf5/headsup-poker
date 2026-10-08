@@ -3,6 +3,7 @@ import json
 import threading
 from http.server import ThreadingHTTPServer
 
+import numpy as np
 import pytest
 
 from headsup.web.server import SessionHolder, make_handler
@@ -158,7 +159,8 @@ def test_allin_hands_report_equity_and_expected_result():
     assert allin["luck"] == pytest.approx(s.result["reward"] - allin["ev"])
     assert "equity" in allin["text"] and "%" in allin["text"]
     st = s.stats()
-    assert st["ev_total"] == pytest.approx(allin["ev"]) and st["luck"] == pytest.approx(st["total"] - st["ev_total"])
+    assert st["ev_total"] == pytest.approx(allin["ev"]) and st["luck"] == pytest.approx(st["total"] - st["adj_total"])
+    assert s.result["vs_range"]["ev"] != pytest.approx(allin["ev"])  # the calling station could hold anything: another average
     assert s.hand_records[-1]["ev"] == pytest.approx(allin["ev"])
     s.next_hand()  # big blind now; the calling station limps, we check it down: nothing was left to chance
     while not s.hand_over:
@@ -171,3 +173,77 @@ def test_allin_hands_report_equity_and_expected_result():
     assert st["hands"] == 2 and st["ev_total"] == pytest.approx(allin["ev"] + s.result["reward"])
     assert len(st["cumulative_ev"]) == 2 and st["ev_mbb"] == pytest.approx(st["ev_total"] / 2 * 500)
     json.dumps(s.state())
+
+
+def _showdown_ev_against(weights, me, board, stake):
+    """Brute force: my expected result at a river showdown against opponent hands weighted by ``weights``."""
+    from headsup.cards import hand_strength
+    from headsup.lbr import COMBOS
+
+    mine = hand_strength(me, board)
+    total = ev = 0.0
+    for h, w in enumerate(weights):
+        a, b = int(COMBOS[h, 0]), int(COMBOS[h, 1])
+        if w <= 0 or {a, b} & (set(me) | set(board)):
+            continue
+        s = hand_strength([a, b], board)
+        ev += w * stake * ((mine < s) - (mine > s))
+        total += w
+    return ev / total
+
+
+def test_showdowns_are_also_valued_against_the_bots_whole_range():
+    """Luck adjustment beyond the runout: which of the hands it plays this way the bot happened to hold is luck too.
+    The result is averaged over all of them, weighted by the probability that the bot takes its actions with each
+    (the expectation given everything both players could see - the same mean, less variance)."""
+    from headsup.lbr import COMBOS
+
+    s = GameSession(opponent="call", advisor=None, device="cpu", seed=11)
+    play_out(s)  # a calling station plays every hand the same way: its range at the showdown is every possible hand
+    e = s.engine
+    assert s.result["showdown"] and s.result["allin"] is None
+    rng_info = s.result["vs_range"]
+    want = _showdown_ev_against(np.ones(1326), list(e.hands[s.me]), list(e.board), min(e.bets))
+    assert rng_info["ev"] == pytest.approx(want, abs=1e-6) and 0.0 <= rng_info["equity"] <= 1.0
+    assert s.stats()["adj_total"] == pytest.approx(want, abs=1e-6) and s.hand_records[-1]["adj"] == pytest.approx(want, abs=1e-6)
+
+    class PairsRaise:  # raises with a pocket pair, calls with everything else (never folds)
+        game = s.game
+
+        def probs(self, obs, ids=None):
+            obs = np.asarray(obs)
+            pair = obs[:, 0] == obs[:, 3]  # rank + 1 of the two hole cards
+            out = np.zeros((len(obs), 4), dtype=np.float32)
+            out[pair, 2], out[~pair, 1] = 1.0, 1.0
+            return out
+
+        def __call__(self, obs, ids=None):
+            return self.probs(obs).argmax(1)
+
+    s = GameSession(opponent="call", advisor=None, device="cpu", seed=4)
+    s.opponent = PairsRaise()
+    for _ in range(40):  # until the bot shows down a hand it raised with
+        while not s.hand_over:
+            s.bot_step() if s.bot_to_act else s.act("call")
+        if any(entry["seat"] == "bot" and "raise" in entry["text"].lower() for entry in s.log) and s.result["showdown"]:
+            break
+        s.next_hand()
+    e = s.engine
+    assert e.hands[s.opp][0] % 13 == e.hands[s.opp][1] % 13  # it did raise: it holds a pair
+    pairs = (COMBOS[:, 0] % 13 == COMBOS[:, 1] % 13).astype(float)
+    want = _showdown_ev_against(pairs, list(e.hands[s.me]), list(e.board), min(e.bets))
+    assert s.result["vs_range"]["ev"] == pytest.approx(want, abs=1e-6)
+    json.dumps(s.state())
+
+
+def test_luck_adjusted_results_have_the_same_mean_and_less_variance():
+    s = GameSession(opponent="random", advisor=None, device="cpu", seed=2)
+    s.runout_samples = 300  # sampled runouts where many cards are to come: the test is about the mean, not about exactness
+    for _ in range(400):
+        play_out(s)
+        s.next_hand()
+    raw, adj = np.asarray(s.results, dtype=float), np.asarray(s.adj_results, dtype=float)
+    assert len(raw) == len(adj) == 400 and adj.std() < 0.85 * raw.std()
+    assert abs(adj.mean() - raw.mean()) < 4 * np.sqrt((raw - adj).var() / len(raw))  # paired: the difference is pure luck
+    st = s.stats()
+    assert st["adj_total"] == pytest.approx(adj.sum()) and st["luck"] == pytest.approx(raw.sum() - adj.sum())

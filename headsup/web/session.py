@@ -166,6 +166,10 @@ class GameSession:
         self.me = 1  # flipped in new_hand -> human is dealer first
         self.results = []  # per-hand rewards for the human
         self.ev_results = []  # the same with all-in hands at their expectation over the runouts (all-in EV)
+        # ... and with showdowns at their expectation over the hands the bot plays this way (see _range_ev)
+        self.adj_results = []
+        self.runout_samples = 0  # 0: exact expectations over the runouts (pre-flop all-ins: ~0.1 s); > 0: that many sampled
+        self._bot_range = None  # P(the bot's actions of this hand | each of the 1326 hands), or None when unknown
         self.hand_records = []  # compact summaries of finished hands
         self.log = []  # action log of the current hand
         self.hand_over = False
@@ -248,8 +252,31 @@ class GameSession:
             "hand": e.hands_played,
             "n": len(self.log),
         }
+        self._update_bot_range(obs, action)
         self._step(self.opp, action)
         return self.state()
+
+    def _update_bot_range(self, obs, action):
+        """Multiply the bot's range by the probability that it takes ``action`` with each of the 1326 hands (its
+        strategy at this public state for every hand: asked from a search player's round solve, or by substituting
+        the hands into the observation).  Bots whose strategy depends on per-hand state cannot say: no range."""
+        if self._bot_range is None:
+            return
+        from headsup.lbr import substitute_hands, transition_likelihood
+
+        opp = self.opponent
+        try:
+            if getattr(opp, "answers_all_hands", False):
+                sigma = np.asarray(opp.all_hands_probs(obs, np.array([0]))[0], dtype=np.float64)
+            elif getattr(opp, "wants_ids", False) or not hasattr(opp, "probs"):
+                raise ValueError("per-hand state")
+            else:
+                sigma = np.asarray(opp.probs(substitute_hands(obs[0])), dtype=np.float64)
+            if getattr(opp, "deterministic", False):  # it plays the most likely action of each hand
+                sigma = np.eye(sigma.shape[1])[sigma.argmax(axis=1)]
+            self._bot_range = self._bot_range * transition_likelihood(self.engine, action, sigma)
+        except Exception:  # the adjustment is optional: never let it break a hand
+            self._bot_range = None
 
     def _advance_bot(self):
         """Advance the bot until it is the human's turn or the hand is over (used by autoplay/tests)."""
@@ -281,6 +308,9 @@ class GameSession:
         info["allin"] = self._allin_ev(reward)
         ev = info["allin"]["ev"] if info["allin"] else float(reward)
         self.ev_results.append(ev)
+        info["vs_range"] = self._range_ev(reward) if showdown else None
+        adj = info["vs_range"]["ev"] if info["vs_range"] else ev
+        self.adj_results.append(adj)
         self.result = info
         self.hand_records.append(
             {
@@ -293,9 +323,36 @@ class GameSession:
                 "position": self._pos(self.me),
                 "summary": info["text"],
                 "ev": ev,
+                "adj": adj,
             }
         )
         self.hand_records = self.hand_records[-200:]
+
+    def _range_ev(self, reward):
+        """A showdown valued against every hand the bot plays this way: the expectation of the result over the bot's
+        hands, weighted by the probability that it takes its actions of this hand with each (and over the cards to
+        come when the betting closed early).  Given what both players could see, which of those hands it held is
+        luck - the average has the same mean over many hands and far less variance.  None when the bot's strategy
+        for other hands is unknown or the C++ kernels are missing."""
+        from headsup import native
+        from headsup.lbr import valid_combos
+
+        e = self.engine
+        if self._bot_range is None or not native.available() or e.showdown_stage < 0:
+            return None
+        known = list(e.board[: (0, 3, 4, 5)[e.showdown_stage]])
+        final = (0, 3, 4, 5)[e.num_rounds - 1]
+        mine = list(e.hands[self.me])
+        eq = np.asarray(native.module().equity_vs_all(mine[0], mine[1], known, self.runout_samples or 2000, 1100,
+                                                      int(self.rng.integers(2**31)), final), dtype=np.float64)
+        w = self._bot_range * valid_combos(mine + known) * (eq >= 0)
+        if not w.sum() > 0:
+            return None
+        w = w / w.sum()
+        equity = float(w @ np.where(eq >= 0, eq, 0.0))
+        ev = float(min(e.bets) * (2.0 * equity - 1.0))
+        return {"equity": equity, "ev": ev, "luck": reward - ev,
+                "text": f"against all the hands the bot plays this way you have {equity:.0%}: worth {ev:+.1f} on average"}
 
     def _allin_ev(self, reward):
         """For a hand that went all-in before the last card: your equity when the money went in, what the hand was
@@ -304,8 +361,9 @@ class GameSession:
         if e.folded >= 0 or e.showdown_stage < 0 or e.showdown_stage >= e.num_rounds - 1:
             return None
         known = e.board[: (0, 3, 4, 5)[e.showdown_stage]]
-        win, tie = showdown_equity(e.hands[self.me], e.hands[self.opp], known, len(e.board[: (0, 3, 4, 5)[e.num_rounds - 1]]))
-        equity, ev = win + tie / 2, float(e.allin_ev()[self.me])
+        win, tie = showdown_equity(e.hands[self.me], e.hands[self.opp], known, len(e.board[: (0, 3, 4, 5)[e.num_rounds - 1]]),
+                                   self.runout_samples, int(self.rng.integers(2**31)))
+        equity, ev = win + tie / 2, float(e.allin_ev(self.runout_samples, int(self.rng.integers(2**31)))[self.me])
         street = ("pre-flop", "flop", "turn")[e.showdown_stage]
         return {"street": street, "equity": equity, "ev": ev, "luck": reward - ev,
                 "text": f"all-in {'on the ' if e.showdown_stage else ''}{street} with {equity:.0%} equity: worth {ev:+.1f} on average, "
@@ -317,6 +375,7 @@ class GameSession:
         self.engine.reset()
         self.hand_over = False
         self.result = None
+        self._bot_range = np.ones(1326)
         self.log = []
         self.bot_last = None
         self._equity_cache = {}
@@ -411,9 +470,22 @@ class GameSession:
             "ev_avg": float(ev.mean()) if n else 0.0,
             "ev_mbb": float(ev.mean() * 1000 / bb) if n else 0.0,
             "ev_se_mbb": float(ev.std(ddof=1) / np.sqrt(n) * 1000 / bb) if n > 1 else 0.0,
-            "luck": float(r.sum() - ev.sum()) if n else 0.0,
             "allin_hands": int((ev != r).sum()) if n else 0,
             "cumulative_ev": np.cumsum(ev).tolist()[-400:] if n else [],
+            **self._adj_stats(r),
+        }
+
+    def _adj_stats(self, r):
+        """Luck-adjusted session: all-in runouts and the bot's actual hand at showdowns replaced by their averages."""
+        adj = np.asarray(self.adj_results, dtype=np.float64)
+        n, bb = len(adj), self.engine.big_blind
+        return {
+            "adj_total": float(adj.sum()) if n else 0.0,
+            "adj_mbb": float(adj.mean() * 1000 / bb) if n else 0.0,
+            "adj_se_mbb": float(adj.std(ddof=1) / np.sqrt(n) * 1000 / bb) if n > 1 else 0.0,
+            "luck": float(r.sum() - adj.sum()) if n else 0.0,
+            "adjusted_hands": int((adj != r).sum()) if n else 0,
+            "cumulative_adj": np.cumsum(adj).tolist()[-400:] if n else [],
         }
 
     def state(self, reveal_bot=False):

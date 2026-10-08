@@ -59,9 +59,16 @@ paper's hyperparameters and network (`--net deepcfr`: Appendix C with the 3x wid
 **All-in EV.** When a hand goes all-in before the last card, the played-hands tools (`compare`, `lbr`, `exploit`,
 `deepcfr.evaluate`) count it with its expectation over the board cards still to come instead of the one runout that
 was dealt (exact on the flop and turn, 1,000 sampled runouts pre-flop): the same mean with a smaller standard error.
-`--raw` turns it off. The browser table shows it per hand ("all-in pre-flop with 62 % equity: worth +24.0 on
-average, the runout gave you +76.0") and keeps an EV-adjusted win rate and the runouts' luck next to the dealt
-totals. In code: `engine.allin_ev()`, `play_hands(..., allin_ev=True)`, `headsup.cards.showdown_equity`.
+`--raw` turns it off. In code: `engine.allin_ev()`, `play_hands(..., allin_ev=True)`, `headsup.cards.showdown_equity`.
+
+**Luck-adjusted results at the browser table.** Besides the runout, a showdown has a second piece of luck: which of
+the hands it plays this way the bot happened to hold. The table values every showdown against all of them, weighted
+by the probability that the bot takes its actions with each (its strategy for every hand - for `pluribus` from the
+round's solve), and all-in hands over the cards to come: "all-in pre-flop with 62 % equity: worth +24.0 on average …
+against all the hands the bot plays this way you have 55 %: worth +10.0 on average". Both are expectations given what
+the players could see, so the session's luck-adjusted win rate has the same mean as the dealt one. Its standard
+deviation per hand is about half (DeepCFR's strategy against the blueprint, 600 hands: 23 chips dealt, 16 with
+all-in EV, 12 luck-adjusted), i.e. the same precision with a quarter of the hands.
 
 ## Results
 
