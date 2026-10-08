@@ -186,24 +186,27 @@ def rebel_references(oracle_pattern="runs/leduc_rebel/oracle_T*.json"):
 def rebel_table(pattern="runs/leduc_rebel/leduc_s*.json", epochs=None, columns=8, last=3):
     """Markdown table of our ReBeL runs (``--json`` curves of headsup.algos.rebel): mean ± sd over the seeds at the
     evaluated epochs every run has (thinned to ``columns``, the first and the last kept), one line per quantity.
-    The final column is each run's mean over its ``last`` evaluations - the paper reports the mean of three
+    The final column is each run's mean over the ``last`` evaluations that every run has (its header names their
+    epochs, so runs of different lengths are compared at the same ones) - the paper reports the mean of three
     checkpoints for Liar's Dice: single evaluations of a search with a learned value function scatter by 20-30 %."""
     runs = [json.load(open(p)) for p in sorted(glob.glob(pattern))]
     runs = [{c["epoch"]: c for c in r["curve"]} for r in runs if r.get("curve")]
     if not runs:
         return f"(no runs match {pattern})"
+    common = sorted(set.intersection(*(set(r) for r in runs)))
     if epochs is None:
-        common = sorted(set.intersection(*(set(r) for r in runs)))
         keep = np.unique(np.round(np.linspace(0, len(common) - 1, min(columns, len(common)))).astype(int))
         epochs = [common[i] for i in keep]
+    tail = common[-last:]
     samples = sorted({c["samples"] for r in runs for c in r.values() if c.get("samples")})
     head = f"| epoch ({len(runs)} run{'s' if len(runs) > 1 else ''}) | "
-    out = [head + " | ".join(str(e) for e in epochs) + f" | last {last} evaluations |", "|---|" + "---|" * (len(epochs) + 1)]
+    out = [head + " | ".join(str(e) for e in epochs) + f" | last {len(tail)} evaluations (epochs {' / '.join(map(str, tail))}) |",
+           "|---|" + "---|" * (len(epochs) + 1)]
     for key, label, scale in _REBEL_ROWS:
         if key == "exploitability_sampled" and samples:
             label = label.replace("K", "K = " + " / ".join(str(k) for k in samples))
         cells = [_fmt([scale * r[e][key] for r in runs if e in r and r[e].get(key) is not None], 1) for e in epochs]
-        tails = [[r[e][key] for e in sorted(r)[-last:] if r[e].get(key) is not None] for r in runs]
+        tails = [[r[e][key] for e in tail if r[e].get(key) is not None] for r in runs]
         cells.append(_fmt([scale * float(np.mean(t)) for t in tails if t], 1))
         out.append(f"| {label} | " + " | ".join(cells) + " |")
     return "\n".join(out)

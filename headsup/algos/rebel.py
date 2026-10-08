@@ -422,11 +422,14 @@ class ReBeL:
                  grad_clip=5.0, capacity=2_000_000, hidden=256, layers=2, train_stop="uniform", leaf_targets="net", chance_prob=1.0,
                  eval_iters=None, eval_samples=1024, probe_iters=64, regret_floor=EPS, device="cpu", seed=0):
         assert train_stop in STOPS and leaf_targets in LEAF_TARGETS
-        assert iters >= 2 and iters % 2 == 0, "iters counts single-player updates as the official code does: an even number"
         self.game, self.iters, self.epsilon, self.games = game, iters, epsilon, games
         self.steps, self.batch, self.lr, self.lr_halve_every, self.lr_halvings = steps, batch, lr, lr_halve_every, lr_halvings
         self.grad_clip, self.train_stop, self.leaf_targets, self.chance_prob = grad_clip, train_stop, leaf_targets, chance_prob
         self.eval_iters, self.eval_samples, self.probe_iters = eval_iters or iters, eval_samples, min(probe_iters, iters)
+        for name, value in (("iters", iters), ("eval_iters", self.eval_iters), ("probe_iters", self.probe_iters)):
+            if value < 2 or value % 2:  # here, not at the first evaluation after an epoch of training
+                raise ValueError(f"{name} = {value}: a search length counts single-player updates as the official code does "
+                                 "and must be a positive even number")
         self.regret_floor, self.device, self.seed = regret_floor, torch.device(device), seed
         self.rng = np.random.default_rng(seed)
         torch.manual_seed(seed)
@@ -441,7 +444,8 @@ class ReBeL:
             "at most two betting rounds; the last round's tree must not depend on the first round's betting"
         self.tree1 = self.trees1[0] if self.trees1 else None
         self.amount1 = np.stack([t.amount for t in self.trees1]) if self.trees1 else np.zeros((0, 0))  # (leaf, node): the stakes
-        self.scale = float(max([self.tree0.amount.max()] + [t.amount.max() for t in self.trees1]))  # values are learned in [-1, 1]
+        # the most a player can win (half the largest pot): the network's values are learned in [-1, 1]
+        self.scale = float(max([self.tree0.amount.max()] + [t.amount.max() for t in self.trees1]))
         value = np.array([[game.hand_value(h, b) for h in range(H)] for b in [*range(H), None]], dtype=np.float64)
         self.show = np.sign(value[:, :, None] - value[:, None, :]) * (1.0 - np.eye(H))  # [board (last: none), hand, hand]
         self.hand_mask = 1.0 - np.eye(H)  # [board, hand]
@@ -473,7 +477,7 @@ class ReBeL:
     def encode(self, pub, beliefs, agent):
         """Network input (M, in_dim): [agent index, public features, player 0's range, player 1's range]."""
         M = len(pub)
-        return np.concatenate([np.full((M, 1), float(agent)), pub, beliefs.reshape(M, -1)], axis=1).astype(np.float32)
+        return np.concatenate([np.full((M, 1), float(agent)), pub, beliefs.reshape(M, 2 * self.num_hands)], axis=1).astype(np.float32)
 
     def net_values(self, pub, beliefs, agent):
         """The network's values of the agent's hands at M PBSs, in chips, (M, H): each hand's expected payoff
@@ -545,9 +549,7 @@ class ReBeL:
         if len(at):
             lf, lb = t0.leaf_index[node[at]], beliefs[at]
             pre = np.flatnonzero(rng.random(len(at)) < self.chance_prob)
-            if self.leaf_targets == "solve":  # every card's subgame: exact targets before the card, none needed after it
-                pre_values = self.solve_boards(lf[pre], lb[pre], T)[0]
-            else:
+            if self.leaf_targets == "net":  # the game goes on: the card, and the last round's solve from the PBS after it
                 card = sample_board(lb, rng)
                 post = deal_board(lb, card)
                 sub = self.solver(post, lf, card).run(T)
@@ -556,12 +558,13 @@ class ReBeL:
                 board.append(card)
                 ranges.append(post)
                 values.append(sub.root_mean.transpose(1, 0, 2))
-                pre_values = self.net_before_board(lf[pre], lb[pre])
-            stage.append(np.full(len(pre), BEFORE_BOARD))
-            leaf.append(lf[pre])
-            board.append(np.full(len(pre), -1))
-            ranges.append(lb[pre])
-            values.append(pre_values)
+            if len(pre):  # exact targets (every card's subgame solved) or the paper's (the network after every card)
+                solved = self.leaf_targets == "solve"
+                stage.append(np.full(len(pre), BEFORE_BOARD))
+                leaf.append(lf[pre])
+                board.append(np.full(len(pre), -1))
+                ranges.append(lb[pre])
+                values.append(self.solve_boards(lf[pre], lb[pre], T)[0] if solved else self.net_before_board(lf[pre], lb[pre]))
         out.update(stage=np.concatenate(stage), leaf=np.concatenate(leaf), board=np.concatenate(board),
                    beliefs=np.concatenate(ranges), values=np.concatenate(values))
         return out
@@ -601,7 +604,7 @@ class ReBeL:
 
     # -- training -----------------------------------------------------------------------------------------
     def loss(self, x, y):
-        """The official loss: the "Huber" of the error of each hand's value (in units of the largest pot), mean
+        """The official loss: the "Huber" of the error of each hand's value (in units of the largest win), mean
         over hands and examples."""
         return huber(self.net(x) - y).mean()
 
@@ -611,7 +614,7 @@ class ReBeL:
 
     def train(self, steps):
         buf = self.buffer
-        if buf.size == 0:
+        if buf.size == 0 or steps <= 0:
             return
         for group in self.opt.param_groups:
             group["lr"] = self.learning_rate(self.epoch)
@@ -864,9 +867,13 @@ def main(argv=None):
     p.add_argument("--checkpoint-minutes", type=float, default=10.0,
                    help="at most one checkpoint per this many minutes (plus the final one)")
     p.add_argument("--device", default="cpu", help="the network's device; the search itself is numpy on the CPU")
+    p.add_argument("--threads", type=int, default=1,
+                   help="torch's CPU threads. A seed gives the same run only with the same number: it changes the order of the "
+                   "network's float additions and the search amplifies the last digit (2 threads: about 10 %% faster per epoch)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", default=None)
     args = p.parse_args(argv)
+    torch.set_num_threads(args.threads)
     game = make_small_game(args.game)
     solver = ReBeL(game, iters=args.iters, epsilon=args.epsilon, games=args.games, steps=args.steps, batch=args.batch, lr=args.lr,
                    lr_halve_every=args.lr_halve_every, grad_clip=args.grad_clip, capacity=args.buffer, hidden=args.hidden,
@@ -876,11 +883,12 @@ def main(argv=None):
     curve, elapsed = [], 0.0
 
     def dump():
-        if args.json:
+        if args.json:  # atomic: a crash while writing leaves the previous curve intact
             os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
-            with open(args.json, "w") as f:
+            with open(args.json + ".tmp", "w") as f:
                 algo = "rebel-oracle" if args.oracle else "rebel"
                 json.dump({"game": args.game, "algo": algo, "args": vars(args), "curve": curve}, f, indent=2)
+            os.replace(args.json + ".tmp", args.json)
 
     if args.oracle:  # the calibration: what the search alone reaches with a perfect value function
         t0 = time.perf_counter()
