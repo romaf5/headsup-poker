@@ -5,7 +5,19 @@ import pytest
 import torch
 
 from headsup.algos.best_response import expected_value, exploitability
-from headsup.algos.pdcfr import CHANCE, DECISION, TERMINAL, Tree, discount, mlp, sample_episodes, strategy_rows
+from headsup.algos.pdcfr import (
+    CHANCE,
+    DECISION,
+    TERMINAL,
+    PDCFRSolver,
+    Tree,
+    advantage_target,
+    baseline_target,
+    discount,
+    mlp,
+    sample_episodes,
+    strategy_rows,
+)
 from headsup.games import UniformPolicy, make_game
 
 
@@ -161,3 +173,61 @@ def test_exact_baseline_removes_most_sampling_variance_for_both_players():
             mean /= np.maximum(np.bincount(data["adv_info"], minlength=tree.num_infosets), 1)[:, None]
             var.append(((data["adv"] - mean[data["adv_info"]]) ** 2).mean())
         assert var[1] < 0.25 * var[0], (p, var)
+
+
+def test_advantage_target_clips_the_previous_output_at_read_time():
+    frozen = torch.tensor([[2.0, -3.0, 5.0]])
+    legal = torch.tensor([[1.0, 1.0, 0.0]])
+    adv = torch.tensor([[0.5, -0.25, 0.0]])
+    torch.testing.assert_close(advantage_target(frozen, legal, 0.5, adv), torch.tensor([[1.5, -0.25, 0.0]]))
+    torch.testing.assert_close(advantage_target(frozen, legal, 0.0, adv), adv)  # iteration 1: d = 0
+
+
+def test_baseline_target_is_expected_sarsa():
+    reward = torch.tensor([0.0, -1.0])
+    done = torch.tensor([0.0, 1.0])
+    next_q = torch.tensor([[1.0, 3.0, 100.0], [7.0, 7.0, 7.0]])
+    next_sigma = torch.tensor([[0.25, 0.75, 0.0], [1.0, 0.0, 0.0]])
+    torch.testing.assert_close(baseline_target(reward, done, next_q, next_sigma), torch.tensor([2.5, -1.0]))
+
+
+def _small(variant, **kw):
+    args = dict(traversals=1000, adv_steps=100, adv_batch=256, q_steps=100, q_batch=256, policy_steps=400, policy_batch=256, seed=0)
+    args.update(kw)
+    return PDCFRSolver(make_game("kuhn"), variant, **args)
+
+
+@pytest.mark.parametrize("variant", ["dcfr+", "pdcfr+"])
+def test_kuhn_converges(variant):
+    s = _small(variant)
+    assert (s.alpha, s.gamma, s.offset) == ((2.0, 2.0, 1.5) if variant == "dcfr+" else (2.3, 2.0, 1.0))
+    s.iterate(15)
+    ev = s.evaluate()
+    assert ev["average"] < 0.09 and np.isfinite(ev["current"]), ev  # uniform: 0.458; measured 0.019 / 0.042 (0.018 / 0.020 at 30 iterations)
+    assert s.iteration == 15 and s.episodes == 15 * 2 * 1000 and s.nodes_touched > s.episodes * 3
+    pol = s.average_policy()
+    for probs in pol.table.values():
+        assert probs.sum() == pytest.approx(1.0, abs=1e-6)
+    assert (s.r is None) == (variant == "dcfr+")
+
+
+def test_ablation_switches_run():
+    quick = dict(traversals=300, adv_steps=30, q_steps=30, policy_steps=50)
+    for kw in (dict(baseline=False), dict(reach_weighted=True), dict(reinit_prediction=True), dict(fallback="uniform")):
+        s = _small("pdcfr+", **quick, **kw).iterate(3)
+        assert np.isfinite(s.evaluate()["average"])
+    assert not _small("pdcfr+", **quick, baseline=False).iterate(2).q_tab.any()
+
+
+def test_tiny_budget_and_untrained_solver():
+    g = make_game("kuhn")
+    s = PDCFRSolver(g, "pdcfr+", traversals=5, adv_steps=5, q_steps=5, policy_steps=5, seed=0)
+    assert s.evaluate()["average"] == pytest.approx(exploitability(g, UniformPolicy(g))[0], abs=1e-9)  # untrained: uniform
+    s.iterate(3)  # far fewer samples than the 2 048 minibatch
+    assert np.isfinite(s.evaluate()["average"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_runs_on_cuda():
+    s = _small("pdcfr+", traversals=500, device="cuda").iterate(3)
+    assert np.isfinite(s.evaluate()["average"]) and np.isfinite(s.q_tab).all()
