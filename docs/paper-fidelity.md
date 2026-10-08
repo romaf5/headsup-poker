@@ -64,6 +64,7 @@ Open, about the paper's own figures:
   | ours, 10,000 traversals: SD-CFR average | 367 | 199 | | |
   | ours, 10,000 traversals, `--masked-loss`: policy net | | 206 | 129 | 101 |
   | ours, 25,000 traversals: SD-CFR average | 178 | 121 | | |
+  | ours, 25,000 traversals, batch 40,000 + cosine from 3e-3: SD-CFR average | 234 | | | |
 
   What was measured about the gap:
   - *Traversals.* With 25,000 traversals - the paper's nodes touched per iteration - the average is at 178 after 50
@@ -95,7 +96,14 @@ Open, about the paper's own figures:
     sampling noise) and jitters; neither the 2/T weights nor the head initialisation matter, and the audit's network
     is better than the one before. This agrees with the paper's own SGD-step sweep (more steps, lower floor).
     `--batch-size 40000 --lr 3e-3 --lr-schedule cosine` gets most of the 16,000-step fit at 1.1-1.6 times the cost of
-    the paper's; a 100-iteration run with it and 25,000 traversals is the next data point (`runs/fhp4_k25_fit`).
+    the paper's.
+  - *The tighter fit in training.* The benchmark is one memory at t = 125. A 100-iteration run with that fit and
+    25,000 traversals (`runs/fhp4_k25_fit`) is worse early: 234 at t = 50 against 178 with the paper's fit. At
+    iteration 1 the memory holds ~125,000 samples and 4,000 batches of 40,000 pass over it 1,280 times; the fit then
+    reproduces the sampled regrets, noise included. The runs of September with 16,000 steps (three-bet game) showed
+    the same shape - 276 / 145 / 87 at t = 50 / 100 / 200 against 179 / 116 / 96 - i.e. a tighter fit pays only once
+    the memories are large. A fit whose budget grows with the memory, and the floor at 300-450 iterations with the
+    tighter fit, are the open experiments (`runs/scripts/fhp_long.sh` is the prepared full-length run).
 
 ## DREAM and ESCHER
 

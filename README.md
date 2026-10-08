@@ -236,6 +236,7 @@ average on 2,000 sampled flops, which overstates by ~8 %):
 | ours, 10,000 traversals: policy net | | 202 | 113 | 95 |
 | ours, 10,000 traversals: SD-CFR average | 367 | 199 | | |
 | ours, 25,000 traversals: SD-CFR average | 178 | 121 | | |
+| ours, 25,000 traversals, tighter fit (below): SD-CFR average | 234 | | | |
 
 Two things were measured about the gap. The paper's "10,000 traversals" touch 2.4 times the nodes of ours per
 iteration, and with 25,000 traversals the first 50 iterations are close to its curve. And the 4,000-step regret fit is
@@ -243,8 +244,11 @@ the weak part afterwards: two refits on the same data disagree by 7 chips at pre
 same samples is good to 4.5, consecutive iterates play visibly different strategies there, and 16,000 steps lower the
 held-out loss by 5 % (most of what is left is sampling noise) - as in the paper's own sweep, whose 4,000-step curve
 ends near 65, not 40. `--batch-size 40000 --lr 3e-3 --lr-schedule cosine` gets the 16,000-step fit at 1.1-1.6 times
-the paper's cost; `--weight-average` and `--policy-lr` are the related options. Details, the street split of the
-error and the fit benchmark: [docs/paper-fidelity.md](docs/paper-fidelity.md).
+the paper's cost on that memory (iteration 125) - but it does not help early: with it the 25,000-traversal run is at
+234 after 50 iterations instead of 178, because a tighter fit also follows the noise of the small early memories (our
+earlier 16,000-step runs were likewise worse before iteration 100 and better from about 200). Whether it lowers the
+floor at 300-450 iterations has not been run. `--weight-average` and `--policy-lr` are the related options. Details,
+the street split of the error and the fit benchmark: [docs/paper-fidelity.md](docs/paper-fidelity.md).
 
 Every known difference between this code and the papers (fixed, chosen, or still open) is listed in
 [docs/paper-fidelity.md](docs/paper-fidelity.md).

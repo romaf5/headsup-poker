@@ -67,9 +67,10 @@ python -m pytest tests -q                                    # ~440 tests, ~13 m
 - First iteration: untrained nets output zeros and the argmax fallback shares exact ties, i.e. plays uniformly.
 - FHP is not reproduced (2026-10-08, four-bet game, paper preset: 202 / 113 / 95 mbb/g total at t = 100 / 200 / 300
   against the paper's 70 / 51 / 40). Two measured causes: (1) the paper's "10,000 traversals" touch ~2.4x the nodes of
-  ours - `--traversals 25000` gives 178 / 121 at t = 50 / 100 against 367 / 199; (2) the 4,000-step fit is noisy and
-  underfits: `--batch-size 40000 --lr 3e-3 --lr-schedule cosine` (or `--weight-average 0.998`) lowers the held-out
-  loss as much as 16,000 steps do. Offline fit benchmark on a checkpoint's memory: see docs/paper-fidelity.md.
+  ours - `--traversals 25000` gives 178 / 121 at t = 50 / 100 against 367 / 199; (2) at t = 125 the 4,000-step fit is
+  noisy and underfits: `--batch-size 40000 --lr 3e-3 --lr-schedule cosine` (or `--weight-average 0.998`) lowers the
+  held-out loss as much as 16,000 steps do - but in training that fit is WORSE early (234 vs 178 at t = 50: it follows
+  the noise of small memories); its effect on the floor at t >= 300 is not measured. See docs/paper-fidelity.md.
 - Search: pre-river subgames use *sampled* MCCFR where LCFR beats DCFR / CFR+ / PCFR+ (measured); the
   river uses full-width vector CFR where DCFR / CFR+ / PCFR+ win. Do not add regret flooring to the
   sampled solver. `search:` players are slow (~1-2 s/decision): evaluate on 1-2k hands.
