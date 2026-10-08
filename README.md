@@ -204,6 +204,13 @@ Tabular references: CFR+ 0.24, DCFR 0.15 mA/g at 1000 iterations.
 | DeepCFR, paper features + net, 300 it. (`models/deepcfr_policy.pth`) | 1.25 ± 0.07 | ties its SD-CFR average (−0.04 ± 0.05) |
 | tabular blueprint, 20 M it. (`models/blueprint_nlhe.pt`) | **1.03 ± 0.10** | **+0.86 ± 0.02** vs the DeepCFR net |
 | Pluribus-mode search on the blueprint (`pluribus`) | not re-measured | +0.40 ± 0.29 vs the blueprint (2,000 hands) |
+| AlphaHoldem, 0.1e9 samples (15 % of the paper's ablation budget), no value clip | 3.62 ± 0.17 | +0.29 ± 0.05 vs the DeepCFR net, −0.66 ± 0.04 vs the blueprint |
+| AlphaHoldem, same, per-state value clip (`--value-clip`) | 3.45 ± 0.15 | +0.10 ± 0.05 vs the DeepCFR net, −1.10 ± 0.05 vs the blueprint |
+
+AlphaHoldem (self-play PPO, no CFR; LBR on 4,000 pairs) after two hours on a shared RTX 3090 already beats the DeepCFR
+network in play, loses to the blueprint and is three times as exploitable by LBR as either - the usual profile of
+self-play RL. The per-state reading of the paper's value clip biases the advantages (measured: +0.3 to +1 chip for
+every decision that is followed by another) and trains the weaker agent, so it is off by default.
 
 LBR: 10,000 duplicate pairs, flop equities enumerated, showdowns averaged over the opponent's range. The numbers shown
 here before 2026-10-08 (1.33 / 0.60) came from an estimator that kept the first hands to finish among tables played in
