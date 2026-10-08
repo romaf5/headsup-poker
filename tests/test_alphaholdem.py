@@ -370,3 +370,210 @@ def test_pool_assigns_opponents_evenly_and_round_trips():
     for m, o in zip(pool.members, other.members):
         assert all(torch.equal(x, y) for x, y in zip(m.net.parameters(), o.net.parameters()))
         assert not any(p.requires_grad for p in o.net.parameters())
+
+
+# ---------------------------------------------------------------------------------------------- trainer
+TINY = dict(envs=48, samples=500, epochs=2, minibatch=200, channels=8, conv_layers=1, hidden=32, pool=2, snapshot_every=1, seed=0)
+
+
+def _force(net, action):
+    """Make a network (nearly) deterministic: ``action`` when it is legal, else check / call."""
+    with torch.no_grad():
+        net.policy_head.weight.zero_()
+        net.policy_head.bias.copy_(torch.tensor([60.0 if a == action else 30.0 if a == 1 else 0.0 for a in range(net.num_actions)]))
+
+
+def test_rollout_trains_on_the_main_agents_decisions_only():
+    """The main agent always raises, the pool member folds whenever it faces a bet.  As small blind the main agent
+    raises and wins the big blind (+2): one sample per hand, action 2, return 2 / scale.  As big blind it wins the
+    small blind without a decision (+1): no sample, but the hand counts in the result against the member.  Any
+    sample with another action or return would be one of the opponent's decisions or a misplaced reward."""
+    from headsup.alphaholdem.train import Trainer
+
+    trainer = Trainer(TINY, device="cpu")
+    trainer.pool.add(trainer.net, iteration=0)
+    _force(trainer.pool.members[0].net, 0)
+    _force(trainer.net, 2)
+    batch, info = trainer.collect(assignment=np.zeros(48, dtype=np.int64))
+    n = len(batch["action"])
+    assert n >= 500 and all(len(v) == n for v in batch.values())
+    assert (batch["action"] == 2).all()
+    np.testing.assert_allclose(batch["ret"].numpy(), 0.02, rtol=1e-6)  # +2 chips in stacks of 100, on the deciding sample
+    assert (batch["own"] == 1).all() and (batch["opp"] == 2).all() and (batch["seat"] == 0).all()
+    hands, chips = int(info["pool_hands"][0]), float(info["pool_chips"][0])
+    assert info["hands"] == hands and n == round(chips) - hands  # chips = 2 a + b and hands = a + b: a hands as small blind
+    assert 0.3 < n / hands < 0.7  # the seat alternates: about half of the hands
+    np.testing.assert_allclose(batch["adv"].numpy(), (batch["ret"] - batch["value"]).numpy(), rtol=1e-4, atol=1e-7)
+
+
+def test_rollout_returns_are_each_seats_reward_of_its_hand():
+    """Self-play (an empty pool): every decision of both seats is a sample; the rollout ends at hand boundaries; a
+    sample's return is its seat's reward of that hand, discounted per later decision of the seat - recomputed here
+    with a forward walk over the recorded grid.  The stored inputs, actions, log-probabilities and values belong
+    together (the network reproduces them)."""
+    from headsup.alphaholdem.train import Trainer
+
+    trainer = Trainer({**TINY, "gamma": 0.9, "allin_ev": True}, device="cpu")
+    batch, info = trainer.collect()
+    grid = info["grid"]
+    seat, active, done, reward = (grid[k].numpy() for k in ("seat", "active", "done", "reward"))
+    T, N = seat.shape
+    assert len(batch["action"]) == active.sum() >= 500 and info["hands"] == (done & active).sum()
+    expected = {}
+    for i in range(N):
+        steps = np.flatnonzero(active[:, i])
+        assert done[steps[-1], i]  # no hand is cut off
+        hand = {0: [], 1: []}
+        for t in steps:
+            hand[seat[t, i]].append(t)
+            if done[t, i]:
+                for s in (0, 1):
+                    for j, tt in enumerate(hand[s]):
+                        expected[(tt, i)] = 0.9 ** (len(hand[s]) - 1 - j) * reward[t, i, s] / 100.0
+                hand = {0: [], 1: []}
+    got = {(int(t), int(i)): float(r) for t, i, r in zip(batch["step"], batch["table"], batch["ret"])}
+    assert got.keys() == expected.keys()
+    np.testing.assert_allclose([got[k] for k in expected], list(expected.values()), rtol=1e-5, atol=1e-7)
+    assert (reward != np.rint(reward)).any() and len({round(abs(v), 6) for v in expected.values()}) > 5  # all-in EV; many pot sizes
+    np.testing.assert_array_equal(batch["seat"].numpy(), seat[batch["step"].numpy(), batch["table"].numpy()])
+    with torch.no_grad():
+        logits, value = trainer.net(batch["cards"], batch["acts"], batch["legal"])
+    logp = torch.log_softmax(logits, dim=-1).gather(1, batch["action"][:, None]).squeeze(1)
+    assert torch.allclose(logp, batch["logp"], atol=1e-5) and torch.allclose(value, batch["value"], atol=1e-5)
+    assert batch["legal"].gather(1, batch["action"][:, None]).all()
+    assert batch["cards"][:, 0].sum(dim=(1, 2)).eq(2).all()  # two hole cards in every sample
+
+
+def test_training_moves_the_main_agent_and_not_the_pool():
+    from headsup.alphaholdem.train import Trainer
+
+    trainer = Trainer(TINY, device="cpu")
+    start = [p.detach().clone() for p in trainer.net.parameters()]
+    first = trainer.iterate()
+    assert trainer.iteration == 1 and len(trainer.pool) == 1 and trainer.pool.members[0].iteration == 1  # snapshot_every = 1
+    assert any(not torch.equal(a, b) for a, b in zip(start, trainer.net.parameters()))
+    member = trainer.pool.members[0].net
+    frozen = [p.detach().clone() for p in member.parameters()]
+    assert all(torch.equal(a, b) for a, b in zip(frozen, trainer.net.parameters()))  # the snapshot is the agent after iteration 1
+    second = trainer.iterate()
+    assert all(torch.equal(a, b) for a, b in zip(frozen, member.parameters()))  # the frozen opponent did not learn
+    assert any(not torch.equal(a, b) for a, b in zip(frozen, trainer.net.parameters()))  # the main agent did
+    assert not any(p.requires_grad for p in member.parameters()) and all(p.requires_grad for p in trainer.net.parameters())
+    rated = trainer.pool.members[0]
+    assert rated.net is member and trainer.pool.main_elo != 1200.0 and trainer.pool.main_elo + rated.elo == pytest.approx(2400.0)  # one game
+    assert len(trainer.pool) == 2 and second["pool"][0][0] == 1 and second["hands_vs_pool"] > 0 and first["hands_vs_pool"] == 0
+    for record in (first, second):
+        assert all(np.isfinite(record[k]) for k in ("policy", "value", "entropy", "kl", "elo", "samples_per_second"))
+        assert record["batch"] >= 500 and 0.0 < record["entropy"] <= np.log(4) and sum(record["actions"]) == pytest.approx(1.0)
+    assert second["samples"] == first["batch"] + second["batch"] == trainer.samples and trainer.log == [first, second]
+
+
+def test_checkpoint_round_trip_and_cli(tmp_path):
+    import json
+
+    from headsup.alphaholdem.train import Trainer, main
+
+    out = tmp_path / "run"
+    args = ["--out", str(out), "--envs", "48", "--samples", "400", "--epochs", "1", "--minibatch", "200", "--channels", "8",
+            "--conv-layers", "1", "--hidden", "32", "--pool", "2", "--snapshot-every", "1", "--eval-every", "2", "--eval-hands", "300",
+            "--checkpoint-every", "1", "--device", "cpu"]
+    main(args + ["--iterations", "2"])
+    assert {p.name for p in out.iterdir()} >= {"checkpoint.pt", "policy.pth", "log.json"}
+    log = json.loads((out / "log.json").read_text())
+    assert [r["iteration"] for r in log["log"]] == [1, 2] and log["config"]["samples"] == 400
+    assert set(log["log"][1]["eval"]) == {"random", "call", "allin"} and len(log["log"][1]["eval"]["call"]) == 2  # mean, se
+    assert "eval" not in log["log"][0]
+    a = Trainer.resume(out, device="cpu")
+    b = Trainer.resume(out, device="cpu")
+    assert a.iteration == 2 and a.samples == log["log"][1]["samples"] and a.cfg["hidden"] == 32 and len(a.pool) == 2
+    saved = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=False)
+    for k, v in a.net.state_dict().items():
+        assert torch.equal(v, saved["net"][k])
+    assert [(m.iteration, m.elo) for m in a.pool.members] == [(m["iteration"], m["elo"]) for m in saved["pool"]["members"]]
+    assert a.pool.main_elo == saved["pool"]["main_elo"] and a.log == log["log"]
+    moments = [s["exp_avg"] for s in a.opt.state_dict()["state"].values()]
+    assert len(moments) == len(list(a.net.parameters())) and any(m.abs().sum() > 0 for m in moments)  # Adam's state came along
+    assert all(torch.equal(x, y) for x, y in zip(moments, [s["exp_avg"] for s in saved["opt"]["state"].values()]))
+    ra, rb = a.iterate(), b.iterate()  # the same checkpoint continues the same way
+    assert ra["batch"] == rb["batch"] and ra["policy"] == pytest.approx(rb["policy"], rel=1e-4) and a.iteration == 3
+    main(args + ["--iterations", "3", "--resume"])
+    log = json.loads((out / "log.json").read_text())
+    assert [r["iteration"] for r in log["log"]] == [1, 2, 3]
+    with pytest.raises(SystemExit):
+        main(args + ["--iterations", "3"])  # an existing run is not overwritten without --resume
+
+
+# ---------------------------------------------------------------------------------------------- player
+def _decision_observations(hands=120, seed=5):
+    return np.stack([d["obs"] for d in _random_hands(DEFAULT_GAME, hands, seed)[0]])
+
+
+def test_player_probabilities_legality_and_batching(tmp_path):
+    from headsup.alphaholdem.model import AlphaNet
+    from headsup.alphaholdem.player import AlphaHoldemPlayer
+    from headsup.players import make_player
+
+    torch.manual_seed(3)
+    net = AlphaNet(DEFAULT_GAME, channels=8, conv_layers=1, hidden=32)
+    with torch.no_grad():
+        net.policy_head.weight.mul_(100.0)  # a peaked policy, with the fold often on top
+        net.policy_head.bias[0] = 5.0
+    path = tmp_path / "policy.pth"
+    net.save(path)
+    obs = _decision_observations()
+    legal = legal_mask_from_obs(obs, DEFAULT_GAME)
+    player = make_player(f"alpha:{path}", device="cpu", seed=0)
+    assert isinstance(player, AlphaHoldemPlayer) and player.game.tree_dict() == DEFAULT_GAME.tree_dict()
+    assert not getattr(player, "wants_ids", False)
+    probs = player.probs(obs)
+    assert probs.shape == (len(obs), 4) and probs.dtype == np.float32
+    np.testing.assert_allclose(probs.sum(axis=1), 1.0, atol=1e-5)
+    assert (probs[~legal] == 0).all() and (~legal).any() and (probs >= 0).all()
+    # stateless: the same answer for a batch, row by row, in chunks and with ids
+    rows = np.concatenate([player.probs(obs[i : i + 1]) for i in range(0, len(obs), 7)])
+    np.testing.assert_allclose(rows, probs[::7], atol=1e-6)
+    small = AlphaHoldemPlayer(str(path), device="cpu", chunk=50)
+    np.testing.assert_allclose(small.probs(obs, ids=np.arange(len(obs))), probs, atol=1e-6)
+    # sampled actions are legal and follow the probabilities; deterministic = the most likely action
+    counts = np.zeros_like(probs)
+    for _ in range(200):
+        a = player(obs)
+        assert a.shape == (len(obs),) and a.dtype == np.int64 and legal[np.arange(len(obs)), a].all()
+        counts[np.arange(len(obs)), a] += 1
+    assert np.abs(counts / 200 - probs).max() < 0.2 and player.last_probs.shape == probs.shape
+    greedy = make_player(f"alpha:{path}", device="cpu", deterministic=True)
+    np.testing.assert_array_equal(greedy(obs), probs.argmax(axis=1))
+    # terminal observations (after an opponent's open-fold in a one-seat env) are answered too
+    e = HeadsUpPoker(rng=np.random.default_rng(0))
+    e.reset()
+    e.step(0)
+    assert player(e.observation(1)[None]).shape == (1,)
+    with pytest.raises(ValueError, match="alpha:<"):
+        make_player("alpha")
+    from headsup.model import BaseModel
+
+    other = tmp_path / "cfr.pth"
+    BaseModel().save(other)
+    with pytest.raises(ValueError, match="AlphaHoldem"):
+        make_player(f"alpha:{other}", device="cpu")
+
+
+def test_evaluation_tools_take_the_player(tmp_path):
+    from headsup import native
+    from headsup.alphaholdem.model import AlphaNet
+    from headsup.compare import head_to_head
+
+    torch.manual_seed(0)
+    path = tmp_path / "policy.pth"
+    AlphaNet(DEFAULT_GAME, channels=8, conv_layers=1, hidden=32).save(path)
+    mean, se = head_to_head(f"alpha:{path}", "call", 400, num_envs=64, seed=0, device="cpu")
+    assert np.isfinite(mean) and se > 0
+    if native.available():
+        from headsup.lbr import LocalBestResponse
+
+        lbr = LocalBestResponse(f"alpha:{path}", num_tables=4, device="cpu", seed=0, mc_samples=20, workers=2)
+        results = lbr.play(4, progress=False)
+        assert len(results) == 4 and np.isfinite(results).all() and lbr.summary(results)["policy"] == f"alpha:{path}"
+    from headsup.web.session import bot_label
+
+    assert bot_label("alpha:runs/x/policy.pth") == "AlphaHoldem · policy.pth"

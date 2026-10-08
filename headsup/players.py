@@ -325,7 +325,8 @@ def make_player(spec: str, device=None, deterministic=False, seed=None, game=Non
     ``iterate:path/iterates.pt[@t<N>]`` (the current strategy of iteration N - regret matching on that
     iteration's advantage nets; default: the last one) | ``search:<blueprint spec>[@it<N>][@focus<f>]
     [@cont<policy|iterate|bank>][@thin<K>]`` (real-time subgame search on top of the blueprint) |
-    ``tab:path.pt[@current]`` (tabular MCCFR blueprint over the card abstraction, headsup.blueprint)
+    ``tab:path.pt[@current]`` (tabular MCCFR blueprint over the card abstraction, headsup.blueprint) |
+    ``alpha:path/policy.pth`` (AlphaHoldem conv-net policy, headsup.alphaholdem)
     """
     from headsup.paths import DEFAULT_BLUEPRINT_PATH, DEFAULT_POLICY_PATH
 
@@ -370,6 +371,14 @@ def make_player(spec: str, device=None, deterministic=False, seed=None, game=Non
 
         path, current = parse_tab_spec(arg)
         return TabularPlayer(path or DEFAULT_BLUEPRINT_PATH, current=current, seed=seed)
+    if kind == "alpha":
+        from headsup.alphaholdem.player import AlphaHoldemPlayer
+        from headsup.device import get_device
+
+        if not arg:
+            raise ValueError("alpha:<policy.pth> needs the trained network's path (headsup.alphaholdem.train)")
+        device = get_device(device) if not hasattr(device, "type") else device
+        return AlphaHoldemPlayer(arg, device=device, deterministic=deterministic, seed=seed)
     if kind == "iterate":
         import torch
 
