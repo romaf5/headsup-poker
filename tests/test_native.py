@@ -124,3 +124,151 @@ def test_engine_config_is_validated():
     cfg.limit, cfg.num_rounds, cfg.has_all_in, cfg.bet_sizes = [100], 2, False, [-2.0]  # one increment for two rounds
     with pytest.raises((RuntimeError, ValueError), match="round"):
         cpp.Engine(cfg)
+
+
+def _net(game, **config):
+    import torch
+
+    from headsup.model import BaseModel
+
+    torch.manual_seed(0)
+    return native.make_model(BaseModel(game=game, dim=8, **config).numpy_weights())
+
+
+def test_samplers_and_envs_reject_networks_that_do_not_fit_the_game():
+    """A network with fewer outputs than the game has actions left the tail of the output buffer uninitialised
+    (used as advantages / baseline values / logits); only run_traversals checked the head size."""
+    from headsup.game import DEFAULT_GAME, GameConfig
+
+    cpp = native.module()
+    pot = GameConfig(bet_sizes=(0.5, 1.0, 2.0), mask_redundant=True)  # 6 actions
+    n4, n6 = _net(DEFAULT_GAME, features="history"), _net(pot, features="history")
+    b4, b6 = _net(DEFAULT_GAME, features="history", opp_cards=True), _net(pot, features="history", opp_cards=True)
+    cfg6 = native.engine_config(game=pot)
+    wrong = (RuntimeError, ValueError)
+    with pytest.raises(wrong, match="outputs"):
+        cpp.run_dream(n6, n6, b4, 0, 5, 1.0, 0.5, 0, cfg6)
+    with pytest.raises(wrong, match="outputs"):
+        cpp.run_dream(n4, n4, b6, 0, 5, 1.0, 0.5, 0, cfg6)
+    with pytest.raises(wrong, match="outputs"):
+        cpp.run_escher_values(n4, n4, 5, 0, cfg6, 0.01)
+    with pytest.raises(wrong, match="outputs"):
+        cpp.run_escher_regrets(n6, n6, b4, 0, 5, 1.0, 0, cfg6)
+    with pytest.raises(wrong, match="opp_cards"):
+        cpp.run_traversals(b6, b6, 0, 5, 1.0, 0, cfg6)  # a history-input (86-wide) net as advantage net overflowed the stack
+    with pytest.raises(wrong, match="opp_cards"):
+        cpp.run_escher_regrets(n6, n6, n6, 0, 5, 1.0, 0, cfg6)  # the value net must read both players' cards
+    env = cpp.VecEnv(4, 0, cfg6, True)
+    with pytest.raises(wrong, match="outputs"):
+        env.set_opponent_model(n4, False)
+    env.set_opponent_model(n6, False)
+    assert len(cpp.run_dream(n6, n6, b6, 0, 5, 1.0, 0.5, 0, cfg6)) == 8  # the fitting combination still runs
+
+
+def test_subgame_solver_ignores_range_weight_on_board_blocked_hands():
+    """SubgameSolver kept range weight on hands that contain a board card (VectorSolver zeroes them): run() then
+    dealt such hands and evaluated 7 cards with a duplicate."""
+    cpp = native.module()
+    deck = [0, 14, 28, 42, 5, 19, 33, 47, 9]
+    e = cpp.Engine()
+    e.reset(deck)
+    for _ in range(6):
+        e.step(1)  # check / call to the river
+    a = np.array([x for x in range(52) for y in range(x + 1, 52)])
+    b = np.array([y for x in range(52) for y in range(x + 1, 52)])
+    blocked = np.isin(a, deck[4:9]) | np.isin(b, deck[4:9])
+    sv = cpp.SubgameSolver()
+    sv.build(e)
+    ones = np.ones(1326, np.float32)
+    sv.set_ranges(ones, ones)
+    sv.run(20000, 1)
+    s = sv.root_strategy()
+    assert not (np.abs(s[blocked] - s[blocked][0]).sum(1) > 0).any()  # blocked hands were never dealt, never updated
+
+
+def test_bindings_reject_out_of_range_arguments():
+    """Arguments that index C arrays are checked at the binding (each of these read or wrote out of bounds)."""
+    from headsup.game import DEFAULT_GAME
+
+    cpp = native.module()
+    bad = (RuntimeError, ValueError)
+    e = cpp.Engine()
+    with pytest.raises(bad, match="deck"):
+        e.reset([0, 1, 2, 3, 4, 5, 6, 7, 7])  # a duplicated card
+    with pytest.raises(bad, match="deck"):
+        e.reset([0, 1, 2, 3, 4, 5, 6, 7, 52])
+    e.reset(list(range(9)))
+    with pytest.raises(bad, match="seat"):
+        e.observation(5)
+    with pytest.raises(bad, match="raise"):
+        e.raise_amount(0)
+    net = _net(DEFAULT_GAME, features="history")
+    with pytest.raises(bad, match="features"):
+        net.forward(np.zeros(31, np.float32))  # a history net reads 79 features
+    for _ in range(6):
+        e.step(1)  # to the river
+    sv = cpp.VectorSolver()
+    sv.build(e, 50)
+    with pytest.raises(bad, match="freeze"):
+        sv.freeze(0, 1326, 1)
+    with pytest.raises(bad, match="freeze"):
+        sv.freeze(0, 0, 9)
+    unbuilt = cpp.SubgameSolver()
+    unbuilt.set_ranges(np.ones(1326, np.float32), np.ones(1326, np.float32))
+    with pytest.raises(bad, match="build"):
+        unbuilt.run(10, 0)
+
+
+def test_network_forward_clamps_index_features_like_the_torch_model():
+    """A corrupted observation (card id 400, stage 9) indexed outside the embedding tables in C++; the torch model
+    clamps - both must give the same output."""
+    import torch
+
+    from headsup.game import DEFAULT_GAME
+    from headsup.model import BaseModel
+
+    torch.manual_seed(0)
+    model = BaseModel(game=DEFAULT_GAME, dim=8, features="history")
+    with torch.no_grad():
+        torch.nn.init.normal_(model.action_head.weight, std=0.5)
+    net = native.make_model(model.numpy_weights())
+    e = native.module().Engine()
+    e.reset(list(range(9)))
+    obs = np.asarray(e.observation(0)).copy()
+    obs[0:3] = (40.0, 9.0, 400.0)  # rank / suit / card of the first hole card
+    obs[21] = 9.0
+    with torch.no_grad():
+        want = model(torch.from_numpy(obs[None])).numpy()[0]
+    np.testing.assert_allclose(np.asarray(net.forward(obs)), want, atol=1e-5)
+
+
+def test_blueprint_abstraction_arguments_are_checked():
+    """Edges / centroids of the wrong size overflowed the per-round tables later (in traverse / nearest_centroid);
+    card ids outside the deck indexed the evaluator's tables; an unfitted abstraction was dereferenced."""
+    from headsup.game import DEFAULT_GAME
+
+    cpp = native.module()
+    bad = (RuntimeError, ValueError)
+    bp = cpp.TabularBlueprint()
+    bp.build(native.engine_config(game=DEFAULT_GAME), 8, 20)
+    with pytest.raises(bad, match="fit"):
+        bp.bucket(1, 0, 1, [10, 11, 12])  # nothing fitted yet
+    with pytest.raises(bad, match="situations"):
+        bp.fit_abstraction(0)
+    with pytest.raises(bad, match="edges"):
+        bp.edges = [[], [0.1] * 20, [0.5] * 7, [0.5] * 7]  # 20 edges for 8 buckets
+    with pytest.raises(bad, match="edges"):
+        bp.edges = [[], [0.9, 0.1, 0.5, 0.6, 0.7, 0.8, 0.95], [0.5] * 7, [0.5] * 7]  # not sorted
+    bp.edges = [[], [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]] + [[0.5] * 7] * 2
+    assert 0 <= bp.bucket(1, 0, 1, [10, 11, 12]) < 8
+    for cards in ((0, 60, [10, 11, 12]), (0, 0, [10, 11, 12]), (0, 1, [1, 11, 12]), (0, 1, [10, 11, -3])):
+        with pytest.raises(bad, match="cards"):
+            bp.bucket(1, *cards)
+        with pytest.raises(bad, match="cards"):
+            bp.ehs(*cards)
+        with pytest.raises(bad, match="cards"):
+            cpp.equity_vs_all(cards[0], cards[1], cards[2], 100, 1000, 0, 5)
+    table = cpp.TabularBlueprint()
+    table.build(native.engine_config(game=DEFAULT_GAME), 8, 20, "table", 10)
+    with pytest.raises(bad, match="centroids"):
+        table.centroids = [[], [0.5] * 6, [0.5] * 16, [0.5] * 16]  # 3 centroids for 8 buckets

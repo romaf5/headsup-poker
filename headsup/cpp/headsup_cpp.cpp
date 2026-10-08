@@ -40,6 +40,7 @@ constexpr int OBS_DIM_HISTORY = HISTORY_OFFSET + HISTORY_DIM;  // 79
 constexpr int RAISES_INDEX = OBS_DIM_HISTORY;                  // consecutive raises on this street
 constexpr int OBS_DIM = OBS_DIM_HISTORY + 1;                   // 80
 constexpr int MAX_ACTIONS = 8;  // FOLD, CHECK_CALL, up to 5 raise sizes, ALL_IN (headsup/game.py: MAX_ACTIONS)
+inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 constexpr int NUM_CARDS = 52;
 enum Action { FOLD = 0, CHECK_CALL = 1, RAISE = 2 };  // raise sizes are 2 .. num_actions-2, all-in = num_actions-1
 enum Stage { PREFLOP = 0, FLOP = 1, TURN = 2, RIVER = 3, END = 4 };
@@ -429,7 +430,9 @@ struct Model {
       std::memset(x, 0, sizeof(float) * n_groups * D);
       for (int s = 0; s < n_slots; ++s) {
         const int g = GROUP_OF_SLOT[s], tbl = per_group ? g : 0, o = slot_offset(s);
-        const int r = int(obs[o]), su = int(obs[o + 1]), c = int(obs[o + 2]);
+        // index features are clamped as in the torch model (a corrupted or terminal observation must not read
+        // outside the embedding tables)
+        const int r = clampi(int(obs[o]), 0, 13), su = clampi(int(obs[o + 1]), 0, 4), c = clampi(int(obs[o + 2]), 0, NUM_CARDS);
         const float* er = rank_emb[tbl].data() + size_t(r) * D;
         const float* es = suit_emb[tbl].data() + size_t(su) * D;
         const float* ec = card_emb[tbl].data() + size_t(c) * D;
@@ -440,7 +443,7 @@ struct Model {
     } else {  // Linear on concatenated one-hot cards == bias + sum of the selected weight columns
       std::memcpy(c1, onehot_b.data(), sizeof(float) * D);
       for (int s = 0; s < n_slots; ++s) {
-        const float* row = onehot_t.data() + (size_t(s) * CARD_CLASSES + int(obs[slot_offset(s) + 2])) * D;
+        const float* row = onehot_t.data() + (size_t(s) * CARD_CLASSES + clampi(int(obs[slot_offset(s) + 2]), 0, NUM_CARDS)) * D;
         for (int i = 0; i < D; ++i) c1[i] += row[i];
       }
     }
@@ -454,7 +457,7 @@ struct Model {
     float s2[MAX_DIM];
     if (arch == CURRENT) {
       float se[2 * MAX_DIM], s1[MAX_DIM];
-      const int st = int(obs[21]), fa = int(obs[22]);
+      const int st = clampi(int(obs[21]), 0, 3), fa = clampi(int(obs[22]), 0, 1);
       std::memcpy(se, stage_emb.data() + size_t(st) * D, sizeof(float) * D);
       std::memcpy(se + D, first_emb.data() + size_t(fa) * D, sizeof(float) * D);
       stage_fc[0].apply(se, s1);
@@ -745,14 +748,26 @@ py::array_t<bool> to_bool_array(std::vector<uint8_t>& v, ssize_t rows, ssize_t c
   return out;
 }
 
+// A network must fit the game it is used in: as many outputs as the game has actions (with fewer, the tail of the
+// output buffer stayed uninitialised and was used as advantages / values / logits) and the right input - strategy
+// nets read one seat's observation, value nets (opp_cards) both players' cards.
+inline void check_net(const Model& m, const EngineConfig& cfg, bool value_net, const char* what) {
+  if (m.num_actions != cfg.num_actions())
+    throw std::invalid_argument(std::string(what) + ": the network has " + std::to_string(m.num_actions) + " outputs, the game " +
+                                std::to_string(cfg.num_actions()) + " actions");
+  if (m.opp_cards != value_net)
+    throw std::invalid_argument(std::string(what) + (value_net ? ": needs an opp_cards network (both players' cards)"
+                                                               : ": an opp_cards network cannot be used here"));
+}
+
 py::tuple run_traversals(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, int traverser, int n_traversals,
                          float t, uint64_t seed, EngineConfig cfg, py::object decks_obj) {
   Traverser tr;
   tr.nets[0] = net0.get();
   tr.nets[1] = net1.get();
+  check_net(*net0, cfg, false, "advantage net (seat 0)");
+  check_net(*net1, cfg, false, "advantage net (seat 1)");
   if (net0->obs_dim != net1->obs_dim) throw std::runtime_error("both networks must read the same observation width");
-  if (net0->num_actions != cfg.num_actions() || net1->num_actions != cfg.num_actions())
-    throw std::runtime_error("the networks' action heads do not match the game's number of actions");
   tr.adv.obs_dim = tr.strat.obs_dim = net0->obs_dim;
   tr.adv.num_actions = tr.strat.num_actions = cfg.num_actions();
   tr.traverser = traverser;
@@ -949,7 +964,9 @@ struct TrajectorySampler {
 
 py::tuple run_dream(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, std::shared_ptr<Model> baseline, int traverser,
                     int n_traversals, float t, float epsilon, uint64_t seed, EngineConfig cfg, py::object decks_obj) {
-  if (!baseline->opp_cards) throw std::runtime_error("the DREAM baseline must be an opp_cards (history-input) network");
+  check_net(*net0, cfg, false, "advantage net (seat 0)");
+  check_net(*net1, cfg, false, "advantage net (seat 1)");
+  check_net(*baseline, cfg, true, "DREAM baseline");
   TrajectorySampler ts;
   ts.nets[0] = net0.get(); ts.nets[1] = net1.get(); ts.value = baseline.get();
   ts.traverser = traverser; ts.t = t; ts.epsilon = epsilon;
@@ -983,6 +1000,8 @@ py::tuple run_dream(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, st
 
 py::tuple run_escher_values(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, int n_trajectories, uint64_t seed, EngineConfig cfg,
                             float value_epsilon) {
+  check_net(*net0, cfg, false, "regret net (seat 0)");
+  check_net(*net1, cfg, false, "regret net (seat 1)");
   TrajectorySampler ts;
   ts.nets[0] = net0.get(); ts.nets[1] = net1.get();
   ts.value_epsilon = value_epsilon;
@@ -1003,7 +1022,9 @@ py::tuple run_escher_values(std::shared_ptr<Model> net0, std::shared_ptr<Model> 
 
 py::tuple run_escher_regrets(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, std::shared_ptr<Model> vnet, int traverser,
                              int n_trajectories, float t, uint64_t seed, EngineConfig cfg) {
-  if (!vnet->opp_cards) throw std::runtime_error("the ESCHER value net must be an opp_cards (history-input) network");
+  check_net(*net0, cfg, false, "regret net (seat 0)");
+  check_net(*net1, cfg, false, "regret net (seat 1)");
+  check_net(*vnet, cfg, true, "ESCHER value net");
   TrajectorySampler ts;
   ts.nets[0] = net0.get(); ts.nets[1] = net1.get(); ts.value = vnet.get();
   ts.traverser = traverser; ts.t = t;
@@ -1594,7 +1615,28 @@ struct SubgameSolver {
   // only concentrates the hero's updates on the infosets it will actually play; the villain's
   // traversals always deal the hero from its range, so the villain still answers the whole range
   // and cannot exploit knowledge of the real hand.
+  // hands that contain a known board card cannot be held: no range weight (as VectorSolver::set_ranges)
+  void mask_blocked_hands() {
+    if (nodes.empty() || range[0].empty()) return;
+    bool onboard[NUM_CARDS] = {};
+    for (int i = 0; i < known_board; ++i) onboard[nodes[0].state.board[i]] = true;
+    for (int s = 0; s < 2; ++s) {
+      double acc = 0.0;
+      for (int h = 0; h < NUM_COMBOS; ++h) {
+        int a, b;
+        combo_cards(h, a, b);
+        if (onboard[a] || onboard[b]) range[s][h] = 0.0f;
+        acc += std::max(0.0, double(range[s][h]));
+        cum[s][h] = acc;
+      }
+      if (acc <= 0) throw std::runtime_error("empty range (every hand is blocked by the board)");
+    }
+  }
+
   void run(int iterations, uint64_t seed, int hero_seat = 0, int hero_hand = -1, double focus = 0.0) {
+    if (nodes.empty()) throw std::runtime_error("build the subgame first");
+    if (hero_seat < 0 || hero_seat > 1 || hero_hand >= NUM_COMBOS) throw std::invalid_argument("hero_seat must be 0 or 1, hero_hand a combo index");
+    mask_blocked_hands();
     rng.seed(seed);
     hero = hero_seat;
     if (variant == 1) prepare_discounts(iteration + iterations);
@@ -1643,6 +1685,7 @@ struct SubgameSolver {
   // the average-strategy sums are reset (they were accumulated under the pre-action ranges).
   void warm_start(const SubgameSolver& prev, int old_root, int weight = 2000) {
     if (prev.n_actions != n_actions) throw std::runtime_error("warm start: different games");
+    if (old_root < 0 || old_root >= int(prev.nodes.size()) || nodes.empty()) throw std::invalid_argument("warm start: bad root / unbuilt solver");
     if (prev.iteration <= 0) return;
     const double scale = double(weight) / double(prev.iteration);
     std::vector<std::pair<int, int>> stack = {{0, old_root}};
@@ -2000,6 +2043,7 @@ struct VectorSolver {
 
   void freeze(int node, int hand, int action) {
     if (node < 0 || node >= int(nodes.size()) || nodes[node].kind != 0) throw std::runtime_error("freeze: not a decision node");
+    if (hand < 0 || hand >= NUM_COMBOS || action < 0 || action >= n_actions) throw std::invalid_argument("freeze: bad hand or action index");
     if (node_round[node] != root_round) throw std::runtime_error("freeze: only root-round nodes (per-hand infosets)");
     if (!nodes[node].legal[action]) throw std::runtime_error("freeze: illegal action");
     frozen.push_back({node, hand, action});
@@ -2816,6 +2860,30 @@ double bench_forward(const Model& m, int n) {
 
 }  // namespace hp
 
+// binding helpers: card ids index the evaluator's tables, so they are checked where they enter
+inline void check_cards(const std::vector<int>& cards, bool distinct = true) {
+  bool seen[hp::NUM_CARDS] = {};
+  for (int c : cards) {
+    if (c < 0 || c >= hp::NUM_CARDS || (distinct && seen[c])) throw std::invalid_argument("cards must be distinct ids in 0..51");
+    seen[c] = true;
+  }
+}
+inline void check_cards(int c0, int c1, const std::vector<int>& board) {
+  std::vector<int> all = {c0, c1};
+  all.insert(all.end(), board.begin(), board.end());
+  if (board.size() > 5) throw std::invalid_argument("cards: the board has at most 5 cards");
+  check_cards(all);
+}
+
+// a post-flop bucket lookup needs the fitted (or loaded) abstraction of that round and the round's board
+inline void check_round(const hp::TabularBlueprint& b, int round, size_t board_cards) {
+  if (round < 0 || round >= b.abs.rounds) throw std::invalid_argument("round must be in 0.." + std::to_string(b.abs.rounds - 1));
+  if (round == 0) return;
+  if (board_cards < size_t(hp::BOARD_CARDS_BY_STAGE[round])) throw std::invalid_argument("cards: the board of this round is incomplete");
+  const auto& tables = b.abs.table_mode ? b.abs.centroids : b.abs.edges;
+  if (int(tables.size()) <= round || (b.abs.table_mode && tables[round].empty())) throw std::runtime_error("fit_abstraction (or load one) first");
+}
+
 PYBIND11_MODULE(headsup_cpp, m) {
   using namespace hp;
   m.doc() = "C++ kernels for headsup-poker";
@@ -2868,6 +2936,11 @@ PYBIND11_MODULE(headsup_cpp, m) {
       .def("reset",
            [](Engine& e, std::vector<int> deck) {
              if (deck.size() < 9) throw std::runtime_error("deck needs >= 9 cards");
+             bool seen[NUM_CARDS] = {};
+             for (int i = 0; i < 9; ++i) {
+               if (deck[i] < 0 || deck[i] >= NUM_CARDS || seen[deck[i]]) throw std::invalid_argument("deck: 9 distinct cards in 0..51");
+               seen[deck[i]] = true;
+             }
              e.reset(deck.data());
            })
       .def("step", [](Engine& e, int a) {
@@ -2880,9 +2953,13 @@ PYBIND11_MODULE(headsup_cpp, m) {
         e.legal_mask(legal);
         return std::vector<bool>(legal, legal + e.num_actions());
       })
-      .def("raise_amount", [](const Engine& e, int a) { return e.raise_amount(a); })
+      .def("raise_amount", [](const Engine& e, int a) {
+        if (!e.cfg.is_raise(a)) throw std::invalid_argument("raise_amount: not a raise action");
+        return e.raise_amount(a);
+      })
       .def("observation",
            [](const Engine& e, int seat) {
+             if (seat < -1 || seat > 1) throw std::invalid_argument("seat must be 0, 1 or -1 (the player to act)");
              py::array_t<float> out(std::vector<ssize_t>{OBS_DIM});
              e.observation(seat, out.mutable_data());
              return out;
@@ -2904,6 +2981,8 @@ PYBIND11_MODULE(headsup_cpp, m) {
       .def_property_readonly("dim", [](const Model& mm) { return mm.dim; })
       .def_property_readonly("rm_argmax", [](const Model& mm) { return mm.rm_argmax; })
       .def("forward", [](const Model& mm, py::array_t<float, py::array::c_style | py::array::forcecast> obs) {
+        if (obs.ndim() < 1 || obs.ndim() > 2 || obs.shape(obs.ndim() - 1) < mm.obs_dim)
+          throw py::value_error("observations need at least " + std::to_string(mm.obs_dim) + " features (1 or 2 dimensions)");
         if (obs.ndim() == 1) {
           py::array_t<float> out(std::vector<ssize_t>{mm.num_actions});
           mm.forward(obs.data(), out.mutable_data());
@@ -2922,6 +3001,7 @@ PYBIND11_MODULE(headsup_cpp, m) {
       [](int c0, int c1, std::vector<int> board, int samples, int max_exact, uint64_t seed, int final_cards) {
         if (final_cards < 3 || final_cards > 5 || int(board.size()) > final_cards)
           throw std::runtime_error("the board has at most final_cards (3..5) cards");
+        check_cards(c0, c1, board);
         py::array_t<float> out(std::vector<ssize_t>{NUM_COMBOS});
         float* ptr = out.mutable_data();
         {
@@ -2953,6 +3033,11 @@ PYBIND11_MODULE(headsup_cpp, m) {
                                    std::vector<bool> rm, std::vector<double> weights) {
         if (nets0.size() != nets1.size() || nets0.size() != rm.size() || nets0.size() != weights.size() || nets0.empty())
           throw std::runtime_error("continuations: need equally many seat-0 nets, seat-1 nets, rm flags and weights");
+        if (!sv.nodes.empty())
+          for (size_t i = 0; i < nets0.size(); ++i) {
+            check_net(*nets0[i], sv.nodes[0].state.cfg, false, "continuation net (seat 0)");
+            check_net(*nets1[i], sv.nodes[0].state.cfg, false, "continuation net (seat 1)");
+          }
         sv.conts.clear();
         sv.cont_cum.clear();
         double acc = 0.0;
@@ -3109,6 +3194,7 @@ PYBIND11_MODULE(headsup_cpp, m) {
         b.abs.completions = completions;
       }, py::arg("cfg"), py::arg("buckets") = 200, py::arg("samples") = 500, py::arg("mode") = "mc", py::arg("completions") = 300)
       .def("fit_abstraction", [](TabularBlueprint& b, int situations, uint64_t seed, int threads) {
+        if (situations < 1) throw std::invalid_argument("situations must be positive");
         py::gil_scoped_release release;
         if (b.abs.table_mode) b.abs.fit_centroids(std::max(1, situations / NUM_COMBOS), seed, std::max(1, threads));
         else b.abs.fit_edges(situations, seed, threads);
@@ -3117,6 +3203,9 @@ PYBIND11_MODULE(headsup_cpp, m) {
       .def_property("centroids", [](const TabularBlueprint& b) { return b.abs.centroids; },
                     [](TabularBlueprint& b, const std::vector<std::vector<float>>& c) {
                       if (int(c.size()) != b.abs.rounds) throw std::runtime_error("centroids: one list per round");
+                      for (size_t r = 1; r < c.size(); ++r)  // nearest_centroid reads `buckets` (mean, std) pairs
+                        if (!c[r].empty() && int(c[r].size()) != 2 * b.abs.buckets)
+                          throw std::invalid_argument("centroids: a round needs buckets x 2 values");
                       b.abs.centroids = c;
                       for (auto& m : b.abs.cache) m.clear();
                     })
@@ -3127,6 +3216,9 @@ PYBIND11_MODULE(headsup_cpp, m) {
         return out;
       })
       .def("features", [](const TabularBlueprint& b, int round, const std::vector<int>& board, uint64_t seed) {
+        if (round < 1 || round >= b.abs.rounds || board.size() < size_t(BOARD_CARDS_BY_STAGE[round]) || board.size() > 5)
+          throw std::invalid_argument("features: a post-flop round and its board");
+        check_cards(board);
         std::mt19937_64 rng(seed);
         int bd[5] = {0, 0, 0, 0, 0};
         for (size_t i = 0; i < board.size() && i < 5; ++i) bd[i] = board[i];
@@ -3158,12 +3250,15 @@ PYBIND11_MODULE(headsup_cpp, m) {
         return std::vector<bool>(nd.legal, nd.legal + b.n_actions);
       })
       .def("bucket", [](const TabularBlueprint& b, int round, int c0, int c1, const std::vector<int>& board, uint64_t seed) {
+        check_cards(c0, c1, board);
+        check_round(b, round, board.size());
         std::mt19937_64 rng(seed);
         int bd[5] = {0, 0, 0, 0, 0};
         for (size_t i = 0; i < board.size() && i < 5; ++i) bd[i] = board[i];
         return b.abs.bucket(round, c0, c1, bd, rng);
       }, py::arg("round"), py::arg("c0"), py::arg("c1"), py::arg("board"), py::arg("seed") = 0)
       .def("ehs", [](const TabularBlueprint& b, int c0, int c1, const std::vector<int>& board, uint64_t seed) {
+        check_cards(c0, c1, board);
         std::mt19937_64 rng(seed);
         int bd[5] = {0, 0, 0, 0, 0};
         for (size_t i = 0; i < board.size() && i < 5; ++i) bd[i] = board[i];
@@ -3181,6 +3276,10 @@ PYBIND11_MODULE(headsup_cpp, m) {
         if (node < 0 || node >= int(b.tree.nodes.size()) || b.tree.nodes[node].kind != 0) throw std::runtime_error("not a decision node");
         if (hands.ndim() != 2 || hands.shape(1) != 2) throw std::runtime_error("hands must be (N, 2)");
         const int n = int(hands.shape(0)), round = b.tree.round[node];
+        // hands may overlap the board (callers substitute all 1326 and weight the impossible ones 0), ids may not leave the deck
+        check_cards(std::vector<int>(hands.data(), hands.data() + hands.size()), false);
+        check_cards(board);
+        check_round(b, round, board.size());
         int bd[5] = {0, 0, 0, 0, 0};
         for (size_t i = 0; i < board.size() && i < 5; ++i) bd[i] = board[i];
         py::array_t<float> out({ssize_t(n), ssize_t(b.n_actions)});
@@ -3224,6 +3323,9 @@ PYBIND11_MODULE(headsup_cpp, m) {
       .def_property("edges", [](const TabularBlueprint& b) { return b.abs.edges; },
                     [](TabularBlueprint& b, const std::vector<std::vector<float>>& e) {
                       if (int(e.size()) != b.abs.rounds) throw std::runtime_error("edges: one list per round");
+                      for (size_t r = 1; r < e.size(); ++r)  // the bucket is the number of edges below the equity: < buckets
+                        if (int(e[r].size()) > b.abs.buckets - 1 || !std::is_sorted(e[r].begin(), e[r].end()))
+                          throw std::invalid_argument("edges: a round has at most buckets - 1 edges, in ascending order");
                       b.abs.edges = e;
                     })
       .def_property("iterations", [](const TabularBlueprint& b) { return b.iteration.load(); },
@@ -3265,6 +3367,7 @@ PYBIND11_MODULE(headsup_cpp, m) {
            })
       .def("set_opponent_model",
            [](VecEnv& v, std::shared_ptr<Model> mdl, bool deterministic) {
+             if (!v.engines.empty()) check_net(*mdl, v.engines[0].cfg, false, "opponent model");
              v.opp_model = std::move(mdl);
              v.opp_kind = VecEnv::MODEL;
              v.opp_deterministic = deterministic;
