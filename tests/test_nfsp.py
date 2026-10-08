@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from headsup.algos.best_response import exploitability
+from headsup.algos.best_response import TabularPolicy, best_response, exploitability
 from headsup.algos.nfsp import PRESETS, Memory, NFSPSolver, cross_entropy, epsilon, make_net, td_target
 from headsup.algos.pdcfr import CHANCE, DECISION, TERMINAL, Tree
 from headsup.games import make_game
@@ -154,7 +154,7 @@ def test_mlp_depth_and_width():
 
 
 @pytest.mark.parametrize("arch,policy", _NETS)
-@pytest.mark.parametrize("clip", [0.0, 0.05])
+@pytest.mark.parametrize("clip", [0.0, 0.05, 1000.0])  # none, far below the gradient norm, far above it
 def test_network_step_is_sgd_with_gradient_norm_clipping(arch, policy, clip):
     """backward() + step() against torch autograd + clip_grad_norm_ + torch.optim.SGD, for an arbitrary loss gradient."""
     g, tree = make_game("leduc"), _tree("leduc")
@@ -225,6 +225,40 @@ def _spy_actions(s):
     return calls
 
 
+@pytest.mark.parametrize("game,widths", [("kuhn", [2, 6]), ("leduc", [4, 5, 30])])
+def test_deals_follow_the_chance_probabilities(game, widths):
+    """A new hand is ONE draw over all deals (the two private cards are two chance nodes in a row) and a board card
+    one draw over the remaining cards - each outcome with the game's probability."""
+    from headsup.algos.nfsp import chance_closure
+
+    s = _solver("paper", game=game)
+    tree = s.tree
+    row, outcome, cum = chance_closure(tree)
+    chance = np.flatnonzero(tree.kind == CHANCE)
+    assert (row[chance] >= 0).all() and (row[tree.kind != CHANCE] == -1).all() and len(set(row[chance].tolist())) == len(chance)
+    seen = set()
+    for c in chance:
+        width = int((cum[row[c]] <= 1.0).sum())
+        nodes, probs = outcome[row[c], :width], np.diff(cum[row[c], :width], prepend=0.0)
+        assert (tree.kind[nodes] != CHANCE).all() and len(set(nodes.tolist())) == width and cum[row[c], width - 1] == 1.0
+        np.testing.assert_allclose(probs, 1.0 / width, atol=1e-12)  # every deal of these games is uniform
+        seen.add(width)
+    deals = widths[-1]
+    assert sorted(seen) == widths and int((cum[row[0]] <= 1.0).sum()) == deals  # second card, [board card,] both private cards
+    start = s._deal(np.zeros(60_000, dtype=np.int64))
+    nodes, counts = np.unique(start, return_counts=True)
+    assert len(nodes) == deals and (tree.kind[nodes] == DECISION).all() and (tree.player[nodes] == 0).all()
+    assert np.abs(counts - 60_000 / deals).max() < 5 * (60_000 / deals) ** 0.5  # uniform over the deals
+    if game == "leduc":
+        c = int(next(i for i in chance if i > 0 and int((cum[row[i]] <= 1.0).sum()) == 4))  # a board card
+        nodes, counts = np.unique(s._deal(np.full(20_000, c, dtype=np.int64)), return_counts=True)
+        assert sorted(nodes.tolist()) == sorted(tree.chance_child[c][tree.chance_child[c] >= 0].tolist()) and len(nodes) == 4
+        assert np.abs(counts - 5000).max() < 400
+    mixed = np.array([0, start[0], start[1], 0])  # decision nodes are left alone
+    dealt = s._deal(mixed.copy())
+    assert dealt[1] == start[0] and dealt[2] == start[1] and tree.kind[dealt[0]] == DECISION and tree.kind[dealt[3]] == DECISION
+
+
 def test_acting_uses_each_players_own_networks_over_the_legal_actions():
     s = _solver("paper")
     tree = s.tree
@@ -277,7 +311,7 @@ def test_exploration_is_uniform_over_the_legal_actions(shared):
 
 def test_mode_is_drawn_per_hand_and_seat_and_held():
     s = _solver("paper", eta=0.3, envs=64, steps=64)
-    assert s.br.shape == (64, 2) and s.br.dtype == bool
+    assert s.br.shape == (64, 2) and s.br.dtype == bool and 0.15 < s.br.mean() < 0.45  # the first hands draw their modes too
     drawn, mixed, steps = [s.br.copy()], 0, 0
     for _ in range(500):
         before = s.br.copy()
@@ -473,8 +507,9 @@ def test_target_refit_is_counted_in_q_updates_per_player():
 def test_no_update_before_a_minibatch_is_stored():
     s = _solver("paper", eta=0.5)
     before = [n.state_dict() for n in s.Q + s.Pi]
-    s._play()  # one decision per table: fewer than 128 rows per player
-    assert all(m.size < s.batch for m in s.rl_memory + s.sl_memory) and s.sl_memory[0].size > 0
+    s._play()  # two decisions per table: some rows for every memory, fewer than a minibatch (128)
+    s._play()
+    assert all(0 < m.size < s.batch for m in s.rl_memory + s.sl_memory)
     assert not any([s._update_q(0), s._update_q(1), s._update_pi(0), s._update_pi(1)]) and s.q_updates == [0, 0]
     for net, state in zip(s.Q + s.Pi, before):
         assert all(np.array_equal(net.w[k], state[k]) for k in state)
@@ -482,6 +517,82 @@ def test_no_update_before_a_minibatch_is_stored():
         s._play()
     assert all([s._update_q(0), s._update_q(1), s._update_pi(0), s._update_pi(1)]) and s.q_updates == [1, 1]
     assert not any(np.array_equal(net.w[k], state[k]) for net, state in zip(s.Q + s.Pi, before) for k in state)
+
+
+def _exact_action_values(tree, game, opponent, p):
+    """Player p's action values at its infosets against the behaviour table ``opponent``, p best-responding below
+    (the fixed point of Q-learning there), and the infosets' reach by chance and the opponent."""
+    _, response = best_response(game, TabularPolicy(game, {k: opponent[i] for i, k in enumerate(tree.info_keys)}), p)
+    sigma = opponent.copy()
+    for i, key in enumerate(tree.info_keys):
+        if tree.info_player[i] == p and key in response:
+            sigma[i] = response[key]
+    v = tree.values(sigma) * (1.0 if p == 0 else -1.0)
+    reach = np.zeros(tree.num_nodes)
+    reach[0] = 1.0
+    num, den = np.zeros(tree.info_legal.shape), np.zeros(tree.num_infosets)
+    for i in range(tree.num_nodes):
+        if tree.kind[i] == CHANCE:
+            k = tree.chance_child[i] >= 0
+            reach[tree.chance_child[i, k]] = reach[i] * tree.chance_prob[i, k]
+        elif tree.kind[i] == DECISION:
+            a, info = tree.legal[i], tree.info[i]
+            if tree.player[i] == p:
+                reach[tree.child[i, a]] = reach[i]
+                num[info, a] += reach[i] * v[tree.child[i, a]]
+                den[info] += reach[i]
+            else:
+                reach[tree.child[i, a]] = reach[i] * opponent[info, a]
+    return num / np.maximum(den, 1e-300)[:, None], den
+
+
+@pytest.mark.parametrize("preset", ["paper", "dream"])
+@pytest.mark.parametrize("learner", [0, 1])
+def test_q_learning_finds_the_best_response_to_a_fixed_opponent(preset, learner):
+    """The reinforcement-learning half on its own, through play, M_RL, targets and updates: against an opponent that
+    always plays one known policy, a seat's Q converges to the exact best-response action values (in its reward unit)
+    and its greedy action is the best response everywhere.  Either seat: the rewards' sign, the seat's own next
+    infoset, the end of the hand."""
+    s = _solver(preset, seed=0, eta=0.5, eps_start=0.3, eps_const=0.0)  # the learner: eps-greedy Q or its (untrained) Pi
+    tree = s.tree
+    logits = np.log([0.2, 0.5, 0.3])
+    _constant(s.Pi[1 - learner], logits)
+    fixed = np.where(tree.info_legal, np.exp(logits), 0.0)
+    fixed /= fixed.sum(1, keepdims=True)
+    for _ in range(800):
+        s._play()
+        s.br[:, 1 - learner] = False  # the opponent never plays its Q
+        s._update_q(learner)
+        s._update_q(learner)
+    exact, reach = _exact_action_values(tree, s.game, fixed, learner)
+    mine = np.flatnonzero((tree.info_player == learner) & (reach > 0))
+    legal = tree.info_legal[mine]
+    q = s.Q[learner].forward(tree.info_obs[mine], legal) * s.reward_scale
+    error = np.abs(q - exact[mine])[legal]
+    mean, worst = (0.15, 0.6) if preset == "paper" else (0.25, 0.8)  # 6 seeds: up to 0.07, 0.36 (paper) / 0.17, 0.52 (dream) antes
+    assert len(mine) == 6 and error.mean() < mean and error.max() < worst, (error.mean(), error.max())
+    greedy = np.where(legal, q, -np.inf).argmax(1)
+    regret = np.where(legal, exact[mine], -np.inf).max(1) - exact[mine][np.arange(6), greedy]
+    assert regret.max() < 0.2 and (regret == 0).sum() >= 5, regret  # greedy = the best response (one near-tie of 0.14 apart)
+    assert np.abs(exact[mine][legal]).max() > 1.2 and s.q_updates[1 - learner] == 0
+
+
+def test_supervised_learning_averages_the_best_response_behaviour():
+    """The supervised half on its own: with every hand in best-response mode and a constant Q, Pi learns the eps-greedy
+    behaviour that M_SL recorded - the exploratory actions included."""
+    s = _solver("paper", seed=0, eta=1.0, eps_start=0.3, eps_const=0.0, lr_pi=0.05)
+    tree = s.tree
+    for p in (0, 1):
+        _constant(s.Q[p], [1.0, 3.0, 2.0])  # greedy: call, legal everywhere
+    for _ in range(1500):
+        s._play()
+        for p in (0, 1):
+            s._update_pi(p)
+    want = 0.7 * np.eye(3)[1] + 0.3 * tree.info_legal / tree.info_legal.sum(1, keepdims=True)
+    table = s.average_policy().table
+    got = np.stack([table[k] for k in tree.info_keys])
+    assert np.abs(got - want).max() < 0.05, np.abs(got - want).max()
+    assert all(m.seen > 20_000 for m in s.sl_memory) and s.q_updates == [0, 0]
 
 
 def test_iteration_plays_then_updates_q_then_pi():
