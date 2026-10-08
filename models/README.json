@@ -14,7 +14,7 @@
       "call": 7.86,
       "allin": 3.27
     },
-    "lbr_chips_per_hand": "1.33 +- 0.09 (30 000 duplicate pairs)",
+    "lbr_chips_per_hand": "1.25 +- 0.07 (10 000 duplicate pairs, 2026-10-08: flop equities enumerated, showdowns averaged over the range; 1.33 +- 0.09 with the estimator before its hand-selection fix)",
     "ppo_exploiter_chips_per_hand": "0.01 +- 0.03 (best of 3 seeds x 1000 epochs)",
     "best_response_exploitability": "not re-measured yet with the corrected estimator (the 2026-08 figure of 1620 mbb/g missed the board chance factor)",
     "head_to_head_vs_sdcfr_average": "-0.04 +- 0.05 chips/hand (tie)"
@@ -24,8 +24,10 @@
     "algorithm": "tabular Pluribus-style MCCFR-P blueprint (headsup.blueprint): Linear MCCFR with negative-regret pruning, 169 lossless preflop classes + 200 equal-mass EHS buckets per later round (Monte-Carlo EHS, 500 runouts), 20M iterations; average strategy accumulated at the sampled opponent infosets (the 2026-08-17 version weighted it by the opponent's reach); play-only file (average-strategy counters, no regrets)",
     "public_nodes": 8426,
     "infosets": 436366,
-    "lbr_chips_per_hand": "0.60 +- 0.09 (30 000 duplicate pairs; previous version 0.67 +- 0.09)",
-    "head_to_head": "+0.87 +- 0.04 chips/hand vs models/deepcfr_policy.pth, +0.03 +- 0.03 vs the previous blueprint (300 000 hands each)",
-    "note": "an equilibrium approximation exploits fixed bots less than the DeepCFR nets do; use it with real-time search: python -m headsup.web --opponent pluribus"
+    "lbr_chips_per_hand": "1.03 +- 0.10 (10 000 duplicate pairs, 2026-10-08; the 0.60 +- 0.09 measured before came from an LBR that kept the first hands to finish among lock-step tables)",
+    "head_to_head": "+0.86 +- 0.02 chips/hand vs models/deepcfr_policy.pth (400 000 hands, all-in EV, 2026-10-08; +0.87 +- 0.04 before)",
+    "note": "an equilibrium approximation exploits fixed bots less than the DeepCFR nets do; use it with real-time search: python -m headsup.web --opponent pluribus",
+    "search": "pluribus (this blueprint + Pluribus-mode search, after the 2026-10-08 fidelity changes): +0.40 +- 0.29 chips/hand vs the blueprint itself (2 000 hands)",
+    "candidates_2026-10-08": "trained with the current code (deterministic buckets, scaled pruning threshold), table abstraction + pruning 5e-5: 20 M iterations +0.05 +- 0.02 vs this file, LBR 1.14 +- 0.10; 200 M iterations +0.07 +- 0.02, LBR 1.33 +- 0.10 - not clearly better, not shipped"
   }
 }

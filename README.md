@@ -201,9 +201,17 @@ Tabular references: CFR+ 0.24, DCFR 0.15 mA/g at 1000 iterations.
 
 | strategy | LBR | head-to-head |
 |---|---|---|
-| DeepCFR, paper features + net, 300 it. (`models/deepcfr_policy.pth`) | 1.33 ± 0.09 | ties its SD-CFR average (−0.04 ± 0.05) |
-| tabular blueprint, 20 M it., 40 min (`models/blueprint_nlhe.pt`) | **0.60 ± 0.09** | **+0.87 ± 0.04** vs the DeepCFR net |
-| Pluribus-mode search on the blueprint | −0.78 ± 0.39 | within noise of the blueprint |
+| DeepCFR, paper features + net, 300 it. (`models/deepcfr_policy.pth`) | 1.25 ± 0.07 | ties its SD-CFR average (−0.04 ± 0.05) |
+| tabular blueprint, 20 M it. (`models/blueprint_nlhe.pt`) | **1.03 ± 0.10** | **+0.86 ± 0.02** vs the DeepCFR net |
+| Pluribus-mode search on the blueprint (`pluribus`) | not re-measured | +0.40 ± 0.29 vs the blueprint (2,000 hands) |
+
+LBR: 10,000 duplicate pairs, flop equities enumerated, showdowns averaged over the opponent's range. The numbers shown
+here before 2026-10-08 (1.33 / 0.60) came from an estimator that kept the first hands to finish among tables played in
+lock-step, which over-represents short hands; the blueprint's value moved with the fix, its lead over the network in
+play did not. A blueprint study with the current code (deterministic buckets, pruning threshold scaled with the run)
+found nothing clearly better than the shipped file, which therefore stays: the exact per-board abstraction with pruning
+wins +0.05 ± 0.02 chips/hand against it after 20 M iterations (LBR 1.14 ± 0.10) and +0.07 ± 0.02 after 200 M (LBR 1.33 ±
+0.10) - more iterations in a 200-bucket abstraction win a little more in play and are, if anything, more exploitable.
 
 FHP (DeepCFR paper: 37 mbb/g total exploitability at ~3e8 nodes touched). The paper's game has four bets per round;
 until 2026-10-08 our flop stopped at a bet and two raises (Appendix A's "three raises" read literally). Only the
@@ -217,10 +225,26 @@ headsup.algos.fhp_cfr`) follows the paper's dashed reference line:
 | ours, four-bet flop | 115 | 65 | 32 |
 | ours, earlier three-bet flop | 116 | 60 | 28 |
 
-(total exploitability, mbb/g). The Deep CFR numbers measured on the earlier game (80 mbb/g total after 450
-iterations) are not comparable with the paper and are being re-run with the paper's network and loss weights.
-Best-response exploitability of the NL strategies is being re-measured (the earlier estimates missed the board
-chance factor).
+(total exploitability, mbb/g). **Deep CFR on FHP is not reproduced yet.** On the four-bet game with the paper's
+network and hyperparameters (`--game fhp --preset paper`; policy net by exact best response over all flops, SD-CFR
+average on 2,000 sampled flops, which overstates by ~8 %):
+
+| | t = 50 | 100 | 200 | 300 |
+|---|---|---|---|---|
+| **paper, 10,000 traversals (Fig. 2 / 3-left)** | **154** | **70** | **51** | **40** |
+| paper's SGD-step sweep at 4,000 steps (Fig. 3-middle) | 75 | 82 | 72 | 75 |
+| ours, 10,000 traversals: policy net | | 202 | 113 | 95 |
+| ours, 10,000 traversals: SD-CFR average | 367 | 199 | | |
+| ours, 25,000 traversals: SD-CFR average | 178 | 121 | | |
+
+Two things were measured about the gap. The paper's "10,000 traversals" touch 2.4 times the nodes of ours per
+iteration, and with 25,000 traversals the first 50 iterations are close to its curve. And the 4,000-step regret fit is
+the weak part afterwards: two refits on the same data disagree by 7 chips at pre-flop infosets where a table of the
+same samples is good to 4.5, consecutive iterates play visibly different strategies there, and 16,000 steps lower the
+held-out loss by 5 % (most of what is left is sampling noise) - as in the paper's own sweep, whose 4,000-step curve
+ends near 65, not 40. `--batch-size 40000 --lr 3e-3 --lr-schedule cosine` gets the 16,000-step fit at 1.1-1.6 times
+the paper's cost; `--weight-average` and `--policy-lr` are the related options. Details, the street split of the
+error and the fit benchmark: [docs/paper-fidelity.md](docs/paper-fidelity.md).
 
 Every known difference between this code and the papers (fixed, chosen, or still open) is listed in
 [docs/paper-fidelity.md](docs/paper-fidelity.md).
