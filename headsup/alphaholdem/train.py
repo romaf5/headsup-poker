@@ -10,15 +10,16 @@ One iteration:
 2. All tables play in lock-step; the main network acts for its seats (sampled, masked softmax), every pool member
    for its tables.  After ``--samples`` main decisions the tables whose hand is in progress finish it while the
    others wait, so the rollout holds complete hands only.
-3. GAE along the (table, seat) streams, value target = the hand's discounted return, ``--epochs`` passes of
-   Trinal-Clip PPO in minibatches of ``--minibatch``.
+3. GAE along the (table, seat) streams, value target = the hand's discounted return (``--value-clip``: clipped to
+   the chips put in up to the state), ``--epochs`` passes of Trinal-Clip PPO in minibatches of ``--minibatch``.
 4. The hands against each pool member are one ELO game; every ``--snapshot-every`` iterations a frozen copy of the
    main agent joins the pool, which keeps its ``--pool`` best.
 
 ``--out`` gets ``checkpoint.pt`` (everything needed to ``--resume``; a resumed run draws new cards, it is not a
 bit-wise continuation), ``policy.pth`` (player spec ``alpha:<out>/policy.pth``) and ``log.json`` (one record per
 iteration; every ``--eval-every`` iterations with the chips/hand ± SE against random / call / allin, all-in EV).
-On ``--resume`` the hyperparameters are the checkpoint's; only the budget, evaluation and checkpoint flags apply.
+On ``--resume`` the hyperparameters are the checkpoint's; only the budget, evaluation and checkpoint flags apply
+(a hyperparameter flag that says something else is reported and ignored).
 
 What the paper leaves open and what was chosen: docs/superpowers/specs/2026-10-08-alphaholdem-design.md.
 """
@@ -36,7 +37,7 @@ from headsup.alphaholdem.encoding import Encoder
 from headsup.alphaholdem.model import AlphaNet
 from headsup.alphaholdem.player import AlphaHoldemPlayer
 from headsup.alphaholdem.pool import KBestPool
-from headsup.alphaholdem.ppo import ppo_loss, stream_gae
+from headsup.alphaholdem.ppo import ppo_loss, stream_gae, value_fit
 from headsup.game import DEFAULT_GAME, GameConfig
 from headsup.twoseat import make_two_seat_env
 
@@ -55,7 +56,7 @@ DEFAULTS = dict(
     max_grad_norm=0.5,    # not in the paper
     reward_scale=0.0,     # chips per unit of reward; 0 = the stack size
     adv_norm=True,        # advantages normalised over the rollout (not in the paper)
-    value_clip=True,      # the value-target clip with per-state bounds
+    value_clip=False,     # clip the value target to per-state bounds (off: it biases the advantages, see ppo.py)
     pool=8,               # K (not in the paper)
     snapshot_every=50,    # iterations between snapshots (not in the paper)
     elo_k=16.0,           # ELO K-factor
@@ -201,8 +202,7 @@ class Trainer:
         batch, info = self.collect()
         t1 = time.perf_counter()
         size = len(batch["action"])
-        ret, value = batch["ret"], batch["value"]
-        explained = 1.0 - float((ret - value).var() / ret.var().clamp(min=1e-12))
+        fit = value_fit(batch["ret"], batch["value"], batch["own"], batch["opp"], self.reward_scale, c["value_clip"])
         actions = torch.bincount(batch["action"], minlength=self.game.num_actions).float() / size
         stats = self.update(batch)
         self.iteration += 1
@@ -211,6 +211,8 @@ class Trainer:
         for j in range(len(self.pool)):
             self.pool.record(j, float(info["pool_chips"][j]), int(info["pool_hands"][j]))
         vs_hands = int(info["pool_hands"].sum())
+        vs_pool = [[m.iteration, float(chips / max(hands, 1)), int(hands)]  # per member: the main agent's chips / hand
+                   for m, chips, hands in zip(self.pool.members, info["pool_chips"], info["pool_hands"])]
         if self.iteration % c["snapshot_every"] == 0:
             self.pool.add(self.net, self.iteration)
         seconds = time.perf_counter() - t0
@@ -218,8 +220,8 @@ class Trainer:
         record = dict(
             iteration=self.iteration, samples=self.samples, hands=self.hands, batch=size, steps=info["steps"],
             seconds=self.seconds, rollout_seconds=t1 - t0, samples_per_second=size / seconds, **stats,
-            explained_variance=explained, actions=actions.tolist(), elo=self.pool.main_elo,
-            pool=[[m.iteration, m.elo] for m in self.pool.members], hands_vs_pool=vs_hands,
+            **fit, actions=actions.tolist(), elo=self.pool.main_elo,
+            pool=[[m.iteration, m.elo] for m in self.pool.members], vs_pool=vs_pool, hands_vs_pool=vs_hands,
             chips_vs_pool=float(info["pool_chips"].sum() / vs_hands) if vs_hands else 0.0,
         )
         self.log.append(record)
@@ -301,8 +303,8 @@ def _line(r):
             f"{r['value_clipped']:.2f}  actions {' '.join(f'{a:.2f}' for a in r['actions'])}  {pool}")
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def build_parser():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
     p.add_argument("--out", required=True, help="run directory (checkpoint.pt, policy.pth, log.json)")
     p.add_argument("--iterations", type=int, required=True, help="train until this iteration")
     p.add_argument("--device", default=None, help="torch device (default: auto)")
@@ -322,7 +324,10 @@ def main(argv=None):
     p.add_argument("--max-grad-norm", type=float, default=d["max_grad_norm"])
     p.add_argument("--reward-scale", type=float, default=d["reward_scale"], help="chips per unit of reward (0: the stack size)")
     p.add_argument("--no-adv-norm", dest="adv_norm", action="store_false", help="do not normalise advantages over the rollout")
-    p.add_argument("--no-value-clip", dest="value_clip", action="store_false", help="value target without the per-state clip (ablation)")
+    p.add_argument("--value-clip", dest="value_clip", action="store_true",
+                   help="clip the value target to [-own chips, opponent's chips] at the state (the per-state reading of delta2 / delta3)")
+    p.add_argument("--no-value-clip", dest="value_clip", action="store_false", help="the hand's return as value target (the default)")
+    p.set_defaults(value_clip=d["value_clip"])
     p.add_argument("--pool", type=int, default=d["pool"], help="K: survivors kept in the pool")
     p.add_argument("--snapshot-every", type=int, default=d["snapshot_every"], help="iterations between snapshots of the main agent")
     p.add_argument("--elo-k", type=float, default=d["elo_k"])
@@ -338,6 +343,23 @@ def main(argv=None):
     p.add_argument("--eval-cfr", action="store_true", help="also evaluate against the shipped DeepCFR network")
     p.add_argument("--checkpoint-every", type=int, default=25, help="iterations between checkpoints (the last iteration always)")
     p.add_argument("--threads", type=int, default=0, help="torch CPU threads (0: torch's default)")
+    return p
+
+
+def overridden_flags(parser, argv, args, config):
+    """The hyperparameter options of ``argv`` whose value differs from ``config`` (a checkpoint's settings, which a
+    resumed run keeps), as text for a warning."""
+    out = []
+    for action in parser._actions:
+        given = [opt for opt in action.option_strings if any(a == opt or a.startswith(opt + "=") for a in argv)]
+        if given and action.dest in config and getattr(args, action.dest) != config[action.dest]:
+            out.append(f"{given[0]} (the checkpoint has {action.dest} = {config[action.dest]!r})")
+    return out
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else [str(a) for a in argv]
+    p = build_parser()
     args = p.parse_args(argv)
 
     from headsup.device import get_device
@@ -351,6 +373,9 @@ def main(argv=None):
             p.error(f"--resume: no checkpoint in {args.out}")
         trainer = Trainer.resume(args.out, device=device)
         print(f"resumed {args.out} at iteration {trainer.iteration} ({trainer.samples:,} samples)", flush=True)
+        ignored = overridden_flags(p, argv, args, trainer.cfg)
+        if ignored:
+            print("warning: a resumed run keeps its checkpoint's hyperparameters; ignored: " + ", ".join(ignored), flush=True)
     else:
         if os.path.exists(checkpoint):
             p.error(f"{args.out} already holds a run: continue it with --resume or choose another --out")
