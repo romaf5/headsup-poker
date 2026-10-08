@@ -44,6 +44,33 @@ def hand_strength(hand, board) -> int:
     )
 
 
+def showdown_equity(hand0, hand1, board=(), final_cards=5, samples=0, seed=0):
+    """(P(hand0 wins), P(tie)) at a showdown on ``final_cards`` board cards of which ``board`` are dealt: over every
+    completion of the board (1,712,304 pre-flop: ~0.1 s in the C++ kernel), or over ``samples`` random ones when
+    samples > 0 and there are more.  Without the C++ extension: exact with up to two cards to come, sampled
+    (``samples`` or 2,000) beyond."""
+    from headsup import native
+
+    hand0, hand1, board = [int(c) for c in hand0], [int(c) for c in hand1], [int(c) for c in board]
+    if native.available():
+        return tuple(native.module().showdown_equity(hand0, hand1, board, int(final_cards), int(samples), int(seed)))
+    import itertools
+
+    rest = [c for c in range(NUM_CARDS) if c not in set(hand0) | set(hand1) | set(board)]
+    k = final_cards - len(board)
+    if k <= 2 and not (samples and samples < len(rest) ** k / 2):
+        runs = itertools.combinations(rest, k)
+    else:
+        rng = np.random.default_rng(seed)
+        runs = (rng.choice(rest, size=k, replace=False).tolist() for _ in range(samples or 2000))
+    win = tie = n = 0
+    for extra in runs:
+        full = board + list(extra)
+        s0, s1 = hand_strength(hand0, full), hand_strength(hand1, full)
+        win, tie, n = win + (s0 < s1), tie + (s0 == s1), n + 1
+    return win / n, tie / n
+
+
 def hand_class_str(hand, board) -> str:
     rank = hand_strength(hand, board)
     return _EVALUATOR.class_to_string(_EVALUATOR.get_rank_class(rank))

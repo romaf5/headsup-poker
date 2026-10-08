@@ -14,14 +14,15 @@ from headsup.games.holdem import mbb_per_hand
 DEFAULT_OPPONENTS = ("random", "call", "allin")
 
 
-def evaluate(player, hands, opponents=DEFAULT_OPPONENTS, num_envs=1024, seed=0, backend="auto", progress=False):
+def evaluate(player, hands, opponents=DEFAULT_OPPONENTS, num_envs=1024, seed=0, backend="auto", progress=False, allin_ev=True):
     """``player`` is a batched player; returns {opponent: mean chips per hand}.  Envs use the
-    player's action tree (``player.game``) when it has one."""
+    player's action tree (``player.game``) when it has one.  ``allin_ev``: all-in hands count with their
+    expectation over the runouts (see :func:`headsup.env.play_hands`)."""
     scores = {}
     game = getattr(player, "game", None)
     for i, opp in enumerate(opponents):
         env = make_vec_env(num_envs, opp, seed=seed + i, backend=backend, game=game)
-        rewards = play_hands(env, player, hands, progress=progress)
+        rewards = play_hands(env, player, hands, progress=progress, allin_ev=allin_ev)
         scores[opp] = float(rewards.mean())
     return scores
 
@@ -41,6 +42,7 @@ def main():
     parser.add_argument("--device", default=None, help="torch device for the evaluated policy (default: auto)")
     parser.add_argument("--deterministic", action="store_true", help="argmax instead of sampling for the evaluated policy")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--raw", action="store_true", help="dealt runouts for all-in hands instead of their expectation (all-in EV)")
     args = parser.parse_args()
 
     from headsup.players import make_player
@@ -49,7 +51,7 @@ def main():
     for opp in args.opponents.split(","):
         env = make_vec_env(args.num_envs, opp.strip(), seed=args.seed, game=getattr(player, "game", None))
         t0 = time.perf_counter()
-        r = play_hands(env, player, args.hands, progress=True)
+        r = play_hands(env, player, args.hands, progress=True, allin_ev=not args.raw)
         dt = time.perf_counter() - t0
         se = r.std() / np.sqrt(len(r))
         print(f"{args.policy} vs {opp:>10s}: {r.mean():+.3f} ± {se:.3f} chips/hand  ({mbb_per_hand(r.mean(), env.game):+.0f} mbb/hand)  [{len(r)/dt:,.0f} hands/s]")

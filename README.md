@@ -55,6 +55,13 @@ paper's hyperparameters and network (`--net deepcfr`: Appendix C with the 3x wid
 | `python -m headsup.compare <spec> <spec> --bots` | head-to-head chips/hand ± SE |
 | `python -m headsup.exploit --policy <spec>` | PPO exploiters, a weak lower bound |
 
+**All-in EV.** When a hand goes all-in before the last card, the played-hands tools (`compare`, `lbr`, `exploit`,
+`deepcfr.evaluate`) count it with its expectation over the board cards still to come instead of the one runout that
+was dealt (exact on the flop and turn, 1,000 sampled runouts pre-flop): the same mean with a smaller standard error.
+`--raw` turns it off. The browser table shows it per hand ("all-in pre-flop with 62 % equity: worth +24.0 on
+average, the runout gave you +76.0") and keeps an EV-adjusted win rate and the runouts' luck next to the dealt
+totals. In code: `engine.allin_ev()`, `play_hands(..., allin_ev=True)`, `headsup.cards.showdown_equity`.
+
 ## Results
 
 ### Leduc: reproductions

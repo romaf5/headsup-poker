@@ -141,3 +141,33 @@ def test_fold_with_nothing_to_call_is_logged_as_the_check_it_is():
     s.act("fold")  # nothing to call: the engine executes a check
     mine = [entry for entry in s.log if entry["seat"] == "you"][-1]
     assert not s.hand_over and mine["text"] == "checks"
+
+
+def test_allin_hands_report_equity_and_expected_result():
+    """An all-in called before the river: the result also says what the hand was worth on average over the cards
+    to come, and the session keeps an EV-adjusted total next to the dealt one."""
+    s = GameSession(opponent="call", advisor=None, device="cpu", seed=5)
+    assert s.state()["you"]["position"] == "dealer"
+    s.act("allin")  # the calling station calls: 100 chips each, five cards to come
+    while s.bot_to_act:
+        s.bot_step()
+    assert s.hand_over and s.result["showdown"]
+    allin = s.result["allin"]
+    assert allin["street"] == "pre-flop" and 0.0 < allin["equity"] < 1.0
+    assert abs(allin["ev"]) < 100 and allin["ev"] == pytest.approx(100 * (2 * allin["equity"] - 1), abs=1e-6)
+    assert allin["luck"] == pytest.approx(s.result["reward"] - allin["ev"])
+    assert "equity" in allin["text"] and "%" in allin["text"]
+    st = s.stats()
+    assert st["ev_total"] == pytest.approx(allin["ev"]) and st["luck"] == pytest.approx(st["total"] - st["ev_total"])
+    assert s.hand_records[-1]["ev"] == pytest.approx(allin["ev"])
+    s.next_hand()  # big blind now; the calling station limps, we check it down: nothing was left to chance
+    while not s.hand_over:
+        if s.bot_to_act:
+            s.bot_step()
+        else:
+            s.act("call")
+    assert s.result["allin"] is None and s.hand_records[-1]["ev"] == s.result["reward"]
+    st = s.stats()
+    assert st["hands"] == 2 and st["ev_total"] == pytest.approx(allin["ev"] + s.result["reward"])
+    assert len(st["cumulative_ev"]) == 2 and st["ev_mbb"] == pytest.approx(st["ev_total"] / 2 * 500)
+    json.dumps(s.state())

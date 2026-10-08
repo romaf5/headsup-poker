@@ -33,10 +33,11 @@ def table_game(specs, device=None):
     return None
 
 
-def head_to_head(spec_a, spec_b, hands, num_envs=1024, seed=0, device=None, game=None):
+def head_to_head(spec_a, spec_b, hands, num_envs=1024, seed=0, device=None, game=None, allin_ev=True):
     """Mean and standard error of A's chips/hand against B (both seats, alternating).  The game is the
     one the network players were trained in (simple bots adopt it; two bots play ``game``, default: the
-    default no-limit game); two different trees are an error."""
+    default no-limit game); two different trees are an error.  ``allin_ev``: hands that end all-in before the
+    last round count with their expectation over the runouts (the same mean, a smaller standard error)."""
     a = make_player(spec_a, device=device, seed=seed, game=game)
     b = make_player(spec_b, device=device, seed=seed + 1, game=getattr(a, "game", None))
     game_a, game_b = getattr(a, "game", None), getattr(b, "game", None)
@@ -47,11 +48,11 @@ def head_to_head(spec_a, spec_b, hands, num_envs=1024, seed=0, device=None, game
         else:
             raise ValueError(f"{spec_a} and {spec_b} play different games: {game_a.tree_dict()} vs {game_b.tree_dict()}")
     env = make_vec_env(num_envs, b, seed=seed, game=game_a)
-    r = play_hands(env, a, hands)
+    r = play_hands(env, a, hands, allin_ev=allin_ev)
     return float(r.mean()), float(r.std() / np.sqrt(len(r)))
 
 
-def compare(specs, hands, num_envs=1024, seed=0, device=None, bots=False, progress=print):
+def compare(specs, hands, num_envs=1024, seed=0, device=None, bots=False, progress=print, allin_ev=True):
     opponents = list(specs) + (["random", "call", "allin"] if bots else [])
     game = table_game(specs, device)  # bot-vs-bot cells are played in the table's game, not the default one
     results = {}
@@ -64,7 +65,7 @@ def compare(specs, hands, num_envs=1024, seed=0, device=None, bots=False, progre
             results[(a, b)] = (-m, se)
             continue
         t0 = time.perf_counter()
-        results[(a, b)] = head_to_head(a, b, hands, num_envs, seed, device, game=game)
+        results[(a, b)] = head_to_head(a, b, hands, num_envs, seed, device, game=game, allin_ev=allin_ev)
         m, se = results[(a, b)]
         progress(f"{a} vs {b}: {m:+.3f} ± {se:.3f} chips/hand  ({time.perf_counter() - t0:.0f}s)")
     return results, opponents
@@ -96,15 +97,17 @@ def main():
     p.add_argument("--device", default=None)
     p.add_argument("--bots", action="store_true", help="also play against random / call / all-in")
     p.add_argument("--json", default=None, help="write results to this file")
+    p.add_argument("--raw", action="store_true",
+                   help="count all-in hands with the dealt runout instead of their expectation over the runouts (all-in EV, the default)")
     args = p.parse_args()
     if len(args.specs) < 2 and not args.bots:
         p.error("give at least two specs (or one spec with --bots)")
-    results, opponents = compare(args.specs, args.hands, args.num_envs, args.seed, args.device, args.bots)
-    print("\nrow player's chips/hand vs column player (± standard error)\n")
+    results, opponents = compare(args.specs, args.hands, args.num_envs, args.seed, args.device, args.bots, allin_ev=not args.raw)
+    print(f"\nrow player's chips/hand vs column player (± standard error{'' if args.raw else '; all-in EV'})\n")
     print(format_table(args.specs, opponents, results))
     if args.json:
         with open(args.json, "w") as f:
-            json.dump({f"{a} | {b}": {"mean": m, "se": se} for (a, b), (m, se) in results.items()}, f, indent=2)
+            json.dump({f"{a} | {b}": {"mean": m, "se": se, "allin_ev": not args.raw} for (a, b), (m, se) in results.items()}, f, indent=2)
 
 
 if __name__ == "__main__":

@@ -123,6 +123,7 @@ class HeadsUpPoker:
         self.consecutive_raises = 0
         self.done = True
         self.rewards = [0, 0]
+        self.showdown_stage = -1  # the round whose betting ended the hand at a showdown (-1: none yet / a fold)
         # bet history: per street, size (chips / pot before the action) of the first HISTORY_SLOTS
         # actions and the number of actions taken on that street
         self.history_size = [[0.0] * HISTORY_SLOTS for _ in range(HISTORY_ROUNDS)]
@@ -149,6 +150,7 @@ class HeadsUpPoker:
         self.consecutive_raises = 0
         self.done = False
         self.rewards = [0, 0]
+        self.showdown_stage = -1
         self.history_size = [[0.0] * HISTORY_SLOTS for _ in range(HISTORY_ROUNDS)]
         self.history_n = [0] * HISTORY_ROUNDS
         return self.observation()
@@ -326,6 +328,7 @@ class HeadsUpPoker:
     def _showdown(self):
         # showdown on the board of the game's last betting round (all-ins run the board out; FHP: 3 cards)
         board = self.board[: BOARD_CARDS_BY_STAGE[self.num_rounds - 1]]
+        self.showdown_stage = int(self.stage)
         self.stage = Stage.END
         s0 = hand_strength(self.hands[0], board)
         s1 = hand_strength(self.hands[1], board)
@@ -337,6 +340,20 @@ class HeadsUpPoker:
         else:
             self.rewards = [-won, won]
         self.done = True
+
+    def allin_ev(self, samples=0, seed=0):
+        """All-in EV: the expected rewards [seat 0, seat 1] over the board cards that were still to come when the
+        betting closed (an all-in called before the last round) - the same expectation as the dealt outcome
+        without the luck of the runout.  Any other hand: its actual rewards.  ``samples`` > 0: that many random
+        runouts where there are more (pre-flop: 1.7 M, ~0.1 s exactly)."""
+        if not self.done or self.folded >= 0 or self.showdown_stage < 0 or self.showdown_stage >= self.num_rounds - 1:
+            return [float(r) for r in self.rewards]
+        from headsup.cards import showdown_equity
+
+        known = self.board[: BOARD_CARDS_BY_STAGE[self.showdown_stage]]
+        win, tie = showdown_equity(self.hands[0], self.hands[1], known, BOARD_CARDS_BY_STAGE[self.num_rounds - 1], samples, seed)
+        ev = min(self.bets) * (win - (1.0 - win - tie))
+        return [ev, -ev]
 
     # ------------------------------------------------------------------ debugging
     def describe(self, seat=None):

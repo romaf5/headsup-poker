@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -111,6 +112,130 @@ int eval_best(const int* cards, int n) {
   return best;
 }
 
+// ------------------------------------------------------------------ fast 7-card evaluation (the same ranks as eval7)
+// One table lookup instead of 21 five-card ones.  With five or more cards of a suit the best hand is a flush or a
+// straight flush of that suit (two cards outside it cannot make quads or a full house): a table over the suit's 13-bit
+// rank mask.  Otherwise the hand is decided by its rank multiset: a table over the product of the seven rank primes
+// (49,205 entries).  Both are built from eval5 / eval7 on first use.
+struct FastTables {
+  std::vector<uint16_t> flush;                   // by 13-bit rank mask (>= 5 bits set)
+  std::unordered_map<uint64_t, uint16_t> ranks;  // by the product of the seven rank primes (no flush possible)
+  std::once_flag once;
+} g_fast;
+
+inline void build_fast_tables() {
+  if (!g_tables.ready) throw std::runtime_error("evaluator tables not loaded (headsup.native.module())");
+  g_fast.flush.assign(8192, 0);
+  for (uint32_t mask = 0; mask < 8192; ++mask) {
+    int r[13], n = 0;
+    for (int i = 0; i < 13; ++i)
+      if (mask & (1u << i)) r[n++] = i;
+    if (n < 5) continue;
+    int best = 7462;
+    for (int a = 0; a < n; ++a)
+      for (int b = a + 1; b < n; ++b)
+        for (int c = b + 1; c < n; ++c)
+          for (int d = c + 1; d < n; ++d)
+            for (int e = d + 1; e < n; ++e) {
+              const uint32_t five = (1u << r[a]) | (1u << r[b]) | (1u << r[c]) | (1u << r[d]) | (1u << r[e]);
+              best = std::min(best, int(g_tables.flush.at(prime_product_from_rankbits(five))));
+            }
+    g_fast.flush[mask] = uint16_t(best);
+  }
+  // every rank multiset of seven cards (at most four of a rank); suits are dealt in turn, so no suit gets five cards
+  int cnt[13] = {};
+  std::function<void(int, int)> fill = [&](int rank, int left) {
+    if (left == 0) {
+      int cards[7], k = 0;
+      uint64_t prod = 1;
+      for (int i = 0; i < 13; ++i)
+        for (int j = 0; j < cnt[i]; ++j) {
+          cards[k] = i + 13 * (k % 4);
+          ++k;
+          prod *= PRIMES[i];
+        }
+      g_fast.ranks[prod] = uint16_t(eval7(cards));
+      return;
+    }
+    if (rank == 13) return;
+    for (int c = 0; c <= std::min(4, left); ++c) {
+      cnt[rank] = c;
+      fill(rank + 1, left - c);
+    }
+    cnt[rank] = 0;
+  };
+  fill(0, 7);
+}
+
+inline int eval7_fast(const int* cards7) {
+  std::call_once(g_fast.once, build_fast_tables);
+  uint32_t mask[4] = {0, 0, 0, 0};
+  int count[4] = {0, 0, 0, 0};
+  uint64_t prod = 1;
+  for (int i = 0; i < 7; ++i) {
+    const int r = cards7[i] % 13, s = cards7[i] / 13;
+    mask[s] |= 1u << r;
+    ++count[s];
+    prod *= PRIMES[r];
+  }
+  for (int s = 0; s < 4; ++s)
+    if (count[s] >= 5) return g_fast.flush[mask[s]];
+  return g_fast.ranks.find(prod)->second;
+}
+
+// P(seat 0 wins) and P(tie) at a showdown on `final_cards` board cards of which `n_known` are dealt: over every
+// completion of the board, or - with samples > 0 and more completions than that - over `samples` random ones.
+inline void showdown_equity(const int* h0, const int* h1, const int* board, int n_known, int final_cards, long samples, uint64_t seed,
+                            double& win, double& tie) {
+  bool used[NUM_CARDS] = {};
+  used[h0[0]] = used[h0[1]] = used[h1[0]] = used[h1[1]] = true;
+  int c0[7] = {h0[0], h0[1], 0, 0, 0, 0, 0}, c1[7] = {h1[0], h1[1], 0, 0, 0, 0, 0};
+  for (int i = 0; i < n_known; ++i) {
+    used[board[i]] = true;
+    c0[2 + i] = c1[2 + i] = board[i];
+  }
+  int rest[NUM_CARDS], nr = 0;
+  for (int c = 0; c < NUM_CARDS; ++c)
+    if (!used[c]) rest[nr++] = c;
+  const int k = final_cards - n_known, total = 2 + final_cards;
+  long w = 0, t = 0, n = 0;
+  auto score = [&]() {
+    const int s0 = total == 7 ? eval7_fast(c0) : eval_best(c0, total), s1 = total == 7 ? eval7_fast(c1) : eval_best(c1, total);
+    w += s0 < s1;
+    t += s0 == s1;
+    ++n;
+  };
+  double combos = 1.0;
+  for (int i = 0; i < k; ++i) combos = combos * (nr - i) / (i + 1);
+  if (k == 0) {
+    score();
+  } else if (samples > 0 && combos > double(samples)) {
+    std::mt19937_64 rng(seed);
+    for (long sample = 0; sample < samples; ++sample) {
+      for (int i = 0; i < k; ++i) {  // partial Fisher-Yates over the unseen cards
+        std::uniform_int_distribution<int> pick(i, nr - 1);
+        std::swap(rest[i], rest[pick(rng)]);
+        c0[2 + n_known + i] = c1[2 + n_known + i] = rest[i];
+      }
+      score();
+    }
+  } else {
+    int idx[5];
+    for (int i = 0; i < k; ++i) idx[i] = i;
+    while (true) {
+      for (int i = 0; i < k; ++i) c0[2 + n_known + i] = c1[2 + n_known + i] = rest[idx[i]];
+      score();
+      int i = k - 1;
+      while (i >= 0 && idx[i] == nr - k + i) --i;
+      if (i < 0) break;
+      ++idx[i];
+      for (int j = i + 1; j < k; ++j) idx[j] = idx[j - 1] + 1;
+    }
+  }
+  win = double(w) / double(n);
+  tie = double(t) / double(n);
+}
+
 // ------------------------------------------------------------------ engine
 struct EngineConfig {
   int stack_size = 100;
@@ -159,6 +284,7 @@ struct Engine {
   int stacks[2] = {0, 0}, bets[2] = {0, 0}, stage_bets[2] = {0, 0};
   int pot = 0, stage = PREFLOP, current = 0, folded = -1, acted = 0, consecutive_raises = 0;
   int rewards[2] = {0, 0};
+  int showdown_stage = -1;  // the round whose betting ended the hand at a showdown (-1: no showdown yet / a fold)
   bool done = true;
   // bet history: chips / pot-before-the-action of the first HISTORY_SLOTS actions per street
   float hist_size[HISTORY_ROUNDS][HISTORY_SLOTS] = {};
@@ -185,6 +311,7 @@ struct Engine {
     consecutive_raises = 0;
     done = false;
     rewards[0] = rewards[1] = 0;
+    showdown_stage = -1;
     std::memset(hist_size, 0, sizeof(hist_size));
     hist_n[0] = hist_n[1] = hist_n[2] = hist_n[3] = 0;
   }
@@ -260,7 +387,19 @@ struct Engine {
     return stacks[s] == 0;
   }
 
+  // All-in EV: the expected reward of `seat` over the board cards that were still to come when the betting closed
+  // (an all-in called before the last round) - the same expectation as the dealt outcome, without the runout's
+  // luck.  Every other hand: the actual reward.  samples > 0: that many random runouts where there are more.
+  double allin_ev(int seat, long samples = 0, uint64_t seed = 0) const {
+    if (!done || folded >= 0 || showdown_stage < 0 || showdown_stage >= cfg.num_rounds - 1) return double(rewards[seat]);
+    double win, tie;
+    showdown_equity(hands[0], hands[1], board, BOARD_CARDS_BY_STAGE[showdown_stage], cfg.showdown_cards(), samples, seed, win, tie);
+    const double ev0 = std::min(bets[0], bets[1]) * (win - (1.0 - win - tie));
+    return seat == 0 ? ev0 : -ev0;
+  }
+
   void showdown() {
+    showdown_stage = stage;
     stage = END;
     const int nb = cfg.showdown_cards();
     int c0[7] = {hands[0][0], hands[0][1], board[0], board[1], board[2], board[3], board[4]};
@@ -1088,10 +1227,14 @@ struct VecEnv {
   int num_actions;
   std::vector<float> last_probs;  // (num_envs, num_actions) of the opponent's last decision per table
   long hands_completed = 0;
+  bool allin_ev = false;  // rewards of hands that end all-in before the last round: the expectation over the runouts
+  long ev_samples = 1000;  // ... over this many sampled runouts where there are more (0: always exact)
+  std::mt19937_64 ev_rng;  // its own stream: the deals are the same with and without all-in EV
 
   VecEnv(int n, uint64_t seed, EngineConfig cfg, bool alternate_seats)
       : engines(size_t(n), Engine(cfg)), agent_seat(size_t(n)), alternate(alternate_seats), rng(seed),
-        num_actions(cfg.num_actions()), last_probs(size_t(n) * cfg.num_actions(), 1.0f / cfg.num_actions()) {
+        num_actions(cfg.num_actions()), last_probs(size_t(n) * cfg.num_actions(), 1.0f / cfg.num_actions()),
+        ev_rng(seed ^ 0x9E3779B97F4A7C15ull) {
     for (int i = 0; i < n; ++i) agent_seat[i] = (i % 2) ^ 1;  // flipped on first reset
   }
 
@@ -1190,7 +1333,7 @@ struct VecEnv {
       }
       d(i) = e.done;
       if (e.done) {
-        r(i) = float(e.rewards[agent_seat[i]]);
+        r(i) = allin_ev ? float(e.allin_ev(agent_seat[i], ev_samples, ev_rng())) : float(e.rewards[agent_seat[i]]);
         ++hands_completed;
         if (auto_reset) {
           reset_engine(int(i));
@@ -2944,6 +3087,26 @@ PYBIND11_MODULE(headsup_cpp, m) {
     if (cards.size() < 5 || cards.size() > 7) throw std::runtime_error("need 5..7 cards");
     return eval_best(cards.data(), int(cards.size()));
   });
+  m.def("eval7_fast", [](std::vector<int> cards) {
+    if (cards.size() != 7) throw std::runtime_error("need 7 cards");
+    check_cards(cards);
+    return eval7_fast(cards.data());
+  }, "rank of the best five of seven cards (as eval7), by one table lookup");
+  m.def("showdown_equity", [](std::vector<int> h0, std::vector<int> h1, std::vector<int> board, int final_cards, long samples, uint64_t seed) {
+    if (h0.size() != 2 || h1.size() != 2 || final_cards < 3 || final_cards > 5 || int(board.size()) > final_cards)
+      throw std::invalid_argument("cards: two hands of two cards and a board of at most final_cards (3..5) cards");
+    std::vector<int> all = {h0[0], h0[1], h1[0], h1[1]};
+    all.insert(all.end(), board.begin(), board.end());
+    check_cards(all);
+    double win, tie;
+    {
+      py::gil_scoped_release release;
+      showdown_equity(h0.data(), h1.data(), board.data(), int(board.size()), final_cards, samples, seed, win, tie);
+    }
+    return py::make_tuple(win, tie);
+  }, py::arg("hand0"), py::arg("hand1"), py::arg("board"), py::arg("final_cards") = 5, py::arg("samples") = 0, py::arg("seed") = 0,
+     "(P(hand0 wins), P(tie)) at a showdown on final_cards board cards: exact over every completion of the board, or over "
+     "`samples` random ones when samples > 0 and there are more");
 
   py::class_<EngineConfig>(m, "EngineConfig")
       .def(py::init<>())
@@ -2999,6 +3162,12 @@ PYBIND11_MODULE(headsup_cpp, m) {
       .def_property_readonly("pot", [](const Engine& e) { return e.pot; })
       .def_property_readonly("folded", [](const Engine& e) { return e.folded; })
       .def_property_readonly("rewards", [](const Engine& e) { return std::vector<int>{e.rewards[0], e.rewards[1]}; })
+      .def_property_readonly("showdown_stage", [](const Engine& e) { return e.showdown_stage; })
+      .def("allin_ev", [](const Engine& e, long samples, uint64_t seed) {
+        return std::vector<double>{e.allin_ev(0, samples, seed), e.allin_ev(1, samples, seed)};
+      }, py::arg("samples") = 0, py::arg("seed") = 0,
+         "expected rewards over the board cards still to come when the betting closed (all-in before the last round); "
+         "the actual rewards otherwise")
       .def_property_readonly("stacks", [](const Engine& e) { return std::vector<int>{e.stacks[0], e.stacks[1]}; })
       .def_property_readonly("bets", [](const Engine& e) { return std::vector<int>{e.bets[0], e.bets[1]}; });
 
@@ -3406,6 +3575,8 @@ PYBIND11_MODULE(headsup_cpp, m) {
       .def_property_readonly("num_envs", [](const VecEnv& v) { return int(v.engines.size()); })
       .def_property_readonly("agent_seat", [](const VecEnv& v) { return v.agent_seat; })
       .def_property_readonly("hands_completed", [](const VecEnv& v) { return v.hands_completed; })
+      .def_readwrite("allin_ev", &VecEnv::allin_ev)
+      .def_readwrite("ev_samples", &VecEnv::ev_samples)
       .def_property_readonly("last_probs",
                              [](const VecEnv& v) {
                                py::array_t<float> out({ssize_t(v.engines.size()), ssize_t(v.num_actions)});

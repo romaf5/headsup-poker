@@ -10,7 +10,7 @@ import time
 
 import numpy as np
 
-from headsup.cards import card_to_str, describe_hand, hand_strength
+from headsup.cards import card_to_str, describe_hand, hand_strength, showdown_equity
 from headsup.engine import HeadsUpPoker
 from headsup.enums import Action, Stage
 from headsup.game import DEFAULT_GAME, action_label
@@ -165,6 +165,7 @@ class GameSession:
                 self.advisor_error = f"{type(exc).__name__}: {exc}"
         self.me = 1  # flipped in new_hand -> human is dealer first
         self.results = []  # per-hand rewards for the human
+        self.ev_results = []  # the same with all-in hands at their expectation over the runouts (all-in EV)
         self.hand_records = []  # compact summaries of finished hands
         self.log = []  # action log of the current hand
         self.hand_over = False
@@ -277,6 +278,9 @@ class GameSession:
         else:
             info["detail"] = "you folded"
         info["text"] = f"{main} — {info['detail']}"
+        info["allin"] = self._allin_ev(reward)
+        ev = info["allin"]["ev"] if info["allin"] else float(reward)
+        self.ev_results.append(ev)
         self.result = info
         self.hand_records.append(
             {
@@ -288,9 +292,24 @@ class GameSession:
                 "board": [card_json(c) for c in (e.board if showdown else e.visible_board)],
                 "position": self._pos(self.me),
                 "summary": info["text"],
+                "ev": ev,
             }
         )
         self.hand_records = self.hand_records[-200:]
+
+    def _allin_ev(self, reward):
+        """For a hand that went all-in before the last card: your equity when the money went in, what the hand was
+        worth on average over the cards to come, and the part of the result that was the runout's luck."""
+        e = self.engine
+        if e.folded >= 0 or e.showdown_stage < 0 or e.showdown_stage >= e.num_rounds - 1:
+            return None
+        known = e.board[: (0, 3, 4, 5)[e.showdown_stage]]
+        win, tie = showdown_equity(e.hands[self.me], e.hands[self.opp], known, len(e.board[: (0, 3, 4, 5)[e.num_rounds - 1]]))
+        equity, ev = win + tie / 2, float(e.allin_ev()[self.me])
+        street = ("pre-flop", "flop", "turn")[e.showdown_stage]
+        return {"street": street, "equity": equity, "ev": ev, "luck": reward - ev,
+                "text": f"all-in {'on the ' if e.showdown_stage else ''}{street} with {equity:.0%} equity: worth {ev:+.1f} on average, "
+                        f"the runout gave you {reward - ev:+.1f}"}
 
     # ------------------------------------------------------------------ actions
     def new_hand(self):
@@ -380,6 +399,21 @@ class GameSession:
             "lost": int((r < 0).sum()) if n else 0,
             "tied": int((r == 0).sum()) if n else 0,
             "cumulative": cum[-400:],
+            **self._ev_stats(r),
+        }
+
+    def _ev_stats(self, r):
+        """The session with all-in hands at their expectation: the same quantity with less luck in it."""
+        ev = np.asarray(self.ev_results, dtype=np.float64)
+        n, bb = len(ev), self.engine.big_blind
+        return {
+            "ev_total": float(ev.sum()) if n else 0.0,
+            "ev_avg": float(ev.mean()) if n else 0.0,
+            "ev_mbb": float(ev.mean() * 1000 / bb) if n else 0.0,
+            "ev_se_mbb": float(ev.std(ddof=1) / np.sqrt(n) * 1000 / bb) if n > 1 else 0.0,
+            "luck": float(r.sum() - ev.sum()) if n else 0.0,
+            "allin_hands": int((ev != r).sum()) if n else 0,
+            "cumulative_ev": np.cumsum(ev).tolist()[-400:] if n else [],
         }
 
     def state(self, reveal_bot=False):

@@ -93,6 +93,10 @@ class PokerVecEnv:
         self.agent_seat = (np.arange(num_envs) % 2) ^ 1
         self.observation_space, self.action_space = _make_spaces(self.game)
         self.hands_completed = 0
+        # all-in EV: hands that end all-in before the last round are rewarded with the expectation over the runouts
+        # (``ev_samples`` sampled ones where there are more; 0 = always exact).  Its own stream: the deals do not change
+        self.allin_ev, self.ev_samples = False, 1000
+        self._ev_rng = np.random.default_rng(None if seed is None else [int(seed) % 2**63, 0xE7])
 
     # ---------------------------------------------------------------- helpers
     def _reset_engine(self, i):
@@ -142,7 +146,10 @@ class PokerVecEnv:
         for i, e in enumerate(self.engines):
             if e.done:
                 dones[i] = True
-                rewards[i] = e.rewards[self.agent_seat[i]]
+                if self.allin_ev:
+                    rewards[i] = e.allin_ev(self.ev_samples, int(self._ev_rng.integers(2**63)))[self.agent_seat[i]]
+                else:
+                    rewards[i] = e.rewards[self.agent_seat[i]]
         self.hands_completed += int(dones.sum())
         infos = [{} for _ in range(self.num_envs)]
         if auto_reset:
@@ -224,12 +231,28 @@ class SingleAgentEnv:
         pass
 
 
-def play_hands(vec_env, agent, num_hands, progress=False):
+def play_hands(vec_env, agent, num_hands, progress=False, allin_ev=False):
     """Run ``num_hands`` complete hands of ``agent`` in ``vec_env``; returns per-hand rewards.  Every table
     plays the same number of hands (ceil(num_hands / num_envs)): the first hands to finish across the tables are
-    the short ones, so taking those would bias the mean."""
+    the short ones, so taking those would bias the mean.
+
+    ``allin_ev``: hands that end all-in before the last round count with their expectation over the board cards to
+    come instead of the dealt runout - the same mean, without the largest source of variance in no-limit results."""
     if getattr(vec_env, "game", None) is not None:
         check_same_tree(agent, vec_env.game, "agent")
+    if allin_ev and not hasattr(vec_env, "allin_ev"):
+        raise ValueError(f"{type(vec_env).__name__} has no all-in EV rewards")
+    previous = getattr(vec_env, "allin_ev", False)
+    if allin_ev:
+        vec_env.allin_ev = True
+    try:
+        return _play_hands(vec_env, agent, num_hands, progress)
+    finally:
+        if allin_ev:
+            vec_env.allin_ev = previous
+
+
+def _play_hands(vec_env, agent, num_hands, progress):
     obs = vec_env.reset()
     bar = None
     if progress:
@@ -290,6 +313,23 @@ class NativeVecEnv:
     @property
     def hands_completed(self):
         return self.env.hands_completed
+
+    @property
+    def allin_ev(self):
+        """All-in EV rewards (see :class:`PokerVecEnv`); ``ev_samples`` sampled runouts where there are more."""
+        return self.env.allin_ev
+
+    @allin_ev.setter
+    def allin_ev(self, on):
+        self.env.allin_ev = bool(on)
+
+    @property
+    def ev_samples(self):
+        return self.env.ev_samples
+
+    @ev_samples.setter
+    def ev_samples(self, n):
+        self.env.ev_samples = int(n)
 
     @property
     def opponent_last_probs(self):

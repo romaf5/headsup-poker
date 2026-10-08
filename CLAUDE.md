@@ -69,7 +69,9 @@ python -m pytest tests -q                                    # ~270 tests, ~7 mi
   flops overstate it - the BR fits its pre-flop play to the sample: 500 / 2000 / 8000 flops = +23 / +8 / +3 % at 80 mbb/g; papers differ on
   mean-over-seats vs total exploitability - DeepCFR's FHP numbers are totals). LBR vs an
   SD-CFR bank: thin the queried bank (`--model-iterates 32`; the bound stays valid).
-- Measure, don't anecdote: 400k+ hands for head-to-head, 20k+ LBR pairs, report ± SE.
+- Measure, don't anecdote: 400k+ hands for head-to-head, 20k+ LBR pairs, report ± SE. Played-hands tools use all-in
+  EV by default (`--raw` off): hands all-in before the last card count with their expectation over the runouts
+  (`Engine.allin_ev`, Python + C++; `showdown_stage` = the round whose betting ended the hand at a showdown).
 
 ## Machine / operations (64-core WSL2 box, 2 × RTX 3090, 94 GB RAM)
 

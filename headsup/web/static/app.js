@@ -294,7 +294,7 @@ function render() {
     const main = $("#banner-main");
     main.textContent = r.main;
     main.className = "banner-main " + (r.reward > 0 ? "win" : r.reward < 0 ? "lose" : "tie");
-    $("#banner-sub").textContent = `${r.detail} · pot ${r.pot}`;
+    $("#banner-sub").textContent = `${r.detail} · pot ${r.pot}` + (r.allin ? ` · ${r.allin.text}` : "");
     banner.classList.remove("hidden");
   } else banner.classList.add("hidden");
 
@@ -339,6 +339,12 @@ function render() {
     $("#mbb").textContent = `${fmt(Math.round(st.mbb), true).replace(/\B(?=(\d{3})+(?!\d))/g, "\u2009")}` + (se ? ` ± ${Math.round(se).toLocaleString("en").replace(/,/g, "\u2009")}` : "");
     $("#rate-note").textContent = st.hands < 50 ? `1 chip = ${1000 / s.settings.big_blind} mbb — rates are noisy below ~50 hands (${st.hands} so far)` : `${st.hands} hands`;
   } else { $("#mbb").textContent = "–"; $("#rate-note").textContent = "1 chip = " + (1000 / s.settings.big_blind) + " mbb"; }
+  // the same with all-in hands at their expectation over the runouts, and how much of the result was the runouts' luck
+  const thin = (x) => fmt(Math.round(x), true).replace(/\B(?=(\d{3})+(?!\d))/g, "\u2009");
+  $("#ev-mbb").textContent = st.hands ? thin(st.ev_mbb) + (st.hands > 1 ? ` ± ${thin(st.ev_se_mbb).replace("+", "")}` : "") : "–";
+  const luck = $("#luck");
+  luck.textContent = st.allin_hands ? `${fmt(Math.round(st.luck * 10) / 10, true)} chips in ${st.allin_hands} all-in${st.allin_hands > 1 ? "s" : ""}` : "–";
+  luck.className = st.allin_hands ? (st.luck > 0 ? "pos" : st.luck < 0 ? "neg" : "") : "";
 
   renderLog(s);
   renderHistory(s);

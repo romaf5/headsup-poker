@@ -139,7 +139,8 @@ class _Table:
 
 class LocalBestResponse:
     def __init__(self, opponent_spec, num_tables=64, device=None, seed=0, mc_samples=200, max_exact=100,
-                 duplicate=True, workers=None, engine_kwargs=None, model_iterates=0, opponent=None, model=None, game=None):
+                 duplicate=True, workers=None, engine_kwargs=None, model_iterates=0, opponent=None, model=None, game=None,
+                 allin_ev=True):
         from headsup.players import make_player
 
         from headsup.env import resolve_game
@@ -150,8 +151,10 @@ class LocalBestResponse:
         self.model = model if model is not None else _model_for(opponent_spec, device, seed + 1, model_iterates, self.game)  # is queried
         self.model_observes = hasattr(self.model, "observe")
         self.duplicate = duplicate
+        self.allin_ev = allin_ev  # all-in hands count with their expectation over the runouts (same mean, less variance)
         self.n = num_tables + (num_tables % 2 if duplicate else 0)
         self.rng = np.random.default_rng(seed)
+        self._ev_rng = np.random.default_rng([int(seed) % 2**63, 0xE7])
         self.mc_samples, self.max_exact = mc_samples, max_exact
         self.tables = [_Table(i, self.game) for i in range(self.n)]
         from headsup import native
@@ -300,7 +303,10 @@ class LocalBestResponse:
             for t in self.tables:
                 if not t.engine.done or t.reward is not None:
                     continue
-                t.reward = float(t.engine.rewards[t.seat])
+                if self.allin_ev:
+                    t.reward = float(t.engine.allin_ev(1000, int(self._ev_rng.integers(2**63)))[t.seat])
+                else:
+                    t.reward = float(t.engine.rewards[t.seat])
                 if not self.duplicate:
                     results[t.id].append(t.reward)
                     bar.update(1)
@@ -322,7 +328,7 @@ class LocalBestResponse:
         stages = ["preflop", "flop", "turn", "river"]
         counts = {s: {action_label(self.game, a): int(self.action_counts[i, a]) for a in range(self.num_actions)} for i, s in enumerate(stages)}
         return {
-            "policy": self.spec, "hands": int(len(results)), "duplicate": self.duplicate,
+            "policy": self.spec, "hands": int(len(results)), "duplicate": self.duplicate, "allin_ev": self.allin_ev,
             "lbr_chips_per_hand": m, "se": se, "mbb_per_hand": 1000.0 * m / self.game.big_blind, "mbb_se": 1000.0 * se / self.game.big_blind,
             "model_iterates": getattr(getattr(self.model, "bank", None), "T", None),
             "lbr_actions_by_stage": counts,
@@ -344,11 +350,12 @@ def main(argv=None):
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", default=None, help="write the summary to this file")
+    p.add_argument("--raw", action="store_true", help="dealt runouts for all-in hands instead of their expectation (all-in EV)")
     args = p.parse_args(argv)
 
     lbr = LocalBestResponse(args.policy, num_tables=args.num_tables, device=args.device, seed=args.seed,
                             mc_samples=args.mc_samples, max_exact=args.max_exact, duplicate=not args.no_duplicate,
-                            workers=args.workers, model_iterates=args.model_iterates)
+                            workers=args.workers, model_iterates=args.model_iterates, allin_ev=not args.raw)
     t0 = time.perf_counter()
     results = lbr.play(args.hands)
     summary = lbr.summary(results)
