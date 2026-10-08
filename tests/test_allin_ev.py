@@ -152,3 +152,22 @@ def test_evaluation_tools_use_allin_ev_unless_told_not_to():
     assert lbr.allin_ev and not whole(r).all()  # expectations over the runouts
     lbr = LocalBestResponse("allin", num_tables=8, device="cpu", seed=0, workers=2, mc_samples=20, allin_ev=False)
     assert whole(lbr.play(40, progress=False)).all()
+
+
+def test_lbr_values_showdowns_against_the_opponents_whole_range():
+    """LBR knows the opponent's strategy, hence its range at a showdown: the result of a showdown is the expectation
+    over that range (and over the cards to come), not the hand the opponent happened to hold. The same mean - the
+    hand it holds is drawn from exactly that range - with less variance; only for an exact opponent model."""
+    from headsup.lbr import LocalBestResponse
+
+    kw = dict(num_tables=32, device="cpu", seed=0, workers=4, mc_samples=50, duplicate=False)
+    plain = LocalBestResponse("random", range_ev=False, **kw)
+    raw = plain.play(400, progress=False)
+    ranged = LocalBestResponse("random", **kw)
+    assert ranged.range_ev and not plain.range_ev
+    ev = ranged.play(400, progress=False)
+    assert ev.std() < 0.8 * raw.std()  # measured: 24 -> 13 chips per hand (65 dealt)
+    assert abs(ev.mean() - raw.mean()) < 4 * np.sqrt(raw.var() / len(raw) + ev.var() / len(ev))
+    assert ranged.summary(ev)["range_ev"] is True
+    assert LocalBestResponse("random", allin_ev=False, **kw).range_ev is False  # --raw: dealt results
+    assert LocalBestResponse("random", model_iterates=8, **kw).range_ev is False  # an approximate opponent model

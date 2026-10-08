@@ -140,7 +140,7 @@ class _Table:
 class LocalBestResponse:
     def __init__(self, opponent_spec, num_tables=64, device=None, seed=0, mc_samples=200, max_exact=100,
                  duplicate=True, workers=None, engine_kwargs=None, model_iterates=0, opponent=None, model=None, game=None,
-                 allin_ev=True):
+                 allin_ev=True, range_ev=None):
         from headsup.players import make_player
 
         from headsup.env import resolve_game
@@ -154,6 +154,10 @@ class LocalBestResponse:
         self.model_observes = hasattr(self.model, "observe")
         self.duplicate = duplicate
         self.allin_ev = allin_ev  # all-in hands count with their expectation over the runouts (same mean, less variance)
+        # ... and showdowns with their expectation over the opponent's range, which LBR tracks anyway: given the public
+        # actions and LBR's cards, the hand the opponent holds is a draw from that range.  Only when the model IS the
+        # opponent's strategy - a thinned SD-CFR bank is an approximation, and its posterior would bias the result
+        self.range_ev = bool(allin_ev and not model_iterates) if range_ev is None else bool(range_ev)
         self.n = num_tables + (num_tables % 2 if duplicate else 0)
         self.rng = np.random.default_rng(seed)
         self._ev_rng = np.random.default_rng([int(seed) % 2**63, 0xE7])
@@ -289,6 +293,22 @@ class LocalBestResponse:
             self.value_gap.append(values[a] - values[Action.CHECK_CALL])
             e.step(a)
 
+    def _result(self, t):
+        """LBR's result of a finished hand: dealt, or (see ``allin_ev`` / ``range_ev``) its expectation over the
+        cards to come and over the opponent's range."""
+        e = t.engine
+        if not self.allin_ev:
+            return float(e.rewards[t.seat])
+        seed = int(self._ev_rng.integers(2**63))
+        if self.range_ev and e.folded < 0 and e.showdown_stage >= 0:
+            known = [int(c) for c in e.board[: BOARD_CARDS_BY_STAGE[e.showdown_stage]]]
+            eq = np.asarray(self._cpp.equity_vs_all(int(e.hands[t.seat][0]), int(e.hands[t.seat][1]), known, 1000, 1100, seed % 2**31,
+                                                    BOARD_CARDS_BY_STAGE[self.game.num_rounds - 1]), dtype=np.float64)
+            p = np.where(eq >= 0, t.range, 0.0)
+            if p.sum() > 0:
+                return self._showdown_value(e, t.seat, p / p.sum(), np.where(eq >= 0, eq, 0.5))
+        return float(e.allin_ev(1000, seed)[t.seat])
+
     # ------------------------------------------------------------------ main loop
     def play(self, hands, progress=True):
         """Play ``hands`` hands; returns per-hand LBR chip results (duplicate: per-pair means).
@@ -317,10 +337,7 @@ class LocalBestResponse:
             for t in self.tables:
                 if not t.engine.done or t.reward is not None:
                     continue
-                if self.allin_ev:
-                    t.reward = float(t.engine.allin_ev(1000, int(self._ev_rng.integers(2**63)))[t.seat])
-                else:
-                    t.reward = float(t.engine.rewards[t.seat])
+                t.reward = self._result(t)
                 if not self.duplicate:
                     results[t.id].append(t.reward)
                     bar.update(1)
@@ -343,6 +360,7 @@ class LocalBestResponse:
         counts = {s: {action_label(self.game, a): int(self.action_counts[i, a]) for a in range(self.num_actions)} for i, s in enumerate(stages)}
         return {
             "policy": self.spec, "hands": int(len(results)), "duplicate": self.duplicate, "allin_ev": self.allin_ev,
+            "range_ev": self.range_ev,
             "lbr_chips_per_hand": m, "se": se, "mbb_per_hand": 1000.0 * m / self.game.big_blind, "mbb_se": 1000.0 * se / self.game.big_blind,
             "model_iterates": getattr(getattr(self.model, "bank", None), "T", None),
             "lbr_actions_by_stage": counts,
