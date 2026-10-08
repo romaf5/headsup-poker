@@ -290,3 +290,22 @@ def test_legal_mask_from_obs_keys_and_stack_cap():
     with pytest.raises(ValueError, match="stack"):
         legal_mask_from_obs(np.stack([row(10, 30)]), big)
     legal_mask_from_obs(np.stack([row(10, 30)]), GameConfig(stack_size=STACK_FEATURE_CAP, small_blind=5, big_blind=10))
+
+
+def test_a_round_never_has_more_actions_than_the_observation_records():
+    """The observation keeps 6 actions per round; a game whose rounds can be longer cannot be replayed from it
+    (tab: / search players raised mid-hand) and history networks would not see the whole round."""
+    from headsup.engine import HISTORY_SLOTS
+
+    for kwargs in (dict(raise_cap=6), dict(raise_cap=6, stack_size=200, bet_sizes=(0.5, 1.0), mask_redundant=True),
+                   dict(stack_size=100_000, small_blind=50, big_blind=100, limit=(100, 100), raise_caps=(3, 5), num_rounds=2, all_in=False)):
+        with pytest.raises(ValueError, match="actions"):
+            GameConfig(**kwargs)
+    longest = GameConfig(stack_size=100_000, small_blind=50, big_blind=100, limit=(100, 100), raise_caps=(4, 4), num_rounds=2, all_in=False)
+    for game, line in ((GameConfig(raise_cap=5, stack_size=1000), [1, 2, 2, 2, 2, 2]), (longest, [1, 2, 2, 2, 2, 1])):
+        e = HeadsUpPoker(game=game)
+        e.reset(list(range(9)))
+        for a in line:  # the longest line of the first round at the largest cap the observation can describe
+            assert max(e.history_n) < HISTORY_SLOTS
+            e.step(a)
+        assert max(e.history_n) == HISTORY_SLOTS

@@ -24,7 +24,7 @@ import numpy as np
 
 from headsup.cards import CARD_FEATURES, NUM_CARDS, hand_strength
 from headsup.enums import Action, Stage
-from headsup.game import DEFAULT_GAME, GameConfig
+from headsup.game import DEFAULT_GAME, MAX_ROUND_ACTIONS, GameConfig
 
 # Observation layout (float32[OBS_DIM]); the first OBS_DIM_AGGREGATED entries are the original
 # 31-feature encoding, the rest is the per-street bet history of DeepCFR (Brown et al. 2019):
@@ -32,7 +32,7 @@ from headsup.game import DEFAULT_GAME, GameConfig
 # [chips put in by that action / pot before it, 1.0 (an action occurred)] (0, 0 = no action).
 OBS_DIM_AGGREGATED = 31
 HISTORY_ROUNDS = 4
-HISTORY_SLOTS = 6  # DeepCFR: "in each betting round there can be at most 6 sequential actions"
+HISTORY_SLOTS = MAX_ROUND_ACTIONS  # 6 - DeepCFR: "in each betting round there can be at most 6 sequential actions"
 HISTORY_OFFSET = OBS_DIM_AGGREGATED
 HISTORY_DIM = HISTORY_ROUNDS * HISTORY_SLOTS * 2
 OBS_DIM_HISTORY = HISTORY_OFFSET + HISTORY_DIM  # 79: what history-feature networks read

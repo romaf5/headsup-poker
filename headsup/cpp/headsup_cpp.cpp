@@ -144,6 +144,12 @@ inline void validate(const EngineConfig& c) {
     throw std::invalid_argument("raise_caps needs one entry per round");
   if (!(0 < c.small_blind && c.small_blind < c.big_blind && c.big_blind < c.stack_size))
     throw std::invalid_argument("blinds and stack need 0 < small blind < big blind < stack");
+  // the longest line of a round (a check / limp, the raises - no-limit: the cap-th one is an all-in; limit: cap
+  // raises and the closing call) must fit the observation's history slots (headsup/game.py: MAX_ROUND_ACTIONS)
+  for (int r = 0; r < c.num_rounds; ++r)
+    if (c.cap(r) + (c.has_all_in ? 1 : 2) > HISTORY_SLOTS)
+      throw std::invalid_argument("round " + std::to_string(r) + " can have more actions than the observation records (" +
+                                  std::to_string(HISTORY_SLOTS) + ")");
 }
 
 struct Engine {

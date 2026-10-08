@@ -26,6 +26,7 @@ MAX_ACTIONS = 8  # mirrored by headsup_cpp (MAX_ACTIONS): up to 5 raise sizes
 
 
 MAX_BET_SIZE = 100.0  # pot fractions above this are not bets anyone means (and overflow the chip arithmetic)
+MAX_ROUND_ACTIONS = 6  # actions of a betting round the observation records (headsup.engine.HISTORY_SLOTS)
 
 
 def parse_bet_sizes(text):
@@ -71,6 +72,13 @@ class GameConfig:
         assert 0 < self.small_blind < self.big_blind < self.stack_size
         if not 2 <= self.num_rounds <= 4:
             raise ValueError("num_rounds must be 2 (showdown after the flop), 3 or 4")
+        for r in range(self.num_rounds):
+            # the longest line of a round: a check / limp, the raises (no-limit: the cap-th one is an all-in, which
+            # ends the betting of the hand; limit: cap raises and the closing call)
+            longest = self.cap(r) + (1 if self.all_in else 2)
+            if longest > MAX_ROUND_ACTIONS:
+                raise ValueError(f"round {r} can have {longest} actions, the observation records {MAX_ROUND_ACTIONS} per round: "
+                                 f"the raise cap may be at most {MAX_ROUND_ACTIONS - (1 if self.all_in else 2)}")
 
     @property
     def num_raises(self):

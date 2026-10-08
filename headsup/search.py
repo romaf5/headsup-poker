@@ -166,7 +166,9 @@ def _continuations(spec, device, kind, thin):
         data = torch.load(path, map_location="cpu", weights_only=True)
         T = data["T"] if iterations is None else min(iterations, data["T"])
         weights = np.arange(1, T + 1, dtype=np.float64) ** gamma
-        if kind in ("policy", "iterate"):
+        if k == "iterate":  # the one strategy the `iterate:` player itself plays (headsup.players.make_player)
+            picks, w = [data["T"] - 1 if iterations is None else min(iterations, data["T"] - 1)], [1.0]
+        elif kind in ("policy", "iterate"):
             picks, w = [T - 1], [1.0]
         else:  # bank: representative iterates of equal-weight bins (see IterateBank.thin)
             n = max(1, min(thin, T))
@@ -254,7 +256,10 @@ class SearchPlayer:
 
         st = self.state.get(tid)
         n_now = self._n_actions(obs_row)
-        if st is None or n_now < st["processed"] or st["cards"] != tuple(hero_cards(obs_row)):
+        # a new hand: the seat's first decision (pre-flop, no own action yet: the small blind sees 0 actions, the big
+        # blind 1) - or, when that one was not shown to us, fewer actions than accounted for / other hole cards
+        first = int(obs_row[21]) == 0 and n_now == int(obs_row[22])
+        if st is None or first or n_now < st["processed"] or st["cards"] != tuple(hero_cards(obs_row)):
             st = self.state[tid] = self._fresh(obs_row)
         actions, pending, hero_pending = [], [], []
         counter = [0]
@@ -298,13 +303,14 @@ class SearchPlayer:
         Pluribus mode: only actions of *earlier* betting rounds are applied (the current round's
         actions are inside the solved tree, whose root is the round start), using the average
         strategy of that round's solve for both players when there was one (nested unsafe
-        search), the blueprint otherwise (the first betting round).
+        search), the blueprint otherwise (the first betting round).  A pre-flop *search* (``@pfsearch``)
+        is a depth-limited solve rooted at the current decision, so there every action is applied.
         """
         from headsup.lbr import transition_likelihood
 
         queries = []  # (table id, kind, obs, engine, action)
         for tid, (engine, hero, actions, pending, hero_pending, st) in jobs.items():
-            if self.mode == "pluribus":
+            if self.mode == "pluribus" and not (self.preflop == "search" and int(engine.stage) == 0 and not engine.done):
                 current = int(engine.stage)
                 keep = [x for x in pending + hero_pending if st["rounds"][x[3]] < current or engine.done]
                 keep.sort(key=lambda x: x[3])
@@ -468,6 +474,9 @@ class SearchPlayer:
 
         obs = np.asarray(obs, dtype=np.float32)
         ids = np.arange(len(obs)) if ids is None else np.asarray(ids)
+        if len(np.unique(ids)) != len(ids):
+            raise ValueError("a search player keeps one state per table: the ids of a query must be unique (it cannot be "
+                             "queried with hand-substituted rows; model it by its blueprint, as headsup.lbr does)")
         jobs = {int(t): self._prepare(o, int(t)) for o, t in zip(obs, ids)}
         self._update_ranges(jobs)
         t0 = time.perf_counter()
@@ -487,6 +496,16 @@ class SearchPlayer:
                 continue
             jobs[int(t)][5]["last_root"] = root.astype(np.float64)
             out[i] = root[hh]
+        if blueprint and self.model_observes:
+            # a stateful blueprint (SD-CFR's exact average: the own reach per id) must first see the hero's earlier
+            # decisions of this round - Pluribus mode applies a round's actions to the ranges at its end only.  The
+            # replay starts at the hero's first decision, where the model resets its reach: nothing is counted twice
+            for _, t, _ in blueprint:
+                hids = (2 * t + 1) * NUM_COMBOS + np.arange(NUM_COMBOS)
+                for obs_h, _, a, _ in jobs[t][4]:
+                    rows_h = substitute_hands(obs_h)
+                    self.model.probs(rows_h, hids)
+                    self.model.observe(rows_h, hids, np.full(NUM_COMBOS, a))
         if blueprint:
             rows = np.concatenate([jobs[t][5].pop("blueprint_rows") for _, t, _ in blueprint])
             # the hero's id space of the range updates ((2 t + 1) * 1326 + combo): a stateful blueprint keeps one
@@ -519,11 +538,11 @@ def parse_search_spec(arg):
     ``[@pluribus][@b<buckets>][@th<threads>][@avg][@pfsearch][@leaf<leaf choices>]`` -> kwargs (``@k<K>`` stays with
     an SD-CFR blueprint: its bank thinning)."""
     parts = arg.split("@")
-    # the blueprint spec itself may contain '@' options (sdcfr:...@g2): the search options are the
-    # trailing ones that parse as ours; when an option repeats, the rightmost wins
-    kw = {}
-    while len(parts) > 1:
-        o = parts[-1]
+    # the blueprint spec itself may contain '@' options (sdcfr:...@g2): the search options are those that
+    # parse as ours, wherever they stand (the blueprint's parsers reject what is left over and unknown);
+    # when an option repeats, the rightmost wins
+    kw, rest = {}, []
+    for o in reversed(parts[1:]):
         if o.startswith("it") and o[2:].isdigit():
             kw.setdefault("iterations", int(o[2:]))
         elif o.startswith("rit") and o[3:].isdigit():
@@ -551,6 +570,5 @@ def parse_search_spec(arg):
         elif o.startswith("leaf") and o[4:].isdigit():
             kw.setdefault("leaf_choices", int(o[4:]))
         else:
-            break
-        parts.pop()
-    return "@".join(parts), kw
+            rest.append(o)
+    return "@".join(parts[:1] + rest[::-1]), kw

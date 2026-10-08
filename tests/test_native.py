@@ -272,3 +272,13 @@ def test_blueprint_abstraction_arguments_are_checked():
     table.build(native.engine_config(game=DEFAULT_GAME), 8, 20, "table", 10)
     with pytest.raises(bad, match="centroids"):
         table.centroids = [[], [0.5] * 6, [0.5] * 16, [0.5] * 16]  # 3 centroids for 8 buckets
+
+
+def test_engine_config_rejects_rounds_longer_than_the_history():
+    cpp = native.module()
+    cfg = cpp.EngineConfig()
+    cfg.raise_cap = 6  # a limp and six raises: seven actions, the observation records six per round
+    with pytest.raises((RuntimeError, ValueError), match="actions"):
+        cpp.Engine(cfg)
+    cfg.raise_cap = 5
+    cpp.Engine(cfg)

@@ -270,11 +270,32 @@ def parse_sdcfr_spec(arg):
     ``iterations`` (use the first N iterates) and ``thin`` (K representative iterates) None if absent."""
     parts = arg.split("@")
     path, opts = parts[0], parts[1:]
-    mode = next((o for o in opts if o in ("exact", "sample")), "sample")
-    gamma = next((float(o[1:]) for o in opts if o.startswith("g")), 1.0)
-    iterations = next((int(o[1:]) for o in opts if o.startswith("t")), None)
-    thin = next((int(o[1:]) for o in opts if o.startswith("k")), None)
+    mode, gamma, iterations, thin = "sample", 1.0, None, None
+    for o in reversed(opts):  # the leftmost of a repeated option wins, as before
+        try:
+            if o in ("exact", "sample"):
+                mode = o
+            elif o[:1] == "g":
+                gamma = float(o[1:])
+            elif o[:1] == "t":
+                iterations = int(o[1:])
+            elif o[:1] == "k":
+                thin = int(o[1:])
+            else:
+                raise ValueError(o)
+        except ValueError:
+            raise ValueError(f"unknown option @{o} in the spec {arg!r} (known: @exact @sample @g<gamma> @t<N> @k<K>)") from None
     return path, mode, gamma, iterations, thin
+
+
+def pluribus_spec(spec):
+    """The ``search:`` argument that ``pluribus[@options]`` stands for (the shipped blueprint, Pluribus mode)."""
+    from headsup.paths import DEFAULT_BLUEPRINT_PATH
+
+    head, _, arg = spec.partition(":")
+    if "@" in head:  # options without a path: pluribus@it300@th8
+        arg = head.partition("@")[2]
+    return f"tab:{DEFAULT_BLUEPRINT_PATH}@pluribus@th16" + (f"@{arg}" if arg else "")
 
 
 def make_player(spec: str, device=None, deterministic=False, seed=None, game=None):
@@ -297,7 +318,7 @@ def make_player(spec: str, device=None, deterministic=False, seed=None, game=Non
     kind, _, arg = spec.partition(":")
     kind = kind.lower()
     if kind.startswith("pluribus@"):  # options without a path: pluribus@it300@th8
-        kind, arg = "pluribus", kind[len("pluribus@"):]
+        kind = "pluribus"
     game = game or DEFAULT_GAME
     if kind in SIMPLE_PLAYERS:
         return SIMPLE_PLAYERS[kind](seed=seed, game=game)
@@ -315,7 +336,7 @@ def make_player(spec: str, device=None, deterministic=False, seed=None, game=Non
     if kind == "pluribus":  # the shipped tabular blueprint + Pluribus-style search (options after '@' as for search:)
         from headsup.search import SearchPlayer, parse_search_spec
 
-        blueprint, kw = parse_search_spec(f"tab:{DEFAULT_BLUEPRINT_PATH}@pluribus@th16" + (f"@{arg}" if arg else ""))
+        blueprint, kw = parse_search_spec(pluribus_spec(spec))
         kw.setdefault("threads", 16)
         return SearchPlayer(blueprint, device=device, seed=seed, game=game, **kw)
     if kind == "sdcfr":

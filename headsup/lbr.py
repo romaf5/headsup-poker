@@ -61,12 +61,8 @@ def transition_likelihood(engine, action, sigma):
     public state (e.g. a capped raise and an all-in) are indistinguishable, so their probabilities
     are summed.  The engine is left untouched."""
     outcomes = []
-    legal = engine.legal_mask()
-    for cand in range(engine.num_actions):
-        if not legal[cand]:
-            outcomes.append(None)
-            continue
-        c = engine.clone()
+    for cand in range(engine.num_actions):  # every index: the engine executes a masked action as its twin (a fold with
+        c = engine.clone()                  # nothing to call is a check), and a model's probs() need not be masked
         c.step(cand)
         outcomes.append((c.done, c.folded, tuple(c.bets), tuple(c.stacks), int(c.stage)))
     c = engine.clone()
@@ -95,9 +91,13 @@ def _model_for(spec, device, seed, model_iterates=0, game=None):
     from headsup.players import make_player, parse_sdcfr_spec
 
     kind, _, arg = spec.partition(":")
-    if kind.lower() == "search":  # a search player is modelled by its blueprint (still a valid lower bound)
+    if kind.lower() == "search" or kind.lower().split("@")[0] == "pluribus":
+        # a search player is modelled by its blueprint (still a valid lower bound)
+        from headsup.players import pluribus_spec
         from headsup.search import parse_search_spec
 
+        if kind.lower() != "search":
+            arg = pluribus_spec(spec)
         return _model_for(parse_search_spec(arg)[0], device, seed, model_iterates, game)
     if kind.lower() == "sdcfr":
         from headsup.device import get_device
@@ -274,18 +274,23 @@ class LocalBestResponse:
 
     # ------------------------------------------------------------------ main loop
     def play(self, hands, progress=True):
-        """Play ``hands`` hands; returns per-hand LBR chip results (duplicate: per-pair means)."""
+        """Play ``hands`` hands; returns per-hand LBR chip results (duplicate: per-pair means).
+
+        Every table (pair) plays the same number of hands and then stops, as in :func:`headsup.env.play_hands`:
+        taking the first results to finish among lock-step tables over-represents short hands."""
         from tqdm import tqdm
 
-        results = []
+        units = self.n // 2 if self.duplicate else self.n  # a unit = a table, or a pair of duplicate tables
+        quota = -(-int(hands) // units)
+        results = [[] for _ in range(units)]
         for t in self.tables:  # even tables draw the decks, so they start first
             if not self.duplicate or t.id % 2 == 0:
                 self._start_table(t)
         if self.duplicate:
             for t in self.tables[1::2]:
                 self._start_table(t)
-        bar = tqdm(total=hands, disable=not progress, desc="lbr")
-        while len(results) < hands:
+        bar = tqdm(total=quota * units, disable=not progress, desc="lbr")
+        while any(len(r) < quota for r in results):
             opp = [t for t in self.tables if not t.engine.done and t.engine.current == t.opp]
             if opp:
                 self._opponent_step(opp)
@@ -297,18 +302,20 @@ class LocalBestResponse:
                     continue
                 t.reward = float(t.engine.rewards[t.seat])
                 if not self.duplicate:
-                    results.append(t.reward)
+                    results[t.id].append(t.reward)
                     bar.update(1)
-                    self._start_table(t)
+                    if len(results[t.id]) < quota:
+                        self._start_table(t)
                     continue
                 partner = self.tables[t.id ^ 1]
                 if partner.reward is not None:  # both tables of the pair are done
-                    results.append(0.5 * (t.reward + partner.reward))
+                    results[t.id // 2].append(0.5 * (t.reward + partner.reward))
                     bar.update(1)
-                    self._start_table(self.tables[t.id & ~1])
-                    self._start_table(self.tables[t.id | 1])
+                    if len(results[t.id // 2]) < quota:
+                        self._start_table(self.tables[t.id & ~1])
+                        self._start_table(self.tables[t.id | 1])
         bar.close()
-        return np.asarray(results[:hands], dtype=np.float64)
+        return np.asarray(results, dtype=np.float64).T.reshape(-1)[:hands]  # [k-th hand, unit]
 
     def summary(self, results):
         m, se = float(results.mean()), float(results.std(ddof=1) / np.sqrt(len(results)))

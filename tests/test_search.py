@@ -250,3 +250,148 @@ def test_pluribus_mode_player(tmp_path):
         assert np.all(st["villain"][valid_combos(list(st["cards"])) == 0] == 0)
         if st["solver"] is not None:  # a full-game vector solve rooted at the round it was made in (snapshot)
             assert st["solver"].root_round == st["solver_round"] >= 1 and st["solver"].node_player(0) >= 0
+
+
+def test_search_options_are_found_anywhere_and_unknown_options_raise():
+    """Search options left of a blueprint option stayed in the blueprint spec, whose parsers ignored unknown
+    options: 'sdcfr:x@pluribus@exact' silently ran depth mode."""
+    from headsup.blueprint import parse_tab_spec
+    from headsup.players import parse_sdcfr_spec
+
+    assert parse_search_spec("sdcfr:x/it.pt@pluribus@exact") == ("sdcfr:x/it.pt@exact", {"mode": "pluribus"})
+    assert parse_search_spec("sdcfr:x/it.pt@it100@k64") == ("sdcfr:x/it.pt@k64", {"iterations": 100})
+    assert parse_search_spec("tab:bp.pt@pluribus@current@th2") == ("tab:bp.pt@current", {"mode": "pluribus", "threads": 2})
+    assert parse_search_spec("tab:bp.pt@it50@it20")[1] == {"iterations": 20}  # a repeated option: the rightmost wins
+    assert parse_sdcfr_spec("x/it.pt@exact@g2@t100@k64") == ("x/it.pt", "exact", 2.0, 100, 64)
+    for bad in ("x/it.pt@pluribus", "x/it.pt@t10x", "x/it.pt@exat"):
+        with pytest.raises(ValueError, match="option"):
+            parse_sdcfr_spec(bad)
+    assert parse_tab_spec("bp.pt@current") == ("bp.pt", True)
+    with pytest.raises(ValueError, match="option"):
+        parse_tab_spec("bp.pt@curent")
+
+
+def _random_bank(path, T=3, tag=False):
+    from headsup.model import BaseModel, normalize_config
+    from headsup.sdcfr import IterateBank
+
+    cfg = normalize_config({"features": "history"})
+    torch.manual_seed(0)
+    dicts = [[], []]
+    for seat in (0, 1):
+        for t in range(T):
+            m = BaseModel(config=cfg)
+            with torch.no_grad():
+                if tag:
+                    m.action_head.bias.fill_(float(t))  # the bias tells which bank index a net is
+                else:
+                    torch.nn.init.normal_(m.action_head.weight, std=1.5)
+                    torch.nn.init.normal_(m.action_head.bias, std=1.5)
+            dicts[seat].append({k: v.clone() for k, v in m.state_dict().items()})
+    IterateBank.from_state_dicts(dicts, "cpu", cfg).save(path)
+    return IterateBank.load(path, "cpu")
+
+
+def test_iterate_blueprint_and_its_continuation_use_the_same_iterate(tmp_path, monkeypatch):
+    """`search:iterate:<bank>@tN`: the opponent model played bank index N, the continuation index N - 1."""
+    import headsup.search as search
+    from headsup.players import make_player
+
+    path = tmp_path / "bank.pt"
+    _random_bank(path, T=6, tag=True)
+    seen = []
+    make_model = native.make_model
+
+    def spy(weights):
+        seen.extend(float(np.asarray(v).ravel()[0]) for k, v in weights.items() if k.endswith("action_head.bias"))
+        return make_model(weights)
+
+    monkeypatch.setattr(native, "make_model", spy)
+    for n in (2, 4):
+        played = float(make_player(f"iterate:{path}@t{n}", device="cpu").nets[0].action_head.bias[0].item())
+        seen.clear()
+        search._continuations(f"iterate:{path}@t{n}", "cpu", "iterate", 8)
+        assert played == n and seen and set(seen) == {float(n)}
+
+
+def test_pluribus_mode_plays_the_sdcfr_average_at_a_second_preflop_decision(tmp_path):
+    """Pluribus mode with an SD-CFR blueprint: at the hero's second pre-flop decision the blueprint must weight the
+    iterates by their probability of the hero's first action (the reach was never updated: the plain mixture)."""
+    from headsup.engine import HeadsUpPoker
+    from headsup.players import make_player
+
+    path = tmp_path / "bank.pt"
+    bank = _random_bank(path, T=3)
+    p = make_player(f"search:sdcfr:{path}@pluribus@it20@b20@th1", device="cpu", seed=0)
+    w = bank.weights.numpy()
+    for deal_seed in range(200):  # a deal where the iterates raise with clearly different probabilities
+        e = HeadsUpPoker(rng=np.random.default_rng(deal_seed), game=p.game)
+        e.reset()
+        obs1 = e.observation(0)
+        sig1 = bank.strategies(0, obs1[None])[:, 0].numpy()
+        if (sig1[:, 2] > 0.05).sum() >= 2 and np.ptp(sig1[:, 2]) > 0.3:
+            break
+    ids = np.array([5])
+    np.testing.assert_allclose(p.probs(obs1[None], ids)[0], (w[:, None] * sig1).sum(0) / w.sum(), atol=1e-5)
+    e.step(2)  # the hero (small blind) raises
+    e.step(2)  # the big blind re-raises
+    obs2 = e.observation(0)
+    sig2 = bank.strategies(0, obs2[None])[:, 0].numpy()
+    reach = w * sig1[:, 2]
+    exact = (reach[:, None] * sig2).sum(0) / reach.sum()
+    assert np.abs(exact - (w[:, None] * sig2).sum(0) / w.sum()).max() > 0.05  # the reach matters in this deal
+    np.testing.assert_allclose(p.probs(obs2[None], ids)[0], exact, atol=1e-5)
+    np.testing.assert_allclose(p.probs(obs2[None], ids)[0], exact, atol=1e-5)  # asking again changes nothing
+
+
+def _random_policy(path, std=0.6):
+    from headsup.model import BaseModel
+    from headsup.players import TorchPolicyPlayer
+
+    torch.manual_seed(0)
+    m = BaseModel()
+    with torch.no_grad():
+        torch.nn.init.normal_(m.action_head.weight, std=std)
+    m.save(path)
+    return TorchPolicyPlayer(m, device="cpu")
+
+
+def test_preflop_search_in_pluribus_mode_gets_the_ranges_of_its_root(tmp_path):
+    """`@pluribus@pfsearch`: the pre-flop solve is rooted at the current decision, so the villain's range must
+    already contain its actions of this round (it got the round-start prior)."""
+    from headsup.engine import HeadsUpPoker
+    from headsup.lbr import substitute_hands
+    from headsup.players import make_player
+
+    bp = _random_policy(tmp_path / "bp.pth")
+    p = make_player(f"search:cfr:{tmp_path / 'bp.pth'}@pluribus@pfsearch@it300@b30@th1", device="cpu", seed=0)
+    e = HeadsUpPoker(rng=np.random.default_rng(1), game=p.game)
+    e.reset()
+    obs_sb = e.observation(0)
+    e.step(2)  # the small blind raises; the hero is the big blind
+    p.probs(e.observation(1)[None], np.array([0]))
+    st = p.state[0]
+    assert st["solver_actions"] == [2]  # the solve is rooted after the raise
+    post = valid_combos(e.hands[1]) * np.asarray(bp.probs(substitute_hands(obs_sb)), dtype=float)[:, 2]
+    np.testing.assert_allclose(st["villain"], post / post.sum(), atol=1e-9)
+
+
+def test_a_new_hand_with_the_same_hole_cards_starts_from_fresh_ranges(tmp_path):
+    """A new hand was recognised by fewer actions or other hole cards only: the same cards in the same seat again
+    (duplicate tables, random seats) kept the previous hand's ranges."""
+    from headsup.engine import HeadsUpPoker
+    from headsup.lbr import substitute_hands
+    from headsup.players import make_player
+
+    bp = _random_policy(tmp_path / "bp.pth")
+    p = make_player(f"search:cfr:{tmp_path / 'bp.pth'}@it200@rit20", device="cpu", seed=0)
+    e = HeadsUpPoker(game=p.game)
+    e.reset([0, 1, 20, 33, 5, 6, 7, 8, 9])  # the hero (big blind) holds cards 20, 33
+    e.step(2)  # hand 1: the small blind raises, the hero decides once
+    p.probs(e.observation(1)[None], np.array([0]))
+    e.reset([10, 11, 20, 33, 40, 41, 42, 43, 44])  # the next hand at this table: the same hole cards
+    obs_sb = e.observation(0)
+    e.step(1)  # hand 2: the small blind limps
+    p.probs(e.observation(1)[None], np.array([0]))
+    post = valid_combos([20, 33]) * np.asarray(bp.probs(substitute_hands(obs_sb)), dtype=float)[:, 1]
+    np.testing.assert_allclose(p.state[0]["villain"], post / post.sum(), atol=1e-9)

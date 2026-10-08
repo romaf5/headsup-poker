@@ -104,7 +104,8 @@ class TabularBlueprint:
             bp.cpp.edges = [list(map(float, e)) for e in data["edges"]]
         if data.get("centroids"):
             bp.cpp.centroids = [list(map(float, c)) for c in data["centroids"]]
-        if "regret" in data:
+        bp.has_regrets = "regret" in data  # a play-only file has the average strategy only
+        if bp.has_regrets:
             bp.cpp.regret = np.asarray(data["regret"], dtype=np.float32)
         bp.cpp.phi = np.asarray(data["phi"], dtype=np.float32)
         bp.cpp.iterations = int(data["iterations"])
@@ -123,7 +124,19 @@ class TabularBlueprint:
         return np.asarray(self.cpp.strategy_for_hands(int(node), np.asarray(hands, dtype=np.int32).reshape(-1, 2), list(map(int, board)), int(seed), current))
 
 
-_PROJ = np.random.default_rng(12345).random(128)  # fixed random projection for the public-state keys
+_PROJ = np.random.default_rng(12345).random((2, 128))  # two fixed random projections for the public-state keys
+
+
+def public_groups(obs):
+    """(first, inverse): the rows of ``obs`` grouped by their public part (everything but the hand slots);
+    ``first[g]`` is a row of group g, ``inverse[i]`` the group of row i."""
+    # keyed by two random projections (equal rows -> equal keys; distinct rows collide with negligible probability -
+    # with one projection ~3e-8 per pair of states, which big best-response queries did hit), much cheaper than
+    # np.unique over 74-column rows
+    pub = np.asarray(obs)[:, 6:].astype(np.float64)
+    a, b = np.round(pub @ _PROJ[:, : pub.shape[1]].T, 6).T
+    _, first, inverse = np.unique(a + 1j * b, return_index=True, return_inverse=True)
+    return first, inverse.ravel()
 
 
 class TabularPlayer:
@@ -135,6 +148,8 @@ class TabularPlayer:
         from concurrent.futures import ThreadPoolExecutor
 
         self.bp = blueprint if isinstance(blueprint, TabularBlueprint) else TabularBlueprint.load(blueprint)
+        if current and not getattr(self.bp, "has_regrets", True):
+            raise ValueError("@current needs the blueprint's regrets, and this file was saved play-only (average strategy only)")
         self.game = self.bp.game
         self.current = current
         self.rng = np.random.default_rng(seed)
@@ -158,13 +173,7 @@ class TabularPlayer:
 
         obs = np.asarray(obs, dtype=np.float32)
         out = np.zeros((len(obs), self.game.num_actions), dtype=np.float32)
-        # rows sharing the public part (everything but the hand slots) form one query; the rows are
-        # keyed by two random projections (equal rows -> equal keys, distinct rows collide with
-        # negligible probability), which is much cheaper than np.unique over 74-column rows
-        pub = obs[:, 6:].astype(np.float64)
-        keys = np.round(pub @ _PROJ[: pub.shape[1]], 6)
-        _, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
-        inverse = inverse.ravel()
+        first, inverse = public_groups(obs)  # rows sharing the public part (everything but the hand slots) form one query
         all_hands = np.sort(np.stack([obs[:, 2], obs[:, 5]], axis=1).astype(np.int32) - 1, axis=1)
         jobs = []  # (row indices, node, hands, board, seed): the C++ queries, run in parallel below (they release the GIL)
         for g, ref_i in enumerate(first):
@@ -203,6 +212,9 @@ class TabularPlayer:
 def parse_tab_spec(arg):
     """``[path.pt][@current]`` -> (path or '', current)."""
     parts = arg.split("@")
+    for o in parts[1:]:
+        if o != "current":
+            raise ValueError(f"unknown option @{o} in the spec {arg!r} (known: @current)")
     return parts[0], "current" in parts[1:]
 
 

@@ -131,3 +131,35 @@ def test_table_abstraction_features_and_round_trip(tmp_path):
     probs = p.probs(substitute_hands(e.observation(1)))
     assert probs.shape == (NUM_COMBOS, 4)
     np.testing.assert_allclose(probs.sum(1), 1.0, atol=1e-5)
+
+
+def test_current_strategy_needs_the_regrets(tmp_path):
+    """`tab:<file>@current` on a play-only blueprint (no regrets saved) silently played uniform random."""
+    from headsup.blueprint import TabularBlueprint, TabularPlayer
+
+    bp = TabularBlueprint(FHP, buckets=10, samples=50).fit_abstraction(2000, 0, 4)
+    bp.run(2000, 1, 4)
+    bp.save(tmp_path / "play.pt", play_only=True)
+    bp.save(tmp_path / "full.pt")
+    with pytest.raises(ValueError, match="regret"):
+        TabularPlayer(str(tmp_path / "play.pt"), current=True)
+    TabularPlayer(str(tmp_path / "play.pt"))  # the average strategy is what a play-only file has
+    TabularPlayer(str(tmp_path / "full.pt"), current=True)
+
+
+def test_public_states_are_grouped_exactly():
+    """Rows were grouped by ONE rounded random projection of the public features: these two turn boards collided, so
+    one of them was answered with the other's node and board."""
+    from headsup.blueprint import public_groups
+    from headsup.cards import CARD_FEATURES
+    from headsup.engine import HeadsUpPoker
+
+    e = HeadsUpPoker(game=DEFAULT_GAME)
+    e.reset(list(range(40, 49)))
+    for _ in range(4):
+        e.step(1)  # check / call to the turn
+    rows = np.repeat(e.observation()[None], 3, 0)
+    for i, board in enumerate(([1, 26, 28, 13], [12, 14, 26, 4], [1, 26, 28, 13])):
+        rows[i, 6:18] = CARD_FEATURES[board].reshape(12)
+    first, inverse = public_groups(rows)
+    assert len(first) == 2 and inverse[0] == inverse[2] != inverse[1]

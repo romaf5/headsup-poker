@@ -134,3 +134,48 @@ def test_equity_uses_the_games_showdown_board():
         s = hand_strength([a, b], board)
         exact = 1.0 if s_me < s else 0.5 if s_me == s else 0.0
         assert eq[cpp.combo_index(a, b)] == pytest.approx(exact)
+
+
+def test_lbr_plays_the_same_number_of_hands_at_every_table():
+    """play() returned the first pairs to finish among lock-step tables: short hands were over-represented and the
+    hands still in flight were dropped (the bias env.play_hands had; +2 chips at 2 tables / 3000 hands vs 'call')."""
+    lbr = LocalBestResponse("call", num_tables=8, device="cpu", seed=0, workers=4, mc_samples=20)
+    starts = np.zeros(lbr.n, dtype=int)
+    start = lbr._start_table
+
+    def counting(t):
+        starts[t.id] += 1
+        start(t)
+
+    lbr._start_table = counting
+    r = lbr.play(30, progress=False)  # 4 duplicate pairs: 8 pairs of hands each, the first 30 results returned
+    assert len(r) == 30 and starts.tolist() == [8] * 8
+
+
+def test_transition_likelihood_counts_an_action_as_what_the_engine_executes():
+    """A fold with nothing to call is executed as a check: a model that 'folds' half the time checks with
+    probability 1 (illegal indices were skipped: 0.5, an under-counted likelihood for unmasked models)."""
+    from headsup.lbr import transition_likelihood
+
+    e = HeadsUpPoker(game=DEFAULT_GAME)
+    e.reset(list(range(9)))
+    e.step(Action.CHECK_CALL)  # the small blind calls: the big blind has nothing to call
+    assert not e.legal_mask()[Action.FOLD]
+    sigma = np.zeros((NUM_COMBOS, e.num_actions))
+    sigma[:, Action.FOLD] = sigma[:, Action.CHECK_CALL] = 0.5
+    np.testing.assert_allclose(transition_likelihood(e, Action.CHECK_CALL, sigma), 1.0)
+
+
+def test_lbr_models_the_pluribus_bot_by_its_blueprint():
+    """`pluribus[@options]` is a search player like `search:`: LBR queries its blueprint (the SearchPlayer itself was
+    queried with 1326 hand-substituted rows as if they were tables: KeyError on the first bet lookahead)."""
+    from headsup.blueprint import TabularPlayer
+    from headsup.lbr import _model_for
+    from headsup.paths import DEFAULT_BLUEPRINT_PATH
+
+    import os
+
+    if not os.path.exists(DEFAULT_BLUEPRINT_PATH):
+        pytest.skip("the shipped blueprint is not present")
+    for spec in ("pluribus", "pluribus@it20@th2@b50"):
+        assert isinstance(_model_for(spec, "cpu", 0), TabularPlayer)
