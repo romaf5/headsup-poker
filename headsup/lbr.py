@@ -148,6 +148,8 @@ class LocalBestResponse:
         self.spec = opponent_spec
         self.opponent = opponent if opponent is not None else make_player(opponent_spec, device=device, seed=seed, game=game)  # plays
         self.game = resolve_game(game, self.opponent, **(engine_kwargs or {}))
+        if model is None and getattr(self.opponent, "answers_all_hands", False):
+            model = self.opponent  # a search player that can say what every hand does at a public state: the strategy it plays
         self.model = model if model is not None else _model_for(opponent_spec, device, seed + 1, model_iterates, self.game)  # is queried
         self.model_observes = hasattr(self.model, "observe")
         self.duplicate = duplicate
@@ -181,6 +183,18 @@ class LocalBestResponse:
 
     def _query(self, tables, obs_rows):
         """Opponent strategy for every combo at the given decision points: (len(tables), 1326, num_actions)."""
+        if hasattr(self.model, "all_hands_probs"):  # per table, from the real observation (a search player's round solve)
+            ids = [t.id for t in tables]
+            probs = np.empty((len(tables), NUM_COMBOS, self.num_actions))
+            todo = list(range(len(tables)))
+            while todo:  # several states of one table (the bets LBR considers): one row per table and call
+                batch, later, seen = [], [], set()
+                for k in todo:
+                    (later if ids[k] in seen else batch).append(k)
+                    seen.add(ids[k])
+                probs[batch] = self.model.all_hands_probs(np.stack([obs_rows[k] for k in batch]), np.asarray([ids[k] for k in batch]))
+                todo = later
+            return probs, None, None
         rows = np.concatenate([substitute_hands(o) for o in obs_rows])
         ids = np.concatenate([t.id * NUM_COMBOS + np.arange(NUM_COMBOS) for t in tables])
         probs = self.model.probs(rows, ids)

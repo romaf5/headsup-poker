@@ -241,7 +241,11 @@ class SearchPlayer:
         from headsup.public import hero_cards
 
         mine = hero_cards(obs)
-        villain = valid_combos(mine).astype(np.float64)
+        # Pluribus keeps the beliefs "from an outside observer's perspective": every pair of cards starts at 1/1326
+        # for both players, and the solver's card removal does the rest.  The solve then does not depend on the
+        # hand we hold (which is what lets an evaluator ask for every hand's strategy).  Depth mode samples hands
+        # around the real one and conditions the opponent's range on it.
+        villain = np.ones(NUM_COMBOS) if self.mode == "pluribus" else valid_combos(mine).astype(np.float64)
         hero = np.ones(NUM_COMBOS)
         return {"villain": villain, "hero": hero, "processed": 0, "last_root": None, "last_action": None, "cards": tuple(mine),
                 "solver": None, "solver_actions": None, "solver_round": -1}
@@ -355,7 +359,8 @@ class SearchPlayer:
             for key in ("villain", "hero"):
                 total = st[key].sum()
                 if total <= 1e-12:  # the model gave the observed line probability 0: fall back to uniform
-                    st[key] = valid_combos(board + (list(st["cards"]) if key == "villain" else [])).astype(np.float64)
+                    private = list(st["cards"]) if key == "villain" and self.mode != "pluribus" else []
+                    st[key] = valid_combos(board + private).astype(np.float64)
                     total = st[key].sum()
                 st[key] /= total
 
@@ -366,7 +371,7 @@ class SearchPlayer:
 
         def __init__(self, sv):
             self.root_round = sv.root_round
-            self._player, self._round, self._child, self._strategy = {}, {}, {}, {}
+            self._player, self._round, self._child, self._strategy, self._final = {}, {}, {}, {}, {}
             stack = [0]
             seen = set()
             while stack:
@@ -379,6 +384,7 @@ class SearchPlayer:
                 if self._player[node] < 0 or self._round[node] != sv.root_round:
                     continue  # terminal / later-round node: keep its identity only
                 self._strategy[node] = np.asarray(sv.node_strategy(node), dtype=np.float64)
+                self._final[node] = np.asarray(sv.node_strategy(node, True), dtype=np.float64)
                 for a in range(self._strategy[node].shape[1]):
                     c = sv.child(node, a)
                     self._child[(node, a)] = c
@@ -395,35 +401,45 @@ class SearchPlayer:
             return self._round.get(node, -1)
 
         def node_strategy(self, node):
+            """Average strategy (all hands): what the beliefs are updated with."""
             return self._strategy[node]
 
+        def final_strategy(self, node):
+            """Strategy of the last iteration (all hands): what Pluribus plays."""
+            return self._final[node]
+
     def _solve_round(self, engine, hero, actions, st, seed):
-        """Pluribus mode: solve the remaining game from the start of the current betting round
-        (the hero's actions taken in the round frozen for its real hand) and return the strategy
-        at the hero's node (final iterate or average) plus the hero's combo index."""
+        """Pluribus mode: the strategy table (all hands) at the hero's node and the hero's combo index.
+
+        The remaining game is solved once per betting round, from the round's start with the public beliefs
+        (Pluribus's Algorithm 2 searches when a round begins); every decision of the round - ours, and the ones an
+        evaluator asks about - is read from that solve.  Nothing is frozen: no later solve of this round exists
+        that could change what was played."""
         cpp = self._cpp
         current = int(engine.stage)
         n_root = next((i for i, r in enumerate(st["rounds"]) if r == current), len(actions))
-        e = cpp.Engine(self._cfg)
-        e.reset(list(engine.hands[0]) + list(engine.hands[1]) + list(engine.board))
-        for a in actions[:n_root]:
-            e.step(int(a))
-        ranges = [st["hero"], st["villain"]] if hero == 0 else [st["villain"], st["hero"]]
         a, b = sorted(st["cards"])
         hh = cpp.combo_index(int(a), int(b))
-        sv = cpp.VectorSolver()
-        sv.build(e, self.buckets)
-        sv.set_ranges(ranges[0].astype(np.float32), ranges[1].astype(np.float32))
+        solve = st.get("solver")
+        if not (solve is not None and st.get("solver_round") == current and st.get("solver_actions") == list(actions[:n_root])):
+            e = cpp.Engine(self._cfg)
+            e.reset(list(engine.hands[0]) + list(engine.hands[1]) + list(engine.board))
+            for act in actions[:n_root]:
+                e.step(int(act))
+            ranges = [st["hero"], st["villain"]] if hero == 0 else [st["villain"], st["hero"]]
+            sv = cpp.VectorSolver()
+            sv.build(e, self.buckets)
+            sv.set_ranges(ranges[0].astype(np.float32), ranges[1].astype(np.float32))
+            sv.run(self.iterations, int(seed) & 0xFFFFFFFF, self.threads)
+            self.solves += 1
+            solve = self._RoundSolve(sv)  # the strategies of the round's nodes; the C++ solver and its board tables go
+            st["solver"], st["solver_actions"], st["solver_round"] = solve, list(actions[:n_root]), current
         node = 0
         for act in actions[n_root:]:
-            if sv.node_player(node) == hero:
-                sv.freeze(node, hh, int(act))
-            node = sv.child(node, int(act))
-        sv.run(self.iterations, int(seed) & 0xFFFFFFFF, self.threads)
-        self.solves += 1
-        out = sv.node_strategy(node, self.play == "final")
-        st["solver"], st["solver_actions"], st["solver_round"] = self._RoundSolve(sv), list(actions[:n_root]), current
-        return out, hh
+            node = solve.child(node, int(act))
+        if node < 0 or solve.node_player(node) != hero:
+            raise RuntimeError("the observed actions leave the solved round")
+        return (solve.final_strategy(node) if self.play == "final" else solve.node_strategy(node)), hh
 
     def _solve(self, engine, hero, actions, st, seed):
         cpp = self._cpp
@@ -523,6 +539,50 @@ class SearchPlayer:
         s = out.sum(axis=1, keepdims=True)
         out = np.where(s > 0, out / np.maximum(s, 1e-12), legal / legal.sum(axis=1, keepdims=True))
         return out.astype(np.float32)
+
+    @property
+    def answers_all_hands(self):
+        """Whether :meth:`all_hands_probs` exists: Pluribus mode with a blueprint that plays the first round and
+        keeps no per-hand state - then no solve depends on the hand the player holds."""
+        return self.mode == "pluribus" and self.preflop == "blueprint" and not self.model_observes
+
+    def all_hands_probs(self, obs, ids):
+        """The strategy of every hand at the public states of ``obs`` (one row per table): (N, 1326, A).
+
+        Pre-flop the blueprint's rows, afterwards the round's solve - the tables the player's own decisions are read
+        from.  So an evaluator (:mod:`headsup.lbr`) that asks this gets the strategy that is played, at the real
+        state and at any state the current round's actions could lead to, without a second solve."""
+        from headsup.engine import legal_mask_from_obs
+
+        if not self.answers_all_hands:
+            raise ValueError("all-hands strategies need Pluribus mode with a stateless blueprint playing the first round")
+        obs = np.asarray(obs, dtype=np.float32)
+        ids = np.asarray(ids)
+        if len(np.unique(ids)) != len(ids):
+            raise ValueError("one row per table")
+        jobs = {int(t): self._prepare(o, int(t)) for o, t in zip(obs, ids)}
+        self._update_ranges(jobs)
+        seeds = self.rng.integers(2**63, size=len(ids))
+        out = np.zeros((len(obs), NUM_COMBOS, self.game.num_actions))
+        futs, blueprint = {}, []
+        for i, (t, sd) in enumerate(zip(ids, seeds)):
+            engine, hero, actions, _, _, st = jobs[int(t)]
+            if engine.done:
+                out[i, :, 1] = 1.0
+            elif int(engine.stage) == 0:
+                blueprint.append(i)
+            else:
+                futs[i] = self._pool.submit(self._solve_round, engine, hero, actions, st, sd)
+        if blueprint:
+            rows = np.concatenate([substitute_hands(jobs[int(ids[i])][0].observation(jobs[int(ids[i])][1])) for i in blueprint])
+            out[blueprint] = np.asarray(self.model.probs(rows), dtype=np.float64).reshape(len(blueprint), NUM_COMBOS, -1)
+        for i, f in futs.items():
+            out[i] = f.result()[0]
+        legal = legal_mask_from_obs(obs, self.game)  # public: the same for every hand of a table
+        out[~legal[:, None, :].repeat(NUM_COMBOS, 1)] = 0.0
+        total = out.sum(axis=2, keepdims=True)
+        uniform = (legal / legal.sum(axis=1, keepdims=True))[:, None, :]
+        return np.where(total > 0, out / np.maximum(total, 1e-12), uniform)
 
     def __call__(self, obs, ids=None):
         from headsup.players import sample_actions

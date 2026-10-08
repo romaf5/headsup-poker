@@ -2074,6 +2074,7 @@ struct VectorSolver {
   int root_board[5] = {0, 0, 0, 0, 0};
   std::vector<int> deck;  // cards not on the known board
   std::vector<double> range[2];
+  std::vector<double> range_weight[2];  // range / its largest entry: the weight of a hand in its bucket's regrets
   std::vector<double> regret, strat_sum, last_regret;  // per infoset x action
   size_t n_infosets = 0;
   int variant = 0;  // 0 LCFR, 1 DCFR, 2 CFR+, 3 PCFR+ (see the river solver)
@@ -2212,6 +2213,9 @@ struct VectorSolver {
         SubgameSolver::combo_cards(h, a, b);
         range[s][h] = (onboard[a] || onboard[b]) ? 0.0 : std::max(0.0, double(r[h]));
       }
+      const double top = *std::max_element(range[s].begin(), range[s].end());
+      range_weight[s].assign(NUM_COMBOS, 0.0);
+      for (int h = 0; h < NUM_COMBOS; ++h) range_weight[s][h] = top > 0 ? range[s][h] / top : 0.0;
     }
   }
 
@@ -2345,15 +2349,21 @@ struct VectorSolver {
       if (update) {
         const double t = ps.t;
         const double sw = variant == 0 ? t : variant == 1 ? 1.0 : variant == 2 ? t : t * t;
+        // After the root round several hands share an infoset (a bucket).  Its counterfactual regret sums over its
+        // hands with the probability that the player holds each - the subgame's root deals hands in proportion to
+        // their reach, the player's own included - so a hand counts with its range weight.  (In the root round an
+        // infoset is one hand and the weight is a constant factor, which regret matching ignores.)
+        const bool shared = round != root_round;
         for (int h = 0; h < NUM_COMBOS; ++h) {
           if (!ps.valid[h] || range[p][h] <= 0) continue;
           const size_t info = base + key[h];
           double* R = regret.data() + info * A;
           double* S = strat_sum.data() + info * A;
           const double* sk = SK + size_t(key[h]) * A;
+          const double own = shared ? range_weight[p][h] : 1.0;
           for (int a = 0; a < A; ++a) {
             if (!nd.legal[a]) continue;
-            const double inst = L.ua[size_t(a) * NUM_COMBOS + h] - out[h];
+            const double inst = own * (L.ua[size_t(a) * NUM_COMBOS + h] - out[h]);
             switch (variant) {
               case 0: R[a] += t * inst; break;
               case 1: R[a] += inst; break;

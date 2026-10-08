@@ -247,7 +247,7 @@ def test_pluribus_mode_player(tmp_path):
     assert len(r) == 16 and p.solves > 0
     for st in p.state.values():
         assert st["villain"].sum() == pytest.approx(1.0) and st["hero"].sum() == pytest.approx(1.0)
-        assert np.all(st["villain"][valid_combos(list(st["cards"])) == 0] == 0)
+        assert st["villain"][valid_combos(list(st["cards"])) == 0].sum() > 0  # public beliefs: not conditioned on our cards
         if st["solver"] is not None:  # a full-game vector solve rooted at the round it was made in (snapshot)
             assert st["solver"].root_round == st["solver_round"] >= 1 and st["solver"].node_player(0) >= 0
 
@@ -378,7 +378,7 @@ def test_preflop_search_in_pluribus_mode_gets_the_ranges_of_its_root(tmp_path):
     p.probs(e.observation(1)[None], np.array([0]))
     st = p.state[0]
     assert st["solver_actions"] == [2]  # the solve is rooted after the raise
-    post = valid_combos(e.hands[1]) * np.asarray(bp.probs(substitute_hands(obs_sb)), dtype=float)[:, 2]
+    post = np.asarray(bp.probs(substitute_hands(obs_sb)), dtype=float)[:, 2]  # the public prior: every pair of cards
     np.testing.assert_allclose(st["villain"], post / post.sum(), atol=1e-9)
 
 
@@ -401,3 +401,108 @@ def test_a_new_hand_with_the_same_hole_cards_starts_from_fresh_ranges(tmp_path):
     p.probs(e.observation(1)[None], np.array([0]))
     post = valid_combos([20, 33]) * np.asarray(bp.probs(substitute_hands(obs_sb)), dtype=float)[:, 1]
     np.testing.assert_allclose(p.state[0]["villain"], post / post.sum(), atol=1e-9)
+
+
+def _pluribus_player(tmp_path, options="@it40@b50@th2", std=0.6):
+    from headsup.players import make_player
+
+    bp = _random_policy(tmp_path / "bp.pth", std=std)
+    return make_player(f"search:cfr:{tmp_path / 'bp.pth'}@pluribus{options}", device="cpu", seed=0), bp
+
+
+def test_pluribus_mode_solves_once_per_round_with_public_beliefs(tmp_path):
+    """Pluribus (supplement, Algorithm 2): the subgame is solved when a betting round starts; later decisions of the
+    round read the solved strategy.  Ours re-solved at every decision with its earlier action frozen as a one-hot
+    row, and that row then inflated the real hand's weight in its own range.  Beliefs are public ("from an outside
+    observer's perspective"): the opponent's range is not conditioned on our hole cards."""
+    from headsup.engine import HeadsUpPoker
+    from headsup.lbr import transition_likelihood
+
+    p, _ = _pluribus_player(tmp_path)
+    cpp = native.module()
+    e = HeadsUpPoker(game=p.game)
+    e.reset([0, 1, 20, 33, 5, 18, 31, 44, 9])  # the hero is the big blind (seat 1): first to act after the flop
+    ids = np.array([3])
+    e.step(1)
+    p.probs(e.observation(1)[None], ids)  # pre-flop: the blueprint
+    e.step(1)
+    assert int(e.stage) == 1 and e.current == 1
+    first = p.probs(e.observation(1)[None], ids)[0]
+    st = p.state[3]
+    assert p.solves == 1 and st["solver_round"] == 1
+    hh = cpp.combo_index(20, 33)
+    node0 = st["solver"]
+    np.testing.assert_allclose(first, node0.final_strategy(0)[hh], atol=1e-6)
+    mine = (COMBOS == 20).any(1) | (COMBOS == 33).any(1)
+    assert st["villain"][mine].sum() > 0.05  # public beliefs: the opponent may hold "our" cards as far as an observer knows
+    root_engine = e.clone()
+    e.step(1)  # the hero checks
+    after_check = e.clone()
+    e.step(2)  # the opponent bets
+    second = p.probs(e.observation(1)[None], ids)[0]
+    assert p.solves == 1  # the same round: no new solve
+    node = node0.child(node0.child(0, 1), 2)
+    np.testing.assert_allclose(second, node0.final_strategy(node)[hh], atol=1e-6)
+    avg_root, avg_bet, avg_node = node0.node_strategy(0).copy(), node0.node_strategy(node0.child(0, 1)).copy(), node0.node_strategy(node).copy()
+    assert 0.0 < avg_root[hh, 1] < 1.0 or 0.0 < avg_node[hh, 1] < 1.0  # the real hand's rows are strategies, not one-hot
+    before = {k: st[k].copy() for k in ("hero", "villain")}
+    facing_bet = e.clone()
+    e.step(1)  # the hero calls: the turn
+    assert int(e.stage) == 2
+    p.probs(e.observation(1)[None], ids)
+    assert p.solves == 2 and p.state[3]["solver_round"] == 2
+    ok = valid_combos(list(e.visible_board))
+    hero = before["hero"] * transition_likelihood(root_engine, 1, avg_root) * transition_likelihood(facing_bet, 1, avg_node) * ok
+    villain = before["villain"] * transition_likelihood(after_check, 2, avg_bet) * ok
+    np.testing.assert_allclose(p.state[3]["hero"], hero / hero.sum(), atol=1e-9)
+    np.testing.assert_allclose(p.state[3]["villain"], villain / villain.sum(), atol=1e-9)
+
+
+def test_search_player_answers_for_all_hands_from_the_rounds_solve(tmp_path):
+    """What LBR needs from a search player: the strategy of every hand at a public state - the real one or one a
+    round's action would lead to - read from the same solve the player's own decisions come from."""
+    from headsup.engine import HeadsUpPoker
+    from headsup.lbr import substitute_hands
+
+    p, bp = _pluribus_player(tmp_path)
+    assert p.answers_all_hands
+    cpp = native.module()
+    e = HeadsUpPoker(game=p.game)
+    e.reset([0, 1, 20, 33, 5, 18, 31, 44, 9])
+    ids = np.array([0])
+    e.step(1)
+    pre = p.all_hands_probs(e.observation(1)[None], ids)[0]  # pre-flop: the blueprint's rows
+    np.testing.assert_allclose(pre, np.asarray(bp.probs(substitute_hands(e.observation(1)))), atol=1e-6)
+    e.step(1)
+    if_bet = e.clone()
+    if_bet.step(1)
+    if_bet.step(2)  # a state this round could reach: the hero checks and is bet into
+    table = p.all_hands_probs(if_bet.observation(1)[None], ids)[0]
+    assert table.shape == (NUM_COMBOS, 4) and p.solves == 1
+    ok = valid_combos(list(e.visible_board)) > 0
+    np.testing.assert_allclose(table[ok].sum(1), 1.0, atol=1e-5)
+    own = p.probs(e.observation(1)[None], ids)[0]  # the real decision comes from the same solve
+    assert p.solves == 1
+    np.testing.assert_allclose(own, p.all_hands_probs(e.observation(1)[None], ids)[0][cpp.combo_index(20, 33)], atol=1e-6)
+    e.step(1)
+    e.step(2)
+    np.testing.assert_allclose(p.probs(e.observation(1)[None], ids)[0], table[cpp.combo_index(20, 33)], atol=1e-6)
+    assert p.solves == 1
+    depth = __import__("headsup.players", fromlist=["make_player"]).make_player(f"search:cfr:{tmp_path / 'bp.pth'}@it100@rit10", device="cpu", seed=0)
+    assert not depth.answers_all_hands  # depth-limited solves depend on the player's own hand
+
+
+def test_lbr_measures_the_searched_strategy_of_a_pluribus_player(tmp_path):
+    from headsup.lbr import LocalBestResponse
+    from headsup.model import BaseModel
+
+    torch.manual_seed(0)
+    m = BaseModel()
+    with torch.no_grad():  # a blueprint that mostly calls, so that hands reach the flop and the search has to play them
+        torch.nn.init.normal_(m.action_head.weight, std=0.3)
+        m.action_head.bias.copy_(torch.tensor([-3.0, 3.0, -3.0, -3.0]))
+    m.save(tmp_path / "bp.pth")
+    lbr = LocalBestResponse(f"search:cfr:{tmp_path / 'bp.pth'}@pluribus@it20@b20@th1", num_tables=4, device="cpu", seed=0, workers=2, mc_samples=20)
+    assert lbr.model is lbr.opponent  # not its blueprint
+    r = lbr.play(12, progress=False)
+    assert len(r) == 12 and np.isfinite(r).all() and lbr.opponent.solves > 0  # hands reached the flop: the solves were asked

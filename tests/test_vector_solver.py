@@ -161,3 +161,34 @@ def test_board_table_matches_the_numpy_showdown_values():
     np.testing.assert_allclose(t.showdown_values(reach)[valid], _showdown_values(reach, strength)[valid], atol=1e-9)
     np.testing.assert_allclose(cpp.BoardTable.opponent_mass(reach), _opponent_mass(reach), atol=1e-9)
     assert np.array_equal(np.array(t.strength)[valid], strength[valid])
+
+
+def test_bucket_regrets_are_weighted_by_the_solving_players_range():
+    """After the root round hands share buckets. A bucket's regret is the sum over its hands, each with the
+    probability that the player holds it (its range at the subgame root - Pluribus's root chance node deals
+    hands in proportion to their reach).  Ours summed them unweighted: a hand the player almost never has
+    counted like one it always has."""
+    from headsup.lbr import COMBOS
+
+    cpp = native.module()
+    deck = [0, 1, 2, 3, 4, 18, 33, 47, 8]  # 6s 7h 9d Tc on the turn
+    ce, _ = _roots([1, 1, 1, 1], deck)  # turn root: the river nodes are bucketed
+    r = valid_combos(deck[4:8]).astype(np.float32)
+    rare = (COMBOS % 13 >= 9).any(axis=1)  # a jack or better in the hand: the strong end of every bucket
+    results = {}
+    for name, weight in (("untouched", None), ("uniform", 1.0), ("almost never", 1e-6), ("never", 0.0)):
+        sv = cpp.VectorSolver()
+        sv.build(ce, 20)
+        r0 = r.copy()
+        r0[rare] *= 1.0 if weight is None else weight
+        sv.set_ranges(r0, r.copy())
+        if weight is not None:
+            sv.run(1, 5, 1)  # one iteration, the same river card for all: player 0 is updated against a uniform opponent
+        nodes = [i for i, nd in enumerate(sv.tree()) if nd["kind"] == 0 and nd["round"] == 3 and nd["player"] == 0]
+        results[name] = np.stack([np.asarray(sv.node_strategy(n, True)) for n in nodes])
+    assert results["uniform"].shape[1:] == (20, 4) and len(results["uniform"]) > 10
+    # buckets that hold a hand the player can have (the others are never updated when the rare hands are impossible)
+    live = np.abs(results["never"] - results["untouched"]).max(-1) > 1e-9
+    assert live.sum() > 20
+    assert np.abs(results["almost never"] - results["never"])[live].max() < 1e-3  # a hand counts as often as it is held
+    assert np.abs(results["almost never"] - results["uniform"])[live].max() > 0.1
