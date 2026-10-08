@@ -66,7 +66,7 @@ prediction for both variants) and `uniform`.
 | utility scale | largest absolute utility of the game (Leduc 13, Kuhn 2) |
 | optimiser | Adam, lr 1e-3, no gradient clipping |
 | hidden-layer initialisation | truncated normal, sd `1 / sqrt(fan_in)`, zero bias |
-| `R` / `r` fit | 750 steps x 2 048, minibatches without replacement (the whole batch when smaller) |
+| `R` / `r` fit | 750 steps x 2 048 |
 | `Q` fit | 1 000 steps x 2 048; circular buffer of 1 000 000 transitions; fitted after each player's update |
 | `Pi` fit | 5 000 steps x 2 048; reservoir of 1 000 000; at iterations 1, 2, then every 3rd, and the last |
 | loss | MSE averaged over batch x actions, legal actions only |
@@ -88,6 +88,10 @@ Deliberate deviations from the authors' code:
 3. Inputs are our info-state encodings (Leduc 34, Kuhn 22 features), not OpenSpiel's tensors.
 4. Fits run inside CUDA graphs when a GPU is used (the same arithmetic).
 5. `Pi` is also fitted and evaluated at the last iteration (their schedule skips it unless it is a multiple of 3).
+6. Minibatch indices are drawn with replacement (the random numbers come from inside the captured CUDA graph);
+   theirs are drawn without replacement, and the whole batch is used when it is smaller than 2 048.
+7. The episodes of an iteration are sampled in one vectorised pass over a compiled game tree; they are independent
+   given the networks, so this is the same distribution as sampling them one at a time.
 
 ## Architecture
 
