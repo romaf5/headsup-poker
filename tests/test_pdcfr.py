@@ -231,3 +231,38 @@ def test_tiny_budget_and_untrained_solver():
 def test_runs_on_cuda():
     s = _small("pdcfr+", traversals=500, device="cuda").iterate(3)
     assert np.isfinite(s.evaluate()["average"]) and np.isfinite(s.q_tab).all()
+
+
+def test_checkpoint_resume_and_variant_mismatch(tmp_path):
+    a = _small("pdcfr+", traversals=300).iterate(2)
+    torch.save(a.state_dict(), tmp_path / "ck.pt")
+    state = torch.load(tmp_path / "ck.pt", weights_only=False)
+    b = _small("pdcfr+", traversals=300).load_state_dict(state)
+    assert (b.iteration, b.episodes, b.nodes_touched) == (a.iteration, a.episodes, a.nodes_touched)
+    np.testing.assert_array_equal(b.sigma, a.sigma)
+    np.testing.assert_array_equal(b.q_tab, a.q_tab)
+    assert b.q_memory.size == a.q_memory.size and len(b.strat_memory) == len(a.strat_memory)
+    torch.set_rng_state(state["torch_rng"])  # both solvers share torch's global generator in this process
+    a.iterate(1)
+    torch.set_rng_state(state["torch_rng"])
+    b.iterate(1)  # the same random streams: the resumed run continues identically (CPU)
+    np.testing.assert_allclose(b.sigma, a.sigma, atol=1e-6)
+    with pytest.raises(ValueError, match="variant"):
+        _small("dcfr+", traversals=300).load_state_dict(a.state_dict())
+
+
+def test_cli_writes_a_curve_and_resumes(tmp_path, capsys):
+    import json
+
+    from headsup.algos.pdcfr import main
+
+    args = ["--game", "kuhn", "--variant", "dcfr+", "--traversals", "200", "--adv-steps", "20", "--q-steps", "20", "--policy-steps", "50",
+            "--checkpoint", str(tmp_path / "ck.pt"), "--checkpoint-minutes", "0", "--json", str(tmp_path / "run.json")]
+    main(args + ["--episodes", "1600"])  # 4 iterations
+    out = capsys.readouterr().out
+    assert "kuhn dcfr+ it 4: exploitability current" in out and "episodes 1600" in out
+    curve = json.load(open(tmp_path / "run.json"))["curve"]
+    assert [c["iteration"] for c in curve] == [1, 2, 3, 4] and curve[-1]["episodes"] == 1600  # 1, 2, every 3rd, the last
+    main(args + ["--episodes", "2400"])  # resumes at iteration 4 and runs to 6
+    assert "resumed from" in capsys.readouterr().out
+    assert [c["iteration"] for c in json.load(open(tmp_path / "run.json"))["curve"]] == [1, 2, 3, 4, 6]

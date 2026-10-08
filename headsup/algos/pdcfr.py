@@ -459,3 +459,112 @@ class PDCFRSolver:
     def evaluate(self):
         return {"current": exploitability(self.game, self.current_policy())[0],
                 "average": exploitability(self.game, self.average_policy())[0]}
+
+    # -- checkpoints -----------------------------------------------------------------------------------
+    def state_dict(self):
+        cpu = lambda net: {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}  # noqa: E731
+        mem = self.q_memory
+        return {
+            "variant": self.variant, "iteration": self.iteration, "episodes": self.episodes, "nodes_touched": self.nodes_touched,
+            "R": [cpu(n) for n in self.R], "opt_R": [o.state_dict() for o in self.opt_R],
+            "r": [cpu(n) for n in self.r] if self.r else None, "opt_r": [o.state_dict() for o in self.opt_r] if self.r else None,
+            "q_state": self.q_state, "q_tab": self.q_tab.copy(), "sigma": self.sigma.copy(),
+            "q_memory": {"pos": mem.pos, "size": mem.size, **{k: v[: mem.size].copy() for k, v in mem.data.items()}},
+            "strat_memory": self.strat_memory.state_dict(), "strat_rng": self.strat_memory.rng.bit_generator.state,
+            "rng": self.rng.bit_generator.state, "torch_rng": torch.get_rng_state(),
+        }
+
+    def load_state_dict(self, state):
+        if state["variant"] != self.variant:
+            raise ValueError(f"checkpoint of variant {state['variant']!r} cannot be loaded into a {self.variant!r} solver")
+        self.iteration, self.episodes, self.nodes_touched = int(state["iteration"]), int(state["episodes"]), int(state["nodes_touched"])
+        for net, opt, sd, osd in zip(self.R, self.opt_R, state["R"], state["opt_R"]):
+            net.load_state_dict(sd)
+            opt.load_state_dict(osd)
+        if self.r:
+            for net, opt, sd, osd in zip(self.r, self.opt_r, state["r"], state["opt_r"]):
+                net.load_state_dict(sd)
+                opt.load_state_dict(osd)
+        self.q_state, self.q_tab, self.sigma = state["q_state"], state["q_tab"].copy(), state["sigma"].copy()
+        mem, saved = self.q_memory, state["q_memory"]
+        mem.pos, mem.size = int(saved["pos"]), int(saved["size"])
+        for k, _ in Transitions.FIELDS:
+            mem.data[k][: mem.size] = saved[k]
+        self.strat_memory.load_state_dict(state["strat_memory"])
+        self.strat_memory.rng.bit_generator.state = state["strat_rng"]
+        self.rng.bit_generator.state = state["rng"]
+        torch.set_rng_state(state["torch_rng"])
+        return self
+
+
+def main(argv=None):
+    from headsup.games import make_game
+
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--game", default="leduc")
+    p.add_argument("--variant", default="pdcfr+", choices=VARIANTS, help="dcfr+ = VR-DeepDCFR+, pdcfr+ = VR-DeepPDCFR+")
+    p.add_argument("--episodes", type=int, default=10_000_000, help="sampled episodes in total; iterations = episodes // (2 x traversals)")
+    p.add_argument("--traversals", type=int, default=10_000, help="episodes per player per iteration")
+    p.add_argument("--epsilon", type=float, default=0.6, help="the traverser's exploration")
+    p.add_argument("--alpha", type=float, default=None, help="regret discount exponent (default: 2 for dcfr+, 2.3 for pdcfr+)")
+    p.add_argument("--gamma", type=float, default=None, help="average-strategy weight exponent (default 2)")
+    p.add_argument("--discount-offset", type=float, default=None,
+                   help="constant in the discount's denominator (default: the authors' code - 1.5 for dcfr+, 1 for pdcfr+; the paper: 1)")
+    p.add_argument("--adv-steps", type=int, default=750)
+    p.add_argument("--adv-batch", type=int, default=2048)
+    p.add_argument("--q-steps", type=int, default=1000, help="baseline fit steps (the authors' configs; the paper's table says 10000)")
+    p.add_argument("--q-batch", type=int, default=2048)
+    p.add_argument("--policy-steps", type=int, default=5000)
+    p.add_argument("--policy-batch", type=int, default=2048)
+    p.add_argument("--fallback", default="authors", choices=["authors", "argmax", "uniform"],
+                   help="strategy when no (predicted) regret is positive: the authors' code, the largest unclipped score, or uniform")
+    p.add_argument("--reinit-prediction", action="store_true", help="re-initialise the prediction net every iteration (the paper's table)")
+    p.add_argument("--no-baseline", action="store_true", help="no variance reduction (the paper's DeepPDCFR+ ablation)")
+    p.add_argument("--reach-weighted", action="store_true", help="divide the samples by the traverser's sampling reach (the 'w/o adv' ablation)")
+    p.add_argument("--eval-every", type=int, default=3, help="fit and evaluate the average policy every this many iterations (and at 1, 2 and the last)")
+    p.add_argument("--checkpoint", default=None, help="saved at evaluations; an existing file is resumed from")
+    p.add_argument("--checkpoint-minutes", type=float, default=10.0, help="at most one checkpoint per this many minutes (plus the final one)")
+    p.add_argument("--device", default="cpu")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--json", default=None)
+    args = p.parse_args(argv)
+    game = make_game(args.game)
+    solver = PDCFRSolver(game, args.variant, traversals=args.traversals, epsilon=args.epsilon, alpha=args.alpha, gamma=args.gamma,
+                         discount_offset=args.discount_offset, adv_steps=args.adv_steps, adv_batch=args.adv_batch, q_steps=args.q_steps,
+                         q_batch=args.q_batch, policy_steps=args.policy_steps, policy_batch=args.policy_batch, fallback=args.fallback,
+                         reinit_prediction=args.reinit_prediction, baseline=not args.no_baseline, reach_weighted=args.reach_weighted,
+                         device=args.device, seed=args.seed)
+    iterations = args.episodes // (2 * args.traversals)
+    curve, elapsed = [], 0.0
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        solver.load_state_dict(saved["solver"])
+        curve, elapsed = saved["curve"], saved["seconds"]
+        print(f"resumed from {args.checkpoint} at iteration {solver.iteration}", flush=True)
+    t0 = time.perf_counter() - elapsed
+    last_save = time.perf_counter()
+
+    def dump():
+        if args.json:
+            with open(args.json, "w") as f:
+                json.dump({"game": args.game, "algo": args.variant, "args": vars(args), "curve": curve}, f, indent=2)
+
+    for it in range(solver.iteration + 1, iterations + 1):
+        solver.iterate()
+        if it % args.eval_every == 0 or it < args.eval_every or it == iterations:
+            ev = solver.evaluate()
+            curve.append({"iteration": it, **ev, "nodes_touched": solver.nodes_touched, "episodes": solver.episodes,
+                          "seconds": time.perf_counter() - t0})
+            print(f"{args.game} {args.variant} it {it}: exploitability current {ev['current']:.4f} average {ev['average']:.4f}  "
+                  f"nodes {solver.nodes_touched:.3g}  episodes {solver.episodes}  ({time.perf_counter() - t0:.0f}s)", flush=True)
+            dump()
+            due = time.perf_counter() - last_save >= 60.0 * args.checkpoint_minutes or it == iterations
+            if args.checkpoint and due:  # atomic: a crash while writing leaves the previous checkpoint intact
+                torch.save({"solver": solver.state_dict(), "curve": curve, "seconds": time.perf_counter() - t0}, args.checkpoint + ".tmp")
+                os.replace(args.checkpoint + ".tmp", args.checkpoint)
+                last_save = time.perf_counter()
+    dump()
+
+
+if __name__ == "__main__":
+    main()
