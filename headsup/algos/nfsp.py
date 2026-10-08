@@ -12,8 +12,10 @@ Two presets (docs/superpowers/specs/2026-10-08-nfsp-design.md lists every differ
 * ``dream`` - the DREAM authors' NFSP (EricSteinberger/DREAM, Leduc_NFSP.py): Deep-CFR-style nets with a dueling Q
   head, Double DQN, SGD (0.1 / 0.01) with gradient clipping, eps = 0.06 / (1 + 0.01 sqrt(iteration)).
 
-Rewards are in the DREAM code's unit (utilities / 2.6 in Leduc) in both: the paper does not state its unit, and with
-antes its learning rate of 0.1 leaves half of the Q networks' hidden units dead (``--reward-scale 1``).
+Rewards are in the DREAM code's unit (utilities / 2.6 in Leduc) in both.  The paper does not state its unit: for
+``paper`` this is a calibration on three seeds (in antes, ``--reward-scale 1``, the Leduc curves stopped near 250 mA/g).
+Dividing by c is the same run as antes with the first-layer step of Q divided by c^2 (a learning rate of 0.0148 instead
+of 0.1) and Q's initial output layer multiplied by c.
 An iteration is 128 environment steps (one decision at each of 128 parallel tables) followed by 2 SGD steps per network.
 Small games only: the tree is compiled to arrays, memories hold infoset indices, and the networks are numpy arrays
 with a hand-written backward pass (a torch autograd step on these networks takes 3-6 times as long).
@@ -342,7 +344,7 @@ class NFSPSolver:
         unknown = sorted(set(overrides) - set(PRESETS[preset]))
         if unknown:
             raise TypeError(f"unknown settings {', '.join(unknown)} (known: {', '.join(PRESETS[preset])})")
-        self.game, self.preset = game, preset
+        self.game, self.preset, self.seed = game, preset, seed
         self.tree = tree = tree if tree is not None else Tree(game)
         self.config = cfg = {**PRESETS[preset], **overrides}
         if cfg["reward_scale"] is None:
@@ -521,7 +523,7 @@ class NFSPSolver:
     def state_dict(self):
         """The whole state, copied: a solver that loads it continues exactly as this one would."""
         return {
-            "game": self.game.name, "preset": self.preset, "config": dict(self.config),
+            "game": self.game.name, "preset": self.preset, "seed": self.seed, "config": dict(self.config),
             "iteration": self.iteration, "nodes_touched": self.nodes_touched, "episodes": self.episodes, "q_updates": list(self.q_updates),
             "Q": [n.state_dict() for n in self.Q], "Pi": [n.state_dict() for n in self.Pi], "target_q": [t.copy() for t in self.target_q],
             "rl_memory": [m.state_dict() for m in self.rl_memory], "sl_memory": [m.state_dict() for m in self.sl_memory],
@@ -530,7 +532,10 @@ class NFSPSolver:
         }
 
     def load_state_dict(self, state):
-        mine, theirs = {"game": self.game.name, **self.config}, {"game": state["game"], **state["config"]}
+        # the seed is part of a run's identity: continued under another one, the run would repeat under a false label
+        # (checkpoints written before the seed was stored are taken as this solver's)
+        mine = {"game": self.game.name, "seed": self.seed, **self.config}
+        theirs = {"game": state["game"], "seed": state.get("seed", self.seed), **state["config"]}
         if mine != theirs:
             diff = ", ".join(f"{k} = {theirs.get(k)!r} (here: {mine.get(k)!r})" for k in mine if mine[k] != theirs.get(k))
             raise ValueError(f"the checkpoint was written with other settings: {diff}")
@@ -613,10 +618,11 @@ def main(argv=None):
     last_save = time.perf_counter()
 
     def dump():
-        if args.json:
-            with open(args.json, "w") as f:
+        if args.json:  # atomic, as the checkpoint: a run killed while writing keeps the curve it had
+            with open(args.json + ".tmp", "w") as f:
                 json.dump({"game": args.game, "algo": "nfsp", "preset": args.preset, "args": vars(args), "config": solver.config,
                            "curve": curve}, f, indent=2)
+            os.replace(args.json + ".tmp", args.json)
 
     for it in range(solver.iteration + 1, args.iterations + 1):
         solver.iterate()

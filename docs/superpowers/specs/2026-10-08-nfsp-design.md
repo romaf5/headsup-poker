@@ -91,36 +91,49 @@ sliding-window curve starts to diverge.
 
 ## The reward unit of the `paper` preset
 
-The paper gives the learning rate (0.1, plain SGD) but not the unit of the rewards, and the two are one setting: the
-size of a step is the product. With the natural reading - antes, Leduc utilities up to 13 - the preset does not
-reproduce the paper. Measured on Leduc, exploitability in mA/g (seeds 0 / 1 / 2, the evaluation at that iteration; the
-paper's curve for comparison):
+The paper does not state the unit of the rewards. The preset divides the utilities by 2.6, as the DREAM code does.
+That is an empirical calibration on three seeds, not something derived from the paper: with the natural reading -
+antes, Leduc utilities up to 13 - the curves did not follow the paper's. Leduc, exploitability in mA/g (seeds
+0 / 1 / 2, the evaluation at that iteration; the paper's curve for comparison):
 
 | iterations | 1e5 | 2e5 | 3e5 | 5e5 | 6e5 | 8e5 | 1e6 |
 |---|---|---|---|---|---|---|---|
 | paper, Fig. 1a (64 units) | 430 | 257 | 213 | 158 | 150 | 138 | 128 |
 | rewards in antes (`--reward-scale 1`) | 264 / 307 / 305 | 275 / 211 / 297 | 234 / 155 / 298 | 275 / 188 / 225 | 283 / 220 / 239 | 304 / - / - | - |
-| utilities / 2.6 (the preset) | 291 / 367 / 268 | 146 / 178 / 295 | 120 / 130 / 303 | 95 / 116 / 202 | 87 / 96 / 166 | 91 / 90 / 151 | 86 / 87 / 146 |
+| utilities / 2.6 (the preset) | 291 / 367 / 268 | 146 / 178 / 295 | 120 / 129 / 303 | 95 / 116 / 202 | 87 / 96 / 166 | 91 / 90 / 151 | 86 / 87 / 146 |
 | utilities / 13 | 260 / 335 / - | 179 / 256 / - | 126 / 148 / - | - | - | - | - |
 
 With antes the curves stop falling near 250 mA/g and drift upwards; with the DREAM code's unit they keep falling and
-their three-seed mean is within a factor 1.5 of the paper's curve from 1e3 to 1e6 iterations. What goes wrong with
-antes, measured on checkpoints (antes: seed 0 at 490k and seed 1 at 290k / 580k iterations; scaled: seed 0 at 290k):
+their three-seed mean is within a factor 1.5 of the paper's curve from 1e3 to 1e6 iterations. The data do not
+separate 2.6 from 13 (two seeds to 3.5e5 iterations with 13).
 
-- 27-34 of the 64 hidden units of each `Q` network are active on no infoset at all (scaled: 17-18; with
-  `--lr-q 0.02`: 4-10) and the hidden activations reach 10-15 (scaled: 5): a step of 0.1 on errors of several antes
-  kills ReLU units.
+**What the division is.** Dividing the rewards by `c` is exactly the run in antes with the step of the first layer of
+the `Q` networks divided by `c^2` and the initial weights and bias of their output layer multiplied by `c`; the output
+layer's step, the greedy actions and `Pi` are the same (`c Q_scaled = Q_antes`). Checked on Leduc: the two runs deal
+and play the same hands and have the same exploitability to six digits for 800 iterations, their `Q` values agree to
+1e-5 for 600, then rounding separates them. The preset is therefore "antes with a first-layer learning rate of
+0.1 / 6.76 = 0.0148 for `Q`" (and a 2.6 times larger initial output layer). It is not a smaller learning rate as a
+whole: `--lr-q 0.02` in antes slows both layers and is another experiment (one seed: 279 mA/g at 3e5 iterations, no
+better than antes).
+
+**What was measured on the checkpoints**, without a cause being established:
+
 - Against the exact action values of a best response to what the opponent actually plays (`Pi` with probability
-  `1 - eta`, greedy `Q` with `eta`), `Q` is off by 0.62-0.78 antes (visit-weighted rmse; scaled: 0.46-0.51), and the
-  greedy policy realises 12-54 % of the gain of the exact best response over `Pi` (scaled: 60 %).
-- `Pi` itself is not the problem: it is within 0.01 (total variation) of the empirical average of `M_SL`. A 1 x 64
-  MLP can represent the exact action values (rmse 0.02 by regression). More exploration (`--eps-const 0.01`), Double
-  DQN and a smaller `Q` learning rate did not remove the plateau (one or two seeds each).
+  `1 - eta`, greedy `Q` with `eta`), `Q` is off by 0.62-0.78 antes with antes (visit-weighted rmse; seed 0 at 490k,
+  seed 1 at 580k iterations) and by 0.46-0.51 with the preset (seed 0 at 290k); its greedy policy realises 12-54 % of
+  the gain of the exact best response over `Pi`, against 60 %. The best responses that get averaged are worse with
+  antes - at different iterations, on one or two seeds.
+- `Pi` is not the problem: it is within 0.01 (total variation) of the empirical average of `M_SL`. Nor is capacity:
+  a 1 x 64 MLP represents the exact action values (rmse 0.02 by regression).
+- Dead hidden units are not the explanation. With antes 28-37 of the 64 hidden units of a `Q` network are active on no
+  infoset (580k-790k iterations, 198-309 mA/g), but the count does not follow the exploitability: 4-10 with
+  `--lr-q 0.02` in antes (281 mA/g at 280k), 20-27 with the preset at 1.25e6 (80 / 80 / 145), 3-8 with
+  `--reward-scale 13` at 330k (116 / 129).
+- Single runs in antes with more exploration (`--eps-const 0.01`: 357 at 5e5 and 181 at 2.8e5, seeds 0 and 1) and
+  with Double DQN (209 at 2.5e5) were not followed far enough to say more than that neither is clearly better.
 
-So the `paper` preset takes the unit of the DREAM code, whose authors ran NFSP at the same learning rate and report it
-as the paper's hyperparameters; `--reward-scale 1` gives antes. Normalising to [-1, 1] (`--reward-scale 13`) behaves
-like 2.6 as far as it was run. The choice was made on three seeds to 1e6 iterations and is the main thing the
-validation runs test.
+`--reward-scale 1` gives antes. The DREAM authors ran NFSP at the same learning rate with this unit and report it as
+the paper's hyperparameters. The validation runs are the test of the choice.
 
 ## Deliberate deviations
 
@@ -145,7 +158,8 @@ From all three sources:
 
 `paper` preset, from the paper:
 
-7. **Rewards are divided by 2.6** (the largest utility / 5): the paper states no unit; see the section above.
+7. **Rewards are divided by 2.6** (the largest utility / 5): the paper states no unit and this one was calibrated on
+   the published curve; see the section above.
 8. 128 parallel tables with one step each per iteration instead of (presumably) one game played sequentially: a hand
    spans several iterations, the data are the same.
 9. `Q` and `Pi` are not updated before their memory holds a minibatch (the paper does not say).
@@ -177,7 +191,7 @@ Not copied from OpenSpiel: the inner DQN's counters that only advance in best-re
   - `NFSPSolver(game, preset="paper", seed=0, **overrides)`: `iterate()`, `average_policy()`, `evaluate()`,
     `state_dict()` / `load_state_dict()` (the whole state: networks, target values, memories, tables, modes, pending
     transitions, counters, random generator; a snapshot shares nothing with the solver; a checkpoint written with
-    other settings is refused). Plain SGD has no optimiser state.
+    other settings or another seed is refused). Plain SGD has no optimiser state.
   - CLI `python -m headsup.algos.nfsp --game leduc --preset paper --iterations 3000000 --seed 0 --json ...
     --checkpoint ...`. Evaluations at 1, 2, 5, 10, 20, 50, ... iterations up to `--eval-every` (10 000), then at its
     multiples, and at the end. The JSON curve has, per evaluation, `iteration`, `average` (exploitability of the
@@ -190,9 +204,11 @@ Not copied from OpenSpiel: the inner DQN's counters that only advance in best-re
 
 ## Tests (`tests/test_nfsp.py`, `tests/test_deep_algos.py`)
 
-66 tests, 24-34 s on one core of the loaded machine. 88 one-line mutations of `nfsp.py` were run against them (the
-list is in the plan): 87 were killed at once; the survivor (`Q` trained before a minibatch was stored: the test's
-memories were empty) and two mutants that only an indirect test caught led to stronger tests; all 88 are killed now.
+71 tests in `tests/test_nfsp.py` (about 30 s on one core) and one for the report tables in `tests/test_deep_algos.py`.
+88 one-line mutations of `nfsp.py` were run against the first 66 (the list is in the plan): 87 were killed at once;
+the survivor (`Q` trained before a minibatch was stored: the test's memories were empty) and two mutants that only an
+indirect test caught led to stronger tests. An independent review then found nine more survivors at the level of the
+command line and the seed; the tests added for them kill all nine (the plan lists them too).
 
 - The formulas: `epsilon` (both schedules), `td_target` (target network values, legal-masked max, nothing added at
   terminals, Double DQN), `cross_entropy` (loss and gradient equal to torch's on masked logits).
@@ -211,8 +227,13 @@ memories were empty) and two mutants that only an indirect test caught led to st
 - Schedule: `updates` per network per iteration, `Q` before `Pi`, target refit counted in `Q` updates per player,
   no update before a minibatch is stored, `nodes_touched`.
 - Presets set what the table above says; overrides; unknown keywords.
-- Checkpoints: a restored solver continues bit-identically; snapshot, source and copy share no arrays; other settings
-  are refused; the CLI resumes (the resumed curve equals an uninterrupted run's) and writes atomically.
+- Checkpoints: a restored solver continues bit-identically; snapshot, source and copy share no arrays; other
+  settings and another seed are refused (a checkpoint from before the seed was stored is accepted).
+- The seed determines the networks, the deals and the modes.
+- Command line: the evaluation schedule (1-2-5, the multiples, the last); a resumed run's curve equals an
+  uninterrupted run's and its clock goes on; the curve file is on disk after every evaluation; checkpoint and curve
+  file are written under another name and renamed; one checkpoint per interval and one at the end; another `--seed`
+  gives another curve and cannot continue this checkpoint.
 - Kuhn: both presets reduce the exploitability of the average policy within a few thousand iterations.
 - The report tables.
 
@@ -244,9 +265,9 @@ Kuhn (one seed): `paper` 301 / 109 / 10 / 8 mA/g at 1e3 / 1e4 / 1e5 / 2e5 iterat
 
 Not verified, and where it may fail:
 
-- `paper` at 3e6 iterations. The runs stand at 1.27e6: 80 / 82 / 158 mA/g, nearly flat since 8e5 (seed 2 since 6e5);
+- `paper` at 3e6 iterations. The runs stand at 1.27e6: 83 / 82 / 158 mA/g, nearly flat since 8e5 (seed 2 since 6e5);
   the criterion is 50-113. The seed-to-seed spread is large.
-- `dream` at 1e8 and 3.2e8 nodes. The one run stands at 2.9e7 nodes and has moved between 150 and 164 mA/g since
+- `dream` at 1e8 and 3.2e8 nodes. The one run stands at 2.9e7 nodes and has moved between 149 and 164 mA/g since
   2.3e7, where the published curve falls from 136 to 119.
 
 ## Compute
