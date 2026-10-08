@@ -1350,6 +1350,118 @@ struct VecEnv {
   }
 };
 
+// ------------------------------------------------------------------ two-seat vectorised env (self-play)
+// Both seats of every table are driven from Python (headsup/twoseat.py is the reference implementation): step()
+// takes one action per table for the seat to act and returns the observation of the seat that acts next, that
+// seat, both seats' rewards at a hand's end and the done flags.  A finished table is dealt again at once, so its
+// observation already belongs to the next hand (nobody acts during a deal: an observation is never terminal).
+// action < 0: the table waits.  decks (N x 9): the cards of each table's next deal (tests), else the env's generator.
+struct SelfPlayVecEnv {
+  std::vector<Engine> engines;
+  std::vector<long> hands_dealt;  // per table: the number of its current hand (seeds the all-in EV sampling)
+  std::mt19937_64 rng;
+  int num_actions;
+  long hands_completed = 0;
+  bool allin_ev = false;  // as VecEnv: all-in hands are rewarded with the expectation over the runouts
+  long ev_samples = 1000;
+  uint64_t ev_seed;
+
+  SelfPlayVecEnv(int n, uint64_t seed, EngineConfig cfg)
+      : engines(size_t(n), Engine(cfg)), hands_dealt(size_t(n), 0), rng(seed), num_actions(cfg.num_actions()), ev_seed(seed) {}
+
+  // seed of the runout sampling of a table's hand: splitmix64 (headsup/twoseat.py: ev_hand_seed)
+  static uint64_t hand_seed(uint64_t seed, uint64_t table, uint64_t hand) {
+    uint64_t x = seed + 0x9E3779B97F4A7C15ull * ((table << 32) + hand + 1);
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+  }
+
+  using Decks = py::array_t<int64_t, py::array::c_style | py::array::forcecast>;
+
+  void check_decks(const Decks* decks) const {
+    if (decks && (decks->ndim() != 2 || decks->shape(0) != ssize_t(engines.size()) || decks->shape(1) != 9))
+      throw py::value_error("decks must have the shape (num_envs, 9)");
+  }
+
+  void deal(size_t i, const Decks* decks) {
+    if (decks) {
+      int deck[9];
+      bool seen[NUM_CARDS] = {};
+      for (int k = 0; k < 9; ++k) {
+        const int64_t c = decks->at(i, k);
+        if (c < 0 || c >= NUM_CARDS || seen[c]) throw py::value_error("deck: 9 distinct cards in 0..51");
+        seen[c] = true;
+        deck[k] = int(c);
+      }
+      engines[i].reset(deck);
+    } else {
+      engines[i].reset_random(rng);
+    }
+    ++hands_dealt[i];
+  }
+
+  py::tuple output(py::object rewards = py::none(), py::object dones = py::none()) {
+    const ssize_t n = ssize_t(engines.size());
+    py::array_t<float> obs({n, ssize_t(OBS_DIM)});
+    py::array_t<int64_t> seat(std::vector<ssize_t>{n});
+    auto o = obs.mutable_unchecked<2>();
+    auto s = seat.mutable_unchecked<1>();
+    for (ssize_t i = 0; i < n; ++i) {
+      engines[i].observation(-1, o.mutable_data(i, 0));
+      s(i) = engines[i].current;
+    }
+    if (rewards.is_none()) return py::make_tuple(obs, seat);
+    return py::make_tuple(obs, seat, rewards, dones);
+  }
+
+  py::tuple reset(py::object decks) {
+    Decks d;
+    if (!decks.is_none()) d = decks.cast<Decks>();
+    const Decks* dp = decks.is_none() ? nullptr : &d;
+    check_decks(dp);
+    for (size_t i = 0; i < engines.size(); ++i) deal(i, dp);
+    return output();
+  }
+
+  py::tuple step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions, py::object decks) {
+    const ssize_t n = ssize_t(engines.size());
+    if (actions.ndim() != 1 || actions.shape(0) != n) throw py::value_error("actions has wrong length");
+    Decks dk;
+    if (!decks.is_none()) dk = decks.cast<Decks>();
+    const Decks* dp = decks.is_none() ? nullptr : &dk;
+    check_decks(dp);
+    auto a = actions.unchecked<1>();
+    for (ssize_t i = 0; i < n; ++i) {  // before anything is stepped
+      if (a(i) >= num_actions) throw py::value_error("Invalid action " + std::to_string(a(i)) + " at table " + std::to_string(i));
+      if (a(i) >= 0 && engines[i].done) throw std::runtime_error("reset the env first");
+    }
+    py::array_t<float> rewards({n, ssize_t(2)});
+    py::array_t<bool> dones(std::vector<ssize_t>{n});
+    auto r = rewards.mutable_unchecked<2>();
+    auto d = dones.mutable_unchecked<1>();
+    for (ssize_t i = 0; i < n; ++i) {
+      Engine& e = engines[i];
+      r(i, 0) = r(i, 1) = 0.0f;
+      d(i) = false;
+      if (a(i) < 0) continue;  // the table waits
+      if (!e.step(int(a(i)))) continue;
+      d(i) = true;
+      if (allin_ev) {
+        const uint64_t seed = hand_seed(ev_seed, uint64_t(i), uint64_t(hands_dealt[i]));
+        r(i, 0) = float(e.allin_ev(0, ev_samples, seed));
+        r(i, 1) = -r(i, 0);
+      } else {
+        r(i, 0) = float(e.rewards[0]);
+        r(i, 1) = float(e.rewards[1]);
+      }
+      ++hands_completed;
+      deal(size_t(i), dp);
+    }
+    return output(rewards, dones);
+  }
+};
+
 
 // ------------------------------------------------------------------ equity vs every opponent hand (LBR)
 constexpr int NUM_COMBOS = 1326;
@@ -3649,4 +3761,15 @@ PYBIND11_MODULE(headsup_cpp, m) {
         d["rewards"] = std::vector<int>{e.rewards[0], e.rewards[1]};
         return d;
       });
+
+  py::class_<SelfPlayVecEnv>(m, "SelfPlayVecEnv")
+      .def(py::init<int, uint64_t, EngineConfig>(), py::arg("num_envs"), py::arg("seed"), py::arg("cfg") = EngineConfig())
+      .def("reset", &SelfPlayVecEnv::reset, py::arg("decks") = py::none(), "(obs, seat) after dealing every table")
+      .def("step", &SelfPlayVecEnv::step, py::arg("actions"), py::arg("decks") = py::none(),
+           "(obs, seat, rewards[N, 2], dones): one action per table for the seat to act (< 0: the table waits)")
+      .def_property_readonly("num_envs", [](const SelfPlayVecEnv& v) { return int(v.engines.size()); })
+      .def_property_readonly("hands_completed", [](const SelfPlayVecEnv& v) { return v.hands_completed; })
+      .def_readwrite("allin_ev", &SelfPlayVecEnv::allin_ev)
+      .def_readwrite("ev_samples", &SelfPlayVecEnv::ev_samples)
+      .def_readwrite("ev_seed", &SelfPlayVecEnv::ev_seed);
 }

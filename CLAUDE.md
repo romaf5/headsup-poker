@@ -76,6 +76,10 @@ python -m pytest tests -q                                    # ~270 tests, ~7 mi
   (`Engine.allin_ev`, Python + C++; `showdown_stage` = the round whose betting ended the hand at a showdown). LBR and
   the browser table also average showdowns over the opponent's range (`range_ev`; needs the opponent's strategy for
   all 1326 hands: `probs` on hand-substituted observations, or `all_hands_probs` of a search player).
+- AlphaHoldem (`headsup/alphaholdem/`, spec `alpha:<path>`): its tensors are replayed from the observation's bet history
+  (`encoding.py` mirrors `GameConfig.raise_amount` / `legal_mask`), so a change of the observation layout or the betting
+  rules needs `tests/test_alphaholdem.py`. Training plays both seats in `headsup/twoseat.py` (C++ `SelfPlayVecEnv` + Python
+  twin). Open points of the paper and the choices made: `docs/superpowers/specs/2026-10-08-alphaholdem-design.md`.
 
 ## Machine / operations (64-core WSL2 box, 2 × RTX 3090, 94 GB RAM)
 

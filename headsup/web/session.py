@@ -20,7 +20,7 @@ from headsup.players import make_player
 BOT_LABELS = {
     "cfr": "DeepCFR", "sdcfr": "SD-CFR", "onnx": "PPO exploiter", "random": "Random bot", "call": "Calling station",
     "allin": "Maniac", "raise": "Always-raise bot", "tab": "Tabular blueprint", "pluribus": "Pluribus-style (blueprint + search)",
-    "search": "Search",
+    "search": "Search", "alpha": "AlphaHoldem",
 }
 
 

@@ -41,6 +41,7 @@ Opponents: `pluribus` (blueprint + real-time search), `tab` (blueprint), `cfr` (
 | tabular CFR, CFR+, DCFR, PCFR+, DCFR+, PDCFR+, MCCFR | `headsup/algos/tabular.py` | reference solvers for the small games |
 | Pluribus blueprint (Linear MCCFR + pruning) | `headsup/blueprint.py` | `python -m headsup.blueprint --game nlhe --iterations 20000000 --out runs/bp.pt` |
 | real-time search (depth-limited, Pluribus mode) | `headsup/search.py` | player spec `search:<blueprint>[@pluribus]` |
+| AlphaHoldem (conv-nets on card / action tensors, Trinal-Clip PPO, K-Best self-play) | `headsup/alphaholdem/` | `python -m headsup.alphaholdem.train --out runs/alpha --iterations 5000`; player spec `alpha:runs/alpha/policy.pth` |
 
 Trainer outputs: `policy.pth` (spec `cfr:<path>`), `iterates.pt` (SD-CFR average, spec
 `sdcfr:<path>`), `checkpoint.pt` (`--resume`), TensorBoard logs. `--game fhp --preset paper` uses the
@@ -199,6 +200,7 @@ headsup/model.py numpy_model.py        networks (torch, numpy mirror)
 headsup/cpp/headsup_cpp.cpp            C++ kernels: engine, evaluator, MLP, traversals, solvers, blueprint
 headsup/deepcfr/ sdcfr.py              hold'em trainer, reservoir memories, SD-CFR player
 headsup/blueprint.py search.py         tabular blueprint, real-time search
+headsup/alphaholdem/ twoseat.py        AlphaHoldem (end-to-end self-play RL), the two-seat env it trains in
 headsup/games/ algos/                  small games, tabular + deep algorithms, best responses
 headsup/lbr.py compare.py exploit.py   evaluation tools
 headsup/web/                           browser table
@@ -217,4 +219,5 @@ Brown, Sandholm & Amos, [depth-limited solving](https://arxiv.org/abs/1805.08195
 Lisý & Bowling, [LBR](https://arxiv.org/abs/1612.07547) (2017) ·
 Farina, Kroer & Sandholm, [PCFR+](https://arxiv.org/abs/2007.14358) (AAAI 2021) ·
 Xu et al., [DCFR+ / PDCFR+](https://arxiv.org/abs/2404.13891) (IJCAI 2024) and
-[Deep (Predictive) Discounted CFR](https://arxiv.org/abs/2511.08174) (2025)
+[Deep (Predictive) Discounted CFR](https://arxiv.org/abs/2511.08174) (2025) ·
+Zhao et al., AlphaHoldem (AAAI 2022)

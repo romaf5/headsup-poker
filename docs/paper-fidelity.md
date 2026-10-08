@@ -118,3 +118,21 @@ values (equal to the paper's Fig. 1 formula to 5.5e-14).
 | Abstraction: 200 buckets per round by expected hand strength (`mc`) or by (mean, std) of the equity over the completions (`table`); Pluribus clusters equity distributions with k-means. | **by choice** - `table` is the closer one |
 | Depth-limited mode (`search:<net>` without `@pluribus`): one sampled continuation by default, where both papers warn about fixed leaf values and let the players choose among four (`@leaf4`); it plays the average rather than the final iterate; `@leaf4` cannot be used with a tabular blueprint. | **open** - documented in `headsup/search.py`; the default is unchanged until it has been measured |
 | LBR: flop equities from 200 Monte-Carlo runouts (paper: exhaustive); no round-restricted variants (the paper's Table 2). | **fixed** - the flop's 1,081 runouts are enumerated by default (`--max-exact 100` = the old sampling); `--from-round flop` etc. = LBR that only check/calls before that round. Pre-flop equities stay sampled (`--mc-samples`). |
+
+## AlphaHoldem (`headsup.alphaholdem`)
+
+There is no official code and the paper leaves most of the training procedure open; every open point, the choice
+made and the reason are in `docs/superpowers/specs/2026-10-08-alphaholdem-design.md` (22 rows). As the paper states
+them: the two tensors (card 6 x 4 x 13; action 24 x 4 x nb with the rows player 1, player 2, sum, legal-at-that-
+decision), two ConvNets without shared parameters, gamma 0.999, GAE lambda 0.95, delta1 3, Adam 3e-4, minibatch
+16,384, 131,072 decisions per iteration, one main agent against a pool of its K best snapshots by ELO.
+
+| item | status |
+|---|---|
+| The game: 4 actions (one check/call column), 50 bb, this repository's raise cap, against the paper's 9 actions and 200 bb. | **by choice** - the shipped baselines exist only in the default tree; a larger tree only changes tensor sizes |
+| Eq. (3) as printed has no `min` and no sign condition. Implemented: PPO's clipped surrogate, for A < 0 not below delta1 x A (the dual-clip loss the text cites; for A < 0 it equals the printed formula). | **by choice** - `test_trinal_clip_policy_objective_by_hand` (also shows that a `min` over three terms is PPO again) |
+| Value-clip bounds delta2 / delta3: the chips put in up to the state (OpenHoldem's "state value when the player / the opponent folds"), not those of the finished hand, which never clip a complete hand's return. | **by choice**, effect **open** - with it the value head explained none of the return variance in 1 M-sample CPU runs, and one run without it (`--no-value-clip`) was ahead; one seed, not established |
+| Rollouts hold complete hands, the value target is the hand's discounted return, no bootstrap; the paper has 128-step rollouts. | **by choice** |
+| One process, synchronous on-policy PPO, a network of 1.4 M parameters (paper: 8 GPUs, "off-policy ... replay buffer", 8.6 M). | **by choice** |
+| Epochs, loss coefficients, advantage normalisation, gradient clipping, K, snapshot interval, opponent sampling, ELO from blocks of hands: not in the paper. | **by choice** (PPO defaults and the brief's values), none tuned |
+| Nothing has been trained beyond a CPU smoke run; the paper's results (Slumbot, human matches) are in another game and cannot be compared. | **open** |
