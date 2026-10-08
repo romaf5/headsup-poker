@@ -224,3 +224,33 @@ def test_oracle_reports_the_pooled_regret_variance():
     s = OracleSampler(make_game("kuhn"), "dream", trajectories=200, epsilon=0.5, seed=0).iterate(3)
     assert len(s.variance) == len(s.variance_pooled) == 3 and all(v > 0 for v in s.variance_pooled)
     assert np.mean(s.variance_pooled) > np.mean(s.variance)  # pooling adds the spread between infosets
+
+
+def test_mccfr_pruning_follows_the_pluribus_rule():
+    """Pluribus (supplement): pruning is decided for the whole iteration, never applies on the last betting round or
+    to actions that lead straight to a terminal node, and regrets have a floor.  Ours drew per node and had neither
+    exemption (an action with a very negative regret could never be explored again at the end of the game) nor a floor."""
+    g = make_game("leduc")
+    root = g.new_initial_state().child(0).child(1)  # a deal; player 0 to act in the first round
+    assert not root.is_chance() and root.current_player == 0
+    key = root.info_key(0)
+    raise_ = max(root.legal_actions())  # leads to another decision: prunable
+    bet_node = root.child(raise_)
+    fold = min(bet_node.legal_actions())  # facing the bet: folding ends the hand - never pruned
+    assert bet_node.child(fold).is_terminal() and not root.child(raise_).is_terminal()
+    m = MCCFR(g, "external", seed=0, prune_threshold=-1.0, prune_prob=1.0, prune_after=0, linear=False)
+    m._get(m.regret, key)[raise_] = -1e6
+    m._get(m.regret, bet_node.info_key(1))[fold] = -1e6
+    m.iterate(300)
+    assert m.regret[key][raise_] == -1e6  # pruned in every traversal: untouched
+    assert m.regret[bet_node.info_key(1)][fold] != -1e6  # a terminal-leading action is always explored
+    k = make_game("kuhn")  # one betting round = the last one: nothing is ever pruned
+    mk = MCCFR(k, "external", seed=0, prune_threshold=-1.0, prune_prob=1.0, prune_after=0, linear=False)
+    first = k.new_initial_state().child(0).child(1)
+    a = max(first.legal_actions())
+    mk._get(mk.regret, first.info_key(0))[a] = -1e6
+    mk.iterate(200)
+    assert mk.regret[first.info_key(0)][a] != -1e6
+    floor = MCCFR(g, "external", seed=0, regret_floor=-0.25, linear=False).iterate(400)
+    lowest = min(float(r.min()) for r in floor.regret.values())
+    assert lowest >= -0.25 * 400 - 1e-9 and lowest < -50  # the floor on the average regret binds and holds

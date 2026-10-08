@@ -160,16 +160,24 @@ class MCCFR(_Tables):
     """External- or outcome-sampling MCCFR with linear weighting and optional regret-based pruning."""
 
     def __init__(self, game, sampling="external", seed=0, prune_threshold=None, prune_prob=0.95, prune_after=0, linear=True,
-                 epsilon=0.6):
+                 epsilon=0.6, regret_floor=None):
         super().__init__(game)
         assert sampling in ("external", "outcome")
         self.sampling = sampling
         self.rng = np.random.default_rng(seed)
-        # Pluribus: from iteration `prune_after` on, actions whose regret is below `prune_threshold` are
-        # not traversed on a `prune_prob` fraction of the traversals (their regrets stay untouched)
+        # Pluribus (supplement, "Equilibrium finding"): from iteration `prune_after` on, in a `prune_prob` fraction
+        # of the traversals - decided once per traversal - the traverser's actions whose regret is below
+        # `prune_threshold` are not explored (their regrets stay untouched), except on the last betting round and
+        # when the action leads straight to a terminal node; regrets never fall below `regret_floor`.  Both bounds
+        # are on the average regret per iteration (with linear weights the sums grow like t^2)
         self.prune_threshold, self.prune_prob, self.prune_after = prune_threshold, prune_prob, prune_after
+        self.regret_floor = regret_floor
+        self._pruning = False
         self.linear = linear
         self.epsilon = epsilon
+
+    def _norm(self):
+        return self.iteration * (self.iteration + 1) / 2 if self.linear else self.iteration
 
     def _sigma(self, key, legal):
         return regret_matching(self._get(self.regret, key), legal)
@@ -192,17 +200,21 @@ class MCCFR(_Tables):
         R = self._get(self.regret, key)
         values = np.zeros(self.game.num_actions)
         explored = legal.copy()
-        if self.prune_threshold is not None and self.iteration > self.prune_after and self.rng.random() < self.prune_prob:
-            # threshold on the *average* regret per iteration (the sums grow like t^2 with linear weights)
-            norm = self.iteration * (self.iteration + 1) / 2 if self.linear else self.iteration
-            explored &= ~(R / norm < self.prune_threshold)
+        children = {int(a): state.child(int(a)) for a in np.flatnonzero(legal)}
+        last_round = getattr(state, "round", 0) + 1 >= getattr(self.game, "num_rounds", 1)
+        if self._pruning and not last_round:
+            for a, child in children.items():
+                if R[a] / self._norm() < self.prune_threshold and not child.is_terminal():
+                    explored[a] = False
             if not explored.any():
                 explored = legal.copy()
         for a in np.flatnonzero(explored):
-            values[a] = self._external(state.child(a), p)
+            values[a] = self._external(children[int(a)], p)
         v = float(np.where(explored, sigma, 0.0) @ values)  # Pluribus: the mean over the explored actions
         for a in np.flatnonzero(explored):
             R[a] += t * (values[a] - v)
+        if self.regret_floor is not None:
+            np.maximum(R, self.regret_floor * self._norm(), out=R)
         return v
 
     def _outcome(self, state, p, reach_p, reach_q, sample_prob):
@@ -247,6 +259,8 @@ class MCCFR(_Tables):
             self.iteration += 1
             for p in range(2):
                 if self.sampling == "external":
+                    self._pruning = (self.prune_threshold is not None and self.iteration > self.prune_after
+                                     and self.rng.random() < self.prune_prob)  # for the whole traversal
                     self._external(self.game.new_initial_state(), p)
                 else:
                     self._outcome(self.game.new_initial_state(), p, 1.0, 1.0, 1.0)
