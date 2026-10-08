@@ -38,6 +38,8 @@ Opponents: `pluribus` (blueprint + real-time search), `tab` (blueprint), `cfr` (
 | Deep CFR, SD-CFR, DREAM, ESCHER (hold'em) | `headsup/deepcfr/`, `sdcfr.py` | `python -m headsup.deepcfr.train --algo both --features history --net paper --out runs/x` |
 | same on Leduc / Kuhn | `headsup/algos/deep.py` | `python -m headsup.algos.deep --game leduc --algo sdcfr` |
 | Deep DCFR+ / Deep PDCFR+ (Leduc / Kuhn) | `headsup/algos/pdcfr.py` | `python -m headsup.algos.pdcfr --game leduc --variant pdcfr+` |
+| NFSP (Leduc / Kuhn) | `headsup/algos/nfsp.py` | `python -m headsup.algos.nfsp --game leduc --preset paper --iterations 3000000` |
+| ReBeL: search with a value network on public belief states (Leduc) | `headsup/algos/rebel.py` | `python -m headsup.algos.rebel --game leduc --epochs 300` |
 | tabular CFR, CFR+, DCFR, PCFR+, DCFR+, PDCFR+, MCCFR | `headsup/algos/tabular.py` | reference solvers for the small games |
 | Pluribus blueprint (Linear MCCFR + pruning) | `headsup/blueprint.py` | `python -m headsup.blueprint --game nlhe --iterations 20000000 --out runs/bp.pt` |
 | real-time search (depth-limited, Pluribus mode) | `headsup/search.py` | player spec `search:<blueprint>[@pluribus]` |
@@ -220,4 +222,6 @@ Lisý & Bowling, [LBR](https://arxiv.org/abs/1612.07547) (2017) ·
 Farina, Kroer & Sandholm, [PCFR+](https://arxiv.org/abs/2007.14358) (AAAI 2021) ·
 Xu et al., [DCFR+ / PDCFR+](https://arxiv.org/abs/2404.13891) (IJCAI 2024) and
 [Deep (Predictive) Discounted CFR](https://arxiv.org/abs/2511.08174) (2025) ·
-Zhao et al., AlphaHoldem (AAAI 2022)
+Zhao et al., AlphaHoldem (AAAI 2022) ·
+Heinrich & Silver, [NFSP](https://arxiv.org/abs/1603.01121) (2016) ·
+Brown, Bakhtin, Lerer & Gong, [ReBeL](https://arxiv.org/abs/2007.13544) (NeurIPS 2020)
