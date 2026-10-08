@@ -74,6 +74,10 @@ python -m pytest tests -q                                    # ~270 tests, ~7 mi
 - Measure, don't anecdote: 400k+ hands for head-to-head, 20k+ LBR pairs, report ± SE. Played-hands tools use all-in
   EV by default (`--raw` off): hands all-in before the last card count with their expectation over the runouts
   (`Engine.allin_ev`, Python + C++; `showdown_stage` = the round whose betting ended the hand at a showdown).
+- AlphaHoldem (`headsup/alphaholdem/`, spec `alpha:<path>`): its tensors are replayed from the observation's bet history
+  (`encoding.py` mirrors `GameConfig.raise_amount` / `legal_mask`), so a change of the observation layout or the betting
+  rules needs `tests/test_alphaholdem.py`. Training plays both seats in `headsup/twoseat.py` (C++ `SelfPlayVecEnv` + Python
+  twin). Open points of the paper and the choices made: `docs/superpowers/specs/2026-10-08-alphaholdem-design.md`.
 
 ## Machine / operations (64-core WSL2 box, 2 × RTX 3090, 94 GB RAM)
 

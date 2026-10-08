@@ -402,7 +402,7 @@ def test_rollout_trains_on_the_main_agents_decisions_only():
     assert (batch["own"] == 1).all() and (batch["opp"] == 2).all() and (batch["seat"] == 0).all()
     hands, chips = int(info["pool_hands"][0]), float(info["pool_chips"][0])
     assert info["hands"] == hands and n == round(chips) - hands  # chips = 2 a + b and hands = a + b: a hands as small blind
-    assert 0.3 < n / hands < 0.7  # the seat alternates: about half of the hands
+    assert abs(n / hands - 0.5) < 0.05  # the seat alternates from hand to hand (fixed seats would give 1/3: those hands are longer)
     np.testing.assert_allclose(batch["adv"].numpy(), (batch["ret"] - batch["value"]).numpy(), rtol=1e-4, atol=1e-7)
 
 
@@ -442,6 +442,85 @@ def test_rollout_returns_are_each_seats_reward_of_its_hand():
     assert torch.allclose(logp, batch["logp"], atol=1e-5) and torch.allclose(value, batch["value"], atol=1e-5)
     assert batch["legal"].gather(1, batch["action"][:, None]).all()
     assert batch["cards"][:, 0].sum(dim=(1, 2)).eq(2).all()  # two hole cards in every sample
+
+
+def test_rollout_samples_are_aligned_with_their_observations():
+    """Half of the tables against a pool member, half self-play.  Which cells of the [step, table] grid are samples
+    is replayed here from the assignment and the seats (the main agent's seat flips when a hand against the member
+    ends); every sample's inputs, legal set and value-clip bounds are those of the observation at its cell."""
+    from headsup.alphaholdem.encoding import Encoder
+    from headsup.alphaholdem.train import Trainer
+
+    trainer = Trainer(TINY, device="cpu")
+    trainer.pool.add(trainer.net, iteration=0)
+    batch, info = trainer.collect(keep_obs=True)
+    grid = info["grid"]
+    seat, active, done = (grid[k].numpy() for k in ("seat", "active", "done"))
+    opponent, main_seat = info["opponent"], info["main_seat"].copy()
+    assert sorted(np.bincount(opponent + 1).tolist()) == [24, 24]
+    expected = np.zeros_like(active)
+    for t in range(len(seat)):
+        expected[t] = active[t] & ((opponent < 0) | (seat[t] == main_seat))
+        main_seat[done[t] & (opponent >= 0)] ^= 1
+    cells = np.zeros_like(active)
+    cells[batch["step"].numpy(), batch["table"].numpy()] = True
+    np.testing.assert_array_equal(cells, expected)
+    assert cells.sum() == len(batch["action"]) and 0.6 < cells.sum() / active.sum() < 0.9  # all of self-play, half of the rest
+    obs = grid["obs"][batch["step"], batch["table"]]
+    enc = Encoder(DEFAULT_GAME)
+    cards, acts, legal = enc(obs)
+    assert torch.equal(cards, batch["cards"]) and torch.equal(acts, batch["acts"]) and torch.equal(legal, batch["legal"])
+    own, opp = enc.value_bounds(obs)
+    assert torch.equal(own, batch["own"]) and torch.equal(opp, batch["opp"]) and len(set(own.tolist())) > 5
+    assert torch.equal(obs[:, 22].long(), batch["seat"])  # the observer is the acting seat
+    assert torch.equal(grid["value"][batch["step"], batch["table"]], batch["value"]) and not grid["value"].numpy()[~cells].any()
+
+
+def test_elo_game_follows_the_rollout_result():
+    """The main agent always raises and the pool member folds to every bet: the main agent wins every hand against it
+    (+2 as small blind, +1 as big blind), so its rating rises by K / 2 and the member's falls."""
+    from headsup.alphaholdem.train import Trainer
+
+    trainer = Trainer(TINY, device="cpu", snapshot_every=100)
+    trainer.pool.add(trainer.net, iteration=0)
+    _force(trainer.pool.members[0].net, 0)
+    _force(trainer.net, 2)
+    record = trainer.iterate()
+    assert record["hands_vs_pool"] > 50 and record["chips_vs_pool"] == pytest.approx(1.5, abs=0.1)
+    assert trainer.pool.main_elo == pytest.approx(1208.0) and trainer.pool.members[0].elo == pytest.approx(1192.0)
+    assert record["elo"] == trainer.pool.main_elo and record["pool"] == [[0, trainer.pool.members[0].elo]]
+
+
+def test_update_uses_the_configured_loss():
+    """One minibatch, one epoch: the loss of the update is the Trinal-Clip loss with the trainer's settings on the
+    rollout with normalised advantages (distinct values for every coefficient: a swapped pair would show)."""
+    import copy
+
+    from headsup.alphaholdem.ppo import ppo_loss
+    from headsup.alphaholdem.train import Trainer
+
+    settings = dict(eps=0.1, delta1=1.5, value_coef=0.7, entropy_coef=0.03, reward_scale=50.0, epochs=1, minibatch=10**6)
+    trainer = Trainer({**TINY, **settings}, device="cpu")
+    batch, _ = trainer.collect()
+    batch["logp"] = batch["logp"] + torch.linspace(-1.5, 1.5, len(batch["logp"]))  # ratios from 0.2 to 4.5: every clip is active
+    reference = copy.deepcopy(trainer.net).train()
+    before = [p.detach().clone() for p in trainer.net.parameters()]
+    stats = trainer.update(batch)
+    normalised = dict(batch, adv=(batch["adv"] - batch["adv"].mean()) / (batch["adv"].std() + 1e-8))
+    loss, expected = ppo_loss(reference, normalised, eps=0.1, delta1=1.5, value_coef=0.7, entropy_coef=0.03, reward_scale=50.0)
+    assert stats["loss"] == pytest.approx(loss.item(), rel=1e-4)
+    for k in ("policy", "value", "entropy", "clipped", "delta1_clipped", "value_clipped"):
+        assert stats[k] == pytest.approx(expected[k], rel=1e-4), k
+    assert expected["clipped"] > 0.5 and expected["delta1_clipped"] > 0.05 and 0.2 < expected["value_clipped"] < 1.0
+    assert loss.item() != pytest.approx(ppo_loss(reference, normalised, eps=0.1, delta1=1.5, value_coef=0.03, entropy_coef=0.7,
+                                                 reward_scale=50.0)[0].item(), rel=1e-3)
+    moved = [float((a - b.detach()).abs().max()) for a, b in zip(before, trainer.net.parameters())]
+    assert 0 < max(moved) < 1e-3 and stats["grad_norm"] > 0  # one Adam step of lr 3e-4
+    plain = Trainer({**TINY, **settings, "adv_norm": False, "value_clip": False}, device="cpu")  # the two switches
+    plain.net.load_state_dict(reference.state_dict())
+    stats = plain.update(batch)
+    loss, _ = ppo_loss(reference, batch, eps=0.1, delta1=1.5, value_coef=0.7, entropy_coef=0.03, reward_scale=50.0, value_clip=False)
+    assert stats["loss"] == pytest.approx(loss.item(), rel=1e-4) and stats["value_clipped"] == 0
 
 
 def test_training_moves_the_main_agent_and_not_the_pool():
@@ -494,6 +573,8 @@ def test_checkpoint_round_trip_and_cli(tmp_path):
     moments = [s["exp_avg"] for s in a.opt.state_dict()["state"].values()]
     assert len(moments) == len(list(a.net.parameters())) and any(m.abs().sum() > 0 for m in moments)  # Adam's state came along
     assert all(torch.equal(x, y) for x, y in zip(moments, [s["exp_avg"] for s in saved["opt"]["state"].values()]))
+    assert a.rng.bit_generator.state == saved["rng"] and torch.equal(a.gen.get_state(), saved["gen"])  # both generators
+    assert a.rng.bit_generator.state != np.random.default_rng(0).bit_generator.state
     ra, rb = a.iterate(), b.iterate()  # the same checkpoint continues the same way
     assert ra["batch"] == rb["batch"] and ra["policy"] == pytest.approx(rb["policy"], rel=1e-4) and a.iteration == 3
     main(args + ["--iterations", "3", "--resume"])

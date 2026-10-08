@@ -103,18 +103,21 @@ class Trainer:
         return action.squeeze(1), logp.gather(1, action).squeeze(1), value
 
     @torch.no_grad()
-    def collect(self, assignment=None):
+    def collect(self, assignment=None, keep_obs=False):
         """Play one rollout.  Returns ``(batch, info)``: the main agent's decisions (network inputs, action,
         log-probability, value, value-clip bounds, advantage, return, and where they happened: step / table / seat)
-        and the rollout's statistics.  ``assignment`` (int[envs]; -1 = the current agent, else a pool index) overrides
-        the pool's opponent assignment (tests)."""
+        and the rollout's statistics, with the [step, table] grid of what every table did.  ``assignment``
+        (int[envs]; -1 = the current agent, else a pool index) overrides the pool's opponent assignment and
+        ``keep_obs`` adds the observations to the grid (tests)."""
         c, dev, n = self.cfg, self.device, self.cfg["envs"]
         opponent_np = np.asarray(self.pool.assign(n, self.rng) if assignment is None else assignment, dtype=np.int64)
         main_seat_np = self.rng.integers(0, 2, n)  # the main agent's seat at tables against a pool member
-        opponent, main_seat = torch.as_tensor(opponent_np, device=dev), torch.as_tensor(main_seat_np, device=dev)
+        opponent, main_seat = torch.tensor(opponent_np, device=dev), torch.tensor(main_seat_np, device=dev)  # copies
         pool_chips, pool_hands = np.zeros(len(self.pool)), np.zeros(len(self.pool), dtype=np.int64)
         store = {k: [] for k in ("cards", "acts", "legal", "action", "logp", "value", "own", "opp", "step", "table", "seat")}
         grid = {k: [] for k in ("seat", "active", "done", "reward", "value")}
+        info = dict(opponent=opponent_np.copy(), main_seat=main_seat_np.copy())  # as the rollout starts
+        observations = []
         fresh = torch.ones(n, dtype=torch.bool, device=dev)  # no action yet in the table's hand
         count, step, draining = 0, 0, False
         self.net.eval()
@@ -124,6 +127,8 @@ class Trainer:
             if not active.any():
                 break
             obs_t, seat_t = torch.as_tensor(obs, device=dev), torch.as_tensor(seat, device=dev)
+            if keep_obs:
+                observations.append(obs_t)
             cards, acts, legal = self.encoder(obs_t)
             main = active & ((opponent < 0) | (seat_t == main_seat))
             actions = torch.full((n,), -1, dtype=torch.long, device=dev)  # -1: the table waits
@@ -147,7 +152,7 @@ class Trainer:
                 np.add.at(pool_chips, opponent_np[ended], rewards[ended, main_seat_np[ended]])
                 np.add.at(pool_hands, opponent_np[ended], 1)
                 main_seat_np[ended] ^= 1
-                main_seat = torch.as_tensor(main_seat_np, device=dev)
+                main_seat = torch.tensor(main_seat_np, device=dev)
             rewards, dones = torch.as_tensor(rewards, device=dev), torch.as_tensor(dones, device=dev)
             for k, v in zip(grid, (seat_t, active, dones, rewards, values)):
                 grid[k].append(v)
@@ -159,7 +164,9 @@ class Trainer:
                               c["gamma"], c["lam"])
         batch = {k: torch.cat(v) for k, v in store.items()}
         batch["adv"], batch["ret"] = adv[batch["step"], batch["table"]], ret[batch["step"], batch["table"]]
-        info = dict(steps=step, hands=int(grid["done"].sum()), pool_chips=pool_chips, pool_hands=pool_hands, grid=grid)
+        if keep_obs:
+            grid["obs"] = torch.stack(observations)
+        info.update(steps=step, hands=int(grid["done"].sum()), pool_chips=pool_chips, pool_hands=pool_hands, grid=grid)
         return batch, info
 
     # ------------------------------------------------------------------ update
@@ -174,8 +181,10 @@ class Trainer:
         self.net.train()
         for _ in range(c["epochs"]):
             for idx in torch.randperm(size, generator=self.gen, device=self.device).tensor_split(minibatches):
-                loss, stats = ppo_loss(self.net, {k: v[idx] for k, v in batch.items()}, c["eps"], c["delta1"], c["value_coef"],
-                                       c["entropy_coef"], self.reward_scale, c["value_clip"])
+                loss, stats = ppo_loss(self.net, {k: v[idx] for k, v in batch.items()}, eps=c["eps"], delta1=c["delta1"],
+                                       value_coef=c["value_coef"], entropy_coef=c["entropy_coef"], reward_scale=self.reward_scale,
+                                       value_clip=c["value_clip"])
+                stats["loss"] = loss.item()
                 self.opt.zero_grad(set_to_none=True)
                 loss.backward()
                 stats["grad_norm"] = float(torch.nn.utils.clip_grad_norm_(self.net.parameters(), c["max_grad_norm"]))
