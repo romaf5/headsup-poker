@@ -265,9 +265,9 @@ def test_leduc_report_tabulates_rebel_runs_and_labels_its_references(tmp_path):
                   "value_error": 1.0 / e, "value_error_search": None, "loss": 0.1, "seconds": 3.0 * e} for e in (1, 25, 50, 75, 100)]
         (tmp_path / f"leduc_s{seed}.json").write_text(json.dumps({"game": "leduc", "algo": "rebel", "curve": curve[: 5 - seed]}))
     lines = rebel_table(str(tmp_path / "leduc_s*.json"), epochs=(1, 50, 100)).splitlines()
-    assert lines[0] == "| epoch (2 runs) | 1 | 50 | 100 | last 3 evaluations |"
-    # mA/g; the last column: each run's mean over its last three evaluations (seed 0: epochs 50-100, seed 1: 25-75)
-    tail = [1000 * np.mean([0.5 / e + shift for e in epochs]) for epochs, shift in (((50, 75, 100), 0.0), ((25, 50, 75), 0.002))]
+    assert lines[0] == "| epoch (2 runs) | 1 | 50 | 100 | last 3 evaluations (epochs 25 / 50 / 75) |"
+    # mA/g; the last column: each run's mean over the last three evaluations that EVERY run has (seed 1 stops at 75)
+    tail = [1000 * np.mean([0.5 / e + shift for e in (25, 50, 75)]) for shift in (0.0, 0.002)]
     assert lines[2] == ("| policy played in expectation (exact mixture over the stopping steps) | 501.0 ± 1.4 | 11.0 ± 1.4 | 5.0 | "
                         f"{np.mean(tail):.1f} ± {np.std(tail, ddof=1):.1f} |")
     assert lines[3].startswith("| average of K = 1024 sampled playthrough policies (the paper's protocol) | 601.0 ± 1.4 |")

@@ -1,7 +1,11 @@
 # ReBeL on the small poker games - design
 
 Status: implemented on 2026-10-08 under a standing approval for autonomous work; this spec records the design as
-built and awaits review. The long validation runs (three seeds, full length) are not part of it.
+built. An independent review found no correctness bug (brute-force best responses against the explicit mixture
+agree with the repository's to 1e-16) and its findings - test margins, reproducibility across thread counts, edge
+cases - are worked in. Validation, three seeds with the default settings, 300 epochs: 27.7 +- 1.4 mA/g for the
+policy played, 28.2 +- 1.3 for 1 024 sampled playthroughs, 53.3 +- 2.0 for unsafe search, against 22.1 / 24.8 /
+54.5 for the search with exact leaf values: 1.25 times the exact-leaf search, criterion 2 asks for at most 2.
 
 Sources: Brown, Bakhtin, Lerer, Gong, "Combining Deep Reinforcement Learning and Search for Imperfect-Information
 Games", arXiv 2007.13544 (NeurIPS 2020), TeX source with all appendices; the official Liar's Dice code
@@ -109,7 +113,8 @@ first round, but a solve starts AFTER the card. Two ways to make the missing exa
 
 **Value network and training.** Input, 21 numbers for Leduc: agent index (1), a flag "the round is over and the
 board card is due" (1), pot / 26 (1), the board card one-hot (6, zeros before it), both ranges (2 x 6). Output:
-6 values in units of the largest pot (13 chips), so targets lie in [-1, 1]. Architecture as the official `Net2`:
+6 values in units of the most a player can win (13 chips; the largest pot is 26, which is what the pot feature
+is divided by), so targets lie in [-1, 1]. Architecture as the official `Net2`:
 `[Linear -> LayerNorm -> GELU] x 2` with 256 units and a linear output layer scaled by 0.01. Loss: the official
 "Huber", `x^2` for `|x| <= 1` and `2 |x| - 1` beyond, averaged over hands and examples (with targets in [-1, 1]
 it is the squared error in practice). Adam, gradient-norm clipping at 5, minibatches of 512 drawn uniformly from
@@ -204,6 +209,22 @@ exception: the official values are a flag away, the defaults were measured on Le
    `--steps 50 --lr 3e-4 --lr-halve-every 400 --epochs 1000`.
 10. **Not implemented**: CFR-AVG, fictitious play, the policy network, depth limits in actions.
 
+Inherited from the official code rather than a deviation: the self-play walk normalises a range after every
+action, while the leaf query and test-time play normalise the product of the reaches once at the leaf. The two
+differ only on lines where a range loses all its mass on the way (the walk restarts it as uniform there and keeps
+updating it; the product stays without mass and becomes uniform at the leaf): 0 of 13 073 leaf visits with the
+trained network.
+
+**Reproducibility.** A seed fixes a run only together with the number of torch threads: the thread count changes
+the order of the network's float additions, and the search amplifies the last digit (the same seed under 1 and 2
+threads: the root iterates differ from the first step on, the first evaluation gives 1.28 against 1.03). The CLI
+therefore runs with `--threads 1` unless told otherwise (12 % slower per epoch than 2 threads). Runs are compared
+as distributions over seeds, never seed against seed.
+
+Known and deferred (minor): `value_error_search` compares the network with solves of `T - 2` steps where the
+training targets come from `T` steps; resuming a checkpoint checks the game, the network size and the buffer
+capacity but no other hyperparameter.
+
 ## Architecture
 
 - `headsup/algos/rebel.py` (new)
@@ -219,14 +240,15 @@ exception: the official values are a flag away, the defaults were measured on Le
   - `ReBeL(game, ...)`: `search()`, `self_play()`, `generate()`, `train()`, `iterate()`, `policies()`,
     `playthrough()`, `evaluate()`, `probe()`, `state_dict()` / `load_state_dict()`; `Playthrough`.
   - CLI: `python -m headsup.algos.rebel --game leduc --epochs N --seed S --json out.json --checkpoint ck.pt
-    [--device cpu|cuda:0]`, `--oracle` for the calibration. The JSON curve has per evaluation: `epoch`,
+    [--device cpu|cuda:0] [--threads 1]`, `--oracle` for the calibration. The curve file is replaced atomically
+    at every evaluation. The JSON curve has per evaluation: `epoch`,
     `examples`, `sgd_steps`, `games`, the six evaluation keys above with `samples`, `loss`, `seconds`.
 - `headsup/algos/leduc_report.py`: a ReBeL section - the reference rows, each labelled with its source and what
   it measures, and our runs `runs/leduc_rebel/leduc_s*.json` by epoch (mean +- sd over seeds).
 - Restricted to the Leduc family (`headsup/games/leduc.py`): one private card per player, at most two betting
   rounds, a last-round tree that does not depend on the first round's betting. The constructor asserts it.
 
-## Tests (`tests/test_rebel.py`, 38 tests, 15-20 s on CPU; the report's test is in `tests/test_deep_algos.py`)
+## Tests (`tests/test_rebel.py`, 48 tests, 15-20 s on CPU; the report's test is in `tests/test_deep_algos.py`)
 
 A convergence test cannot tell most one-line mistakes apart, so the pieces are tested directly:
 
@@ -255,6 +277,14 @@ A convergence test cannot tell most one-line mistakes apart, so the pieces are t
 - Kuhn end to end (exploitability = Linear CFR's), evaluation keys, an evaluation does not change the training
   trajectory, a short training lowers the value error, checkpoint round trip continues bit-identically on CPU,
   snapshots and loaded solvers do not share optimiser state, the CLI trains / resumes / calibrates.
+- Added after the review, each the only guard of its property at every thread count: what `self_play` hands to the
+  walk (the iterates of the stopping steps, the configured epsilon); every iterate is regret matching over the
+  legal actions (exactly 0 on illegal ones, uniform where nothing is positive); the agent of the leaf query; the
+  evaluation searches with the network, not with exact leaf values; the gradient norm the optimiser sees is 5;
+  batches without a PBS before the card, zero minibatches, odd search lengths (refused in the constructor); the
+  CLI's thread count; the curve file survives a crash while it is rewritten. The one statistical test (a short
+  training lowers the value error) keeps a margin now: the ratio is 0.42-0.50 over seeds and thread counts, the
+  bound 0.6.
 
 Each wiring test was checked against one-line mutants of `rebel.py` (see "Result").
 
@@ -282,19 +312,22 @@ References (none is an official ReBeL-on-Leduc result):
 
 ## Compute
 
-Measured on the shared 64-core box (load average 40 from other jobs), one process with 2 threads, T = 1024:
+Measured on the shared 64-core box when it was quiet (load average 8), one process, T = 1024, torch with one
+thread (the CLI's default) and with two:
 
-| part | time |
-|---|---|
-| root solve, 1024 steps with 5 leaf queries each | 0.5 s |
-| 2048 playthroughs: about 1 900 last-round solves of 1024 steps in one batch (0.9 us per subgame and step) | 1.6-1.7 s |
-| 200 minibatches of 512 | 1.2 s |
-| one epoch: 7 600 examples = 3 800 PBSs at first (92 % of the playthroughs reach the board card), about 5 300 later | 3.3-3.4 s; generation alone: 3 500 examples/s = 1 750 PBSs/s |
-| one evaluation (15 360 last-round solves of 1022 steps in one batch, three best responses) | 25 s |
-| search with exact leaf values, T = 1024 (`--oracle`): 1 024 x 30 last-round solves | 212 s |
+| part | 1 thread | 2 threads |
+|---|---|---|
+| root solve, 1024 steps with 5 leaf queries each | 0.40 s | 0.42 s |
+| 2048 playthroughs: about 1 900 last-round solves of 1024 steps in one batch (0.8 us per subgame and step) | 1.5 s | 1.5 s |
+| 200 minibatches of 512 | 1.25 s | 0.9 s |
+| one epoch: 7 600 examples = 3 800 PBSs at first (92 % of the playthroughs reach the board card), about 5 300 later | 3.2 s | 2.85 s |
+| one evaluation (15 360 last-round solves of 1022 steps in one batch, three best responses) | 22 s | 22 s |
 
-A run of 300 epochs (60 000 minibatches, 1.6 M examples) with an evaluation every 20 epochs: 17 min of training
-plus 7 min of evaluations, about 25 minutes per seed on one core; the development run below took 29 minutes next
+Generation alone produces 4 000 examples = 2 000 PBSs per second; the search with exact leaf values at T = 1024
+(`--oracle`: 1 024 x 30 last-round solves) took 212 s on the loaded machine.
+
+A run of 300 epochs (60 000 minibatches, 1.6 M examples) with an evaluation every 20 epochs: 16 min of training
+plus 6 min of evaluations, about 22 minutes per seed on one core; the development run below took 29 minutes next
 to other jobs. Three seeds fit on three cores. The official Liar's Dice length (1 000 epochs of 50 minibatches)
 takes about 40 minutes plus its evaluations. `--leaf-targets solve` needs six solves per example: `--games 512`
 keeps an epoch near 4 s (1 000 examples).
@@ -306,7 +339,7 @@ network trained and played that way can do. It was not needed.
 The solver's cost is memory traffic, not Python: a first version with the subgame axis first (gathers along a
 middle axis) needed 9 us per subgame and step; subgame-last arrays with whole-block gathers need 0.9.
 
-## Result (2026-10-08: development measurements, seed 0; the three-seed validation runs come after the hand-back)
+## Result (2026-10-08: development measurements, seed 0; the three-seed validation is in the status line)
 
 **Search alone, exact leaf values** (`--oracle`, exact exploitability in mA/g):
 
@@ -328,20 +361,21 @@ with the order of floating-point operations.
 played, of 1 024 sampled playthroughs, of unsafe search (mA/g); value-net RMS error on the probe set and of the
 leaf values fed to the evaluated search (milli-antes):
 
-| epoch | 1 | 35 | 70 | 100 | 120 | 160 | 200 | 220 | 240 | 260 | 280 | 300 |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| policy played (exact) | 1026 | 40.5 | 52.3 | 49.4 | 29.8 | 29.6 | 30.3 | 24.4 | 24.8 | 25.3 | 25.1 | 26.2 |
-| 1 024 sampled playthroughs | 1024 | 40.7 | 53.6 | 53.4 | 30.2 | 31.3 | 44.3 | 26.3 | 27.1 | 28.1 | 26.4 | 26.9 |
-| unsafe search | 920 | 60.8 | 60.1 | 57.6 | 56.9 | 52.8 | 52.6 | 53.1 | 54.9 | 50.6 | 51.2 | 50.9 |
-| value error, probe | 1032 | 244 | 221 | 205 | 193 | 180 | 174 | 165 | 169 | 160 | 161 | 161 |
-| value error, fed to the search | 768 | 68 | 65 | 56 | 52 | 54 | 57 | 49 | 46 | 49 | 44 | 47 |
+| epoch | 1 | 35 | 70 | 80 | 100 | 120 | 140 | 160 | 180 | 200 | 220 | 240 | 260 | 280 | 300 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| policy played (exact) | 1026 | 40.5 | 52.3 | 41.0 | 49.4 | 29.8 | 30.5 | 29.6 | 36.4 | 30.3 | 24.4 | 24.8 | 25.3 | 25.1 | 26.2 |
+| 1 024 sampled playthroughs | 1024 | 40.7 | 53.6 | 43.2 | 53.4 | 30.2 | 42.0 | 31.3 | 35.3 | 44.3 | 26.3 | 27.1 | 28.1 | 26.4 | 26.9 |
+| unsafe search | 920 | 60.8 | 60.1 | 51.3 | 57.6 | 56.9 | 48.7 | 52.8 | 59.5 | 52.6 | 53.1 | 54.9 | 50.6 | 51.2 | 50.9 |
+| value error, probe | 1032 | 244 | 221 | 204 | 205 | 193 | 196 | 180 | 171 | 174 | 165 | 169 | 160 | 161 | 161 |
+| value error, fed to the search | 768 | 68 | 65 | 70 | 56 | 52 | 56 | 54 | 52 | 57 | 49 | 46 | 49 | 44 | 47 |
 
 The mean of the last three evaluations is 25.5 mA/g: 1.15 times the exact-leaf search (22.1), against the
 criterion of 2. The learning rate was halved at epochs 100 and 200; each halving lowers the plateau (about 45,
 30, 25). This run was resumed three times while the code was still being polished (the solver's arithmetic was
-reordered in between), so the final code will not reproduce it bit for bit; a fresh run of the final code and
-CLI defaults (80 epochs, 5.7 minutes) gave 994 / 113 / 56 / 41 / 29 mA/g at epochs 1 / 20 / 40 / 60 / 80, with a
-probe error of 991 / 333 / 264 / 237 / 220 milli-antes: the same course.
+reordered in between) and ran with two torch threads, so the final code will not reproduce it bit for bit. A
+fresh 80-epoch run of the same seed with four threads (5.7 minutes) gave 994 / 113 / 56 / 41 / 29 mA/g at epochs
+1 / 20 / 40 / 60 / 80, with a probe error of 991 / 333 / 264 / 237 / 220 milli-antes - another trajectory of the
+same seed (see "Reproducibility"), the same course. The three validation seeds end at 27.7 +- 1.4.
 
 The same setup with the official Liar's Dice schedule (50 minibatches per epoch, 3e-4 constant up to epoch 400):
 214 / 91 / 63 / 65 / 45 / 33 / 49 / 46 / 40 / 40 / 39 mA/g at epochs 40 / 80 / ... / 240 / 260 / 280 / 300 / 320 /
@@ -362,7 +396,7 @@ six.
 leaf values at T = 64 (12 draws each): K = 16: 244 +- 14, K = 64: 158 +- 5, K = 256: 136.0 +- 2.4, K = 1024:
 128.9 +- 1.0 mA/g against 126.8 exact, single K = 1024 draws scatter by 3.5. At T = 1024 a root iterate is drawn
 only twice on average: in the training table above the K = 1024 number lies up to 14 mA/g above the exact one
-(and at two of the run's evaluations 1-2 below).
+and twice 1-2 below it; in other runs it fell up to 6 below. It is an upper bound in expectation only.
 
 **Mutation check.** One-line mutants of `rebel.py`, each run against `tests/test_rebel.py` in its own copy of the
 package. First pass: 120 mutants, 115 killed. Of the five survivors one was equivalent (a reordered sum), one
@@ -372,5 +406,10 @@ the regret-floor setting not reaching the solvers, the root value's normalisatio
 pass on the final code: 130 mutants, 129 killed; the survivor (the unsafe comparison policy's last round solved
 for half the steps) got its own test and is killed too.
 
-**Not verified:** `--device cuda:0` (the session was CPU-only by instruction); seeds other than 0; the hold'em
-stages of the brief.
+The review then showed that this pass had run with one torch thread only: two mutants (no exploration in
+self-play, regret matching over illegal actions) were killed by nothing but the statistical value-error test,
+by a margin inside its noise, and survived with 2 or 4 threads; a third (the evaluation searching with exact leaf
+values) had not been in the list. Each has its direct test now and is killed by it with 1, 2 and 4 threads, as
+are the mutants of the code added in the fix pass (16 mutants run again).
+
+**Not verified:** `--device cuda:0` (the session was CPU-only by instruction); the hold'em stages of the brief.

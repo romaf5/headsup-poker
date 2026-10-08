@@ -41,6 +41,14 @@ from headsup.games import make_game
 H = 6  # Leduc: a hand is one of six cards
 
 
+@pytest.fixture(autouse=True)
+def _thread_count():
+    """The CLI sets torch's thread count; a test must not leave its setting to the next one."""
+    threads = torch.get_num_threads()
+    yield
+    torch.set_num_threads(threads)
+
+
 def _leduc(**kw):
     kw = {"iters": 8, "games": 32, "steps": 2, "batch": 16, "capacity": 4096, "eval_samples": 8, "probe_iters": 8, **kw}
     return ReBeL(make_game("leduc"), **kw)
@@ -226,6 +234,37 @@ def test_regret_floor_is_the_official_smoothing():
     np.testing.assert_allclose(official.last[0, 1], np.broadcast_to(k.tree0.uniform[1], (3, 3)))  # player 1 has not moved yet
 
 
+def test_iterates_are_regret_matching_over_the_legal_actions():
+    """After every step each strategy row is the floored regrets of the LEGAL actions, normalised: exactly 0 on an
+    illegal action, summing to 1, and uniform over the legal actions for a hand without positive regret."""
+    s = _leduc()
+    rng = np.random.default_rng(7)
+    leaf, board = rng.integers(0, 5, 6), rng.integers(0, H, 6)
+    last_round = s.solver(deal_board(normalise(rng.random((6, 2, H))), board), leaf, board)
+    first_round = s.solver(normalise(rng.random((2, 2, H))), leaf_fn=lambda p, beliefs: 0.3 * np.cos(7 * beliefs[:, :, p] + p))
+    for sub in (last_round, first_round):
+        t = sub.tree
+        legal = t.legal[t.dec]  # (D, A)
+        assert (~legal).any() and (legal.sum(1) >= 2).all()
+        idle = 0
+        for _ in range(9):
+            sub.step()
+            last, regret = sub.last, sub.regret
+            assert (last[:, ~legal] == 0).all() and (last >= 0).all()
+            np.testing.assert_allclose(last.sum(2), 1.0, atol=1e-12)
+            matched = regret.copy()  # the regrets the strategies were matched to: before the update's discount
+            for p in (0, 1):
+                if sub.updates[p]:
+                    matched[:, t.mine[p]] /= sub.updates[p] / (sub.updates[p] + 1.0)
+            pos = np.maximum(matched, EPS) * t.legal_f
+            np.testing.assert_allclose(last, pos / pos.sum(2, keepdims=True), atol=1e-12)
+            none = (np.where(legal[None, :, :, None], regret, -1.0) <= 0).all(axis=2)  # (B, D, H): no positive regret
+            uniform = np.broadcast_to(t.uniform[None], last.shape)
+            np.testing.assert_allclose(np.moveaxis(last, 2, 3)[none], np.moveaxis(uniform, 2, 3)[none], atol=1e-12)
+            idle += int(none.sum())
+        assert idle > 20  # e.g. the hand the board blocks: its values, hence its regrets, are zero
+
+
 def test_root_values_are_averaged_with_linear_weights():
     s = _leduc()
     rng = np.random.default_rng(2)
@@ -276,6 +315,26 @@ def test_leaf_query_uses_the_current_iterate_and_scales_by_opponent_reach():
     average = sub.average()
     assert np.abs(sub.leaf_beliefs(average) - sub.leaf_beliefs(sub.history[5])).max() > 0.01  # the average would be other PBSs
     assert np.abs(reach[0][0, t0.leaves].sum(1) - reach[1][0, t0.leaves].sum(1)).max() > 0.01  # the two reaches differ
+
+
+def test_leaf_values_ask_the_network_for_the_traverser():
+    s = _leduc(iters=8)
+    with torch.no_grad():  # a network whose answer depends on the agent index (its first input)
+        s.net[0].weight[:, 0] += 1.0
+        s.net[-1].weight *= 100
+    calls, real = [], s.net_values
+    s.net_values = lambda pub, beliefs, agent: calls.append((pub.copy(), beliefs.copy(), agent)) or real(pub, beliefs, agent)
+    beliefs = normalise(np.random.default_rng(8).random((3, 5, 2, H)))
+    answers = [s.leaf_values(p, beliefs) for p in (0, 1)]
+    assert [agent for _, _, agent in calls] == [0, 1]
+    for p, (pub, asked, _) in enumerate(calls):
+        np.testing.assert_array_equal(pub, np.tile(s.leaf_pub, (3, 1)))  # rows: subgame x leaf, every leaf with its own pot
+        np.testing.assert_array_equal(asked, beliefs.reshape(15, 2, H))
+        np.testing.assert_array_equal(answers[p], real(pub, asked, p).reshape(3, 5, H))
+    assert np.abs(answers[0] - answers[1]).max() > 0.05
+    calls.clear()
+    s.search(6)
+    assert [agent for _, _, agent in calls] == [0, 1, 0, 1, 0, 1]  # every step asks for the player it updates
 
 
 def test_exact_leaf_values_reproduce_the_calibration():
@@ -367,6 +426,47 @@ def test_sampled_leaves_follow_the_iterate(epsilon):
         assert np.abs(naive / naive.sum() - pairs[ends] / pairs[0]).max() > 0.03
 
 
+def test_self_play_walks_the_stopped_iterates_with_the_configured_exploration(monkeypatch):
+    import headsup.algos.rebel as R
+
+    s = _leduc(iters=8, games=300, epsilon=0.4, seed=2)
+    search = s.search()
+    seen, walk = {}, R.sample_leaf
+
+    def spy(tree, sigma, beliefs, epsilon, rng):
+        seen.update(tree=tree, sigma=np.array(sigma), beliefs=np.array(beliefs), epsilon=epsilon, rng=rng)
+        seen["out"] = walk(tree, sigma, beliefs, epsilon, rng)
+        return seen["out"]
+
+    monkeypatch.setattr(R, "sample_leaf", spy)
+    out = s.self_play(search)
+    iterates = np.concatenate(search.history)
+    assert seen["tree"] is s.tree0 and seen["rng"] is s.rng
+    assert seen["epsilon"] == 0.4 == s.epsilon  # the exploration of the configuration, not none
+    np.testing.assert_array_equal(seen["sigma"], iterates[out["stop"]])  # each game walks the iterate of ITS stopping step
+    assert len(set(out["stop"].tolist())) == 9 and np.abs(iterates[8] - iterates[0]).max() > 0.1
+    np.testing.assert_array_equal(seen["beliefs"], np.full((300, 2, H), 1 / H))  # from the root PBS
+    np.testing.assert_array_equal(out["node"], seen["out"][0])
+    np.testing.assert_array_equal(out["explorer"], seen["out"][2])
+    assert set(out["explorer"].tolist()) == {0, 1}  # one explorer per game
+
+
+def test_self_play_without_a_pbs_before_the_card(monkeypatch):
+    """chance_prob = 0, or a batch in which no game reaches the end of the round: nothing to ask the network."""
+    for mode in ("net", "solve"):
+        s = _leduc(iters=8, games=40, chance_prob=0.0, leaf_targets=mode, seed=1)
+        out = s.generate()
+        assert (out["stage"] == BEFORE_BOARD).sum() == 0
+        assert (out["stage"] == AFTER_BOARD).sum() == (0 if mode == "solve" else (s.tree0.kind[out["node"]] == LEAF).sum())
+        assert s.buffer.size == 2 * len(out["stage"]) and s.iterate(1).epoch == 1
+    import headsup.algos.rebel as R
+
+    s = _leduc(iters=8, games=5)
+    fold = np.full(5, s.tree0.folds[0])  # every game ends in a fold: the root PBS is the only one
+    monkeypatch.setattr(R, "sample_leaf", lambda tree, sigma, beliefs, eps, rng: (fold, np.array(beliefs), np.zeros(5, dtype=int)))
+    assert s.generate()["stage"].tolist() == [ROOT] and s.buffer.size == 2
+
+
 def test_board_card_is_drawn_from_the_ranges(monkeypatch):
     rng = np.random.default_rng(6)
     beliefs = np.array([[0.5, 0.3, 0.1, 0.05, 0.03, 0.02], [0.02, 0.6, 0.1, 0.1, 0.1, 0.08]])
@@ -422,7 +522,7 @@ def test_self_play_stores_the_averaged_root_values_of_every_pbs(mode):
     else:  # exact targets: every card's subgame solved; nothing is stored after the card
         assert len(after) == 0
         np.testing.assert_allclose(values[before], s.solve_boards(leaf[before], beliefs[before], 16)[0], atol=1e-12)
-    # the examples: one row per PBS and agent, targets in units of the largest pot
+    # the examples: one row per PBS and agent, targets in units of the largest win (13), the pot in units of the largest pot (26)
     x, y = s.examples_of(out)
     M = len(stage)
     assert x.shape == (2 * M, s.in_dim) and y.shape == (2 * M, H) and x.dtype == np.float32 and y.dtype == np.float32
@@ -515,6 +615,39 @@ def test_training_steps_follow_the_official_schedule():
     assert ReBeL(make_game("kuhn"), iters=8).train(2) is None  # nothing to train on yet
 
 
+@pytest.mark.parametrize("clip", [5.0, 0.0])
+def test_gradients_are_clipped_at_the_official_norm(clip):
+    s = _leduc(steps=3, batch=32, grad_clip=clip)
+    with torch.no_grad():
+        s.net[-1].weight *= 1e4  # large gradients in the layers below
+    rng = np.random.default_rng(9)
+    s.buffer.add(rng.random((64, s.in_dim), dtype=np.float32), np.full((64, H), 50.0, dtype=np.float32))
+    norms, step = [], s.opt.step
+
+    def spy():
+        norms.append(float(torch.sqrt(sum((p.grad ** 2).sum() for p in s.net.parameters()))))
+        return step()
+
+    s.opt.step = spy
+    s.train(3)
+    assert len(norms) == 3
+    if clip:
+        np.testing.assert_allclose(norms, 5.0, rtol=1e-4)  # the gradient norm the optimiser sees
+    else:
+        assert min(norms) > 50.0  # the same gradients unclipped
+
+
+def test_training_without_minibatches_and_odd_search_lengths():
+    s = _leduc(steps=0)
+    s.iterate(1)  # generation only
+    assert s.sgd_steps == 0 and s.last_loss is None and s.buffer.size > 0 and s.epoch == 1
+    g = make_game("leduc")
+    for kw in ({"iters": 7}, {"iters": 8, "eval_iters": 7}, {"iters": 8, "probe_iters": 5}, {"iters": 0}):
+        with pytest.raises(ValueError, match="even number"):
+            ReBeL(g, **kw)
+    assert ReBeL(g, iters=8, probe_iters=64).probe_iters == 8  # never longer than the search
+
+
 def test_network_input_and_units():
     s = _leduc()
     pub = s.public(np.array([6.0, 10.0]), np.array([4, 0]))
@@ -526,7 +659,7 @@ def test_network_input_and_units():
     with torch.no_grad():
         s.net[-1].weight.zero_()
         s.net[-1].bias.fill_(0.5)
-    np.testing.assert_allclose(s.net_values(pub, beliefs, 0), 6.5)  # the network works in units of the largest pot (13)
+    np.testing.assert_allclose(s.net_values(pub, beliefs, 0), 6.5)  # the network works in units of the largest win (13)
     np.testing.assert_allclose(s.leaf_values(1, np.full((3, 5, 2, H), 1 / H)), 6.5)
 
 
@@ -656,6 +789,23 @@ def test_evaluation_reports_and_does_not_disturb_training():
     assert [x[:2] for x in seen] == [(6, 5)] * 3 and seen[0][2] == seen[1][2] != seen[2][2]
 
 
+def test_evaluation_searches_with_the_network():
+    s = _leduc(iters=8, games=24, seed=4)
+    s.iterate(2)
+    s.probe()  # the probe set is built with exact leaf values, once; nothing else may use them
+
+    def forbidden(iters):
+        raise AssertionError("the evaluation asked for exact leaf values")
+
+    s.exact_leaf = forbidden
+    asked, real = [], s.leaf_values
+    s.leaf_values = lambda p, beliefs: asked.append(p) or real(p, beliefs)
+    ev = s.evaluate()
+    assert asked[:8] == [0, 1] * 4  # the root search of the evaluation: the network at every step
+    want = s.policies(s.search(s.eval_iters))["exact"]
+    assert ev["exploitability"] == pytest.approx(exploitability(s.game, want)[0], abs=1e-12)
+
+
 def test_value_error_measures_the_network_against_exact_solves():
     s = _leduc(iters=8, probe_iters=8)
     beliefs, values, w = s.probe()
@@ -680,7 +830,7 @@ def test_training_lowers_the_value_error():
     start = s.value_error()
     s.iterate(12)
     assert s.epoch == 12 and s.sgd_steps == 300 and s.examples > 1500
-    assert s.value_error() < 0.5 * start
+    assert s.value_error() < 0.6 * start  # 0.42-0.50 over seeds and thread counts: the wiring has its own tests
 
 
 # ----------------------------------------------------------------------------- checkpoints and the CLI
@@ -719,6 +869,34 @@ def test_state_dict_is_a_snapshot_and_solvers_never_share_optimiser_state():
     b.iterate(2)
     assert steps(a) == 4 and steps(b) == 6 and int(snap["opt"]["state"][0]["step"]) == 2
     assert snap["buffer"]["x"].base is None and len(snap["buffer"]["x"]) == snap["buffer"]["size"]  # a copy of the filled part
+
+
+def test_cli_pins_the_thread_count(tmp_path):
+    """The trajectory of a seed depends on torch's thread count (the order of float additions): the CLI fixes it."""
+    args = ["--game", "kuhn", "--iters", "8", "--games", "4", "--steps", "1", "--batch", "4", "--buffer", "64", "--eval-samples", "4",
+            "--epochs", "1"]
+    torch.set_num_threads(3)
+    main(args)
+    assert torch.get_num_threads() == 1
+    main(args + ["--threads", "2", "--json", str(tmp_path / "t.json")])
+    assert torch.get_num_threads() == 2 and json.load(open(tmp_path / "t.json"))["args"]["threads"] == 2
+
+
+def test_cli_replaces_the_curve_file_atomically(tmp_path, monkeypatch):
+    out = str(tmp_path / "c.json")
+    args = ["--game", "kuhn", "--iters", "8", "--games", "4", "--steps", "1", "--batch", "4", "--buffer", "64", "--eval-samples", "4",
+            "--eval-every", "1", "--json", out]
+    main(args + ["--epochs", "1"])
+    first = open(out).read()
+
+    def crash(obj, f, **kw):  # the process dies in the middle of writing the next curve
+        f.write('{"game": "ku')
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(json, "dump", crash)
+    with pytest.raises(KeyboardInterrupt):
+        main(args + ["--epochs", "2"])
+    assert open(out).read() == first  # the last complete curve is still there
 
 
 def test_cli_trains_evaluates_and_resumes(tmp_path, capsys):
