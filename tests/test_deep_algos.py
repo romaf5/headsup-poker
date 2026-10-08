@@ -234,3 +234,20 @@ def test_optimise_steps_several_networks_and_syncs(device):
                      300, grad_clip=0, sync_every=50, sync_fn=lambda: calls.append(1))
     assert loss < 0.05  # both regressions were optimised
     assert len(calls) == 6  # after steps 1, 51, 101, 151, 201, 251
+
+
+def test_leduc_report_tabulates_pdcfr_runs_by_episodes(tmp_path):
+    import json
+
+    from headsup.algos.leduc_report import PDCFR_PAPER, load_run, table
+
+    curve = [{"iteration": i, "average": 0.2 - 0.0002 * i, "current": 1.0, "nodes_touched": 150_000 * i, "episodes": 20_000 * i}
+             for i in range(1, 501)]
+    (tmp_path / "x_s0.json").write_text(json.dumps({"curve": curve}))
+    assert load_run(str(tmp_path / "x_s0.json"))[49] == (50, pytest.approx(190.0), 7_500_000, 1_000_000)
+    out = table([("pdcfrp", "pdcfr+", "ours", str(tmp_path / "x_s*.json"))], "pdcfrp", (1e6, 4e6, 9.5e6))
+    lines = out.splitlines()
+    assert lines[0].startswith("| episodes |") and "9.5e6" in lines[0]
+    assert lines[2] == "| **VR-DeepPDCFR+, paper** | **158** | **115** | **90** |"
+    assert lines[3].startswith("| ours (1) | 190 | 160 | 105 |")  # means within +-10 % (the last column: 9-10 M) of x
+    assert PDCFR_PAPER[("pdcfrk", "dcfr+")][9.5e6] == pytest.approx(5.3)
