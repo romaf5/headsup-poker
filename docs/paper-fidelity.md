@@ -52,8 +52,50 @@ Open, about the paper's own figures:
 - Its SGD-step sweep (Fig. 3-middle) ends at about 65 mbb/g for 4,000 steps (110 / 80 / 65 / 43 / 37 / 35 for 1k ... 32k),
   the traversal sweep (Fig. 3-left, nominally 4,000 steps) at 34-46 for every K: the headline 37-40 is the level of the
   sweep's 8,000-32,000-step runs.
-- **The FHP reproduction itself is open.** The earlier 80 mbb/g (total, 450 iterations) was measured on the three-bet
-  flop with the narrow network and raw weights; it has to be re-run.
+- **The FHP reproduction itself is open.** Runs of 2026-10-08 on the four-bet game with `--preset paper` (total
+  exploitability in mbb/g; policy net by exact best response over all flops, SD-CFR average on 2,000 sampled flops,
+  which overstates by ~8 %):
+
+  | | t = 50 | 100 | 200 | 300 |
+  |---|---|---|---|---|
+  | paper, Fig. 3-left, K = 10,000 | 154 | 70 | 51 | 40 |
+  | paper, Fig. 3-middle, 4,000 SGD steps (many more traversals) | 75 | 82 | 72 | 75 |
+  | ours, 10,000 traversals: policy net | | 202 | 113 | 95 |
+  | ours, 10,000 traversals: SD-CFR average | 367 | 199 | | |
+  | ours, 10,000 traversals, `--masked-loss`: policy net | | 206 | 129 | 101 |
+  | ours, 25,000 traversals: SD-CFR average | 178 | 121 | | |
+
+  What was measured about the gap:
+  - *Traversals.* With 25,000 traversals - the paper's nodes touched per iteration - the average is at 178 after 50
+    iterations (paper 154); with 10,000 it is at 367. The paper's K = 10,000 is therefore not our `--traversals 10000`.
+  - *Where the error is.* Of the policy net's 202 at t = 100, deviations on the pre-flop street alone are worth 49 and
+    deviations on the flop alone 145 (`holdem_br --br-streets`).
+  - *Refit noise.* Two consecutive regret nets (iterations 99 and 100, 98 % the same data) disagree by 15-19 chips rms
+    at the 1,352 pre-flop infosets, where the predicted regrets have an rms of 75-82; 90 % of the per-iterate
+    strategies there are pure, and consecutive iterates differ by 0.26 (small blind) and 0.49 (big blind) in L1
+    (`docs/analysis/fhp_preflop_refit_noise.py`). Regret matching turns the fit's noise into the strategy.
+  - *The fit.* Refitting one seat's memory at t = 125 under different recipes (`docs/analysis/fhp_fit_noise.py`; per-net
+    noise at the pre-flop infosets in chips, where the tabular mean of the same samples has a standard error of 4.5;
+    held-out loss relative to the paper's recipe):
+
+    | recipe (4,000 steps of 10,000 unless stated) | noise | distance to the tabular mean | held-out loss |
+    |---|---|---|---|
+    | the paper's: constant 1e-3, last weights | 6.7 | 7.2 | 1 |
+    | loss weights raw instead of 2/T; zero instead of random head | 7.1-7.6 | 7.2-8.4 | 1.000-1.003 |
+    | `--net paper` (the network before the audit) | 11.0 | 9.4 | 1.042 |
+    | `--weight-average 0.998` | 2.7 | 4.9 | 0.987 |
+    | `--lr-schedule cosine` | 2.9 | 4.8 | 0.992 |
+    | batch 40,000 | 5.0 | 5.8 | 0.960 |
+    | batch 40,000, cosine from 3e-3 | 2.4 | 4.3 | 0.937 |
+    | 8,000 steps, cosine | 2.5 | 4.3 | 0.956 |
+    | 16,000 steps | 4.4 | 5.5 | 0.948 |
+    | 16,000 steps, weight average | 2.2 | 4.1 | 0.931 |
+
+    The 4,000-step fit both underfits (16,000 steps take 5 % off the held-out loss, of which most is irreducible
+    sampling noise) and jitters; neither the 2/T weights nor the head initialisation matter, and the audit's network
+    is better than the one before. This agrees with the paper's own SGD-step sweep (more steps, lower floor).
+    `--batch-size 40000 --lr 3e-3 --lr-schedule cosine` gets most of the 16,000-step fit at 1.1-1.6 times the cost of
+    the paper's; a 100-iteration run with it and 25,000 traversals is the next data point (`runs/fhp4_k25_fit`).
 
 ## DREAM and ESCHER
 
