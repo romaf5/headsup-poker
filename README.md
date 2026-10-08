@@ -165,6 +165,22 @@ DREAM paper's NFSP settings (`--preset dream`, one seed so far) the curve flatte
 on, where that paper's baseline goes on to 61 at 2e8 - not reproduced. Open points and the 17 places where the paper,
 the DREAM code and OpenSpiel differ: `docs/superpowers/specs/2026-10-08-nfsp-design.md`.
 
+**ReBeL** (Brown et al. 2020; `headsup.algos.rebel`): CFR search over one betting round with a value network at the
+public belief states where the round ends, trained by self-play; at test time it plays a randomly stopped iterate.
+The paper has no Leduc experiment, so the reference is the same search with exact leaf values (the rest of the game
+solved at every leaf query - what a perfect value network would give). Exact exploitability in mA/g, T = 1024 search
+steps, 300 epochs (25-30 min on one core per seed), mean ± sd over 3 seeds:
+
+| | exact leaf values | trained network |
+|---|---|---|
+| policy played (the mixture over stopping steps) | 22.1 | **27.7 ± 1.4** |
+| the paper's protocol: 1,024 sampled playthroughs | 24.8 | 28.2 ± 1.3 |
+| "unsafe" search (average strategy) | 54.5 | 53.3 ± 2.0 |
+
+(full-game tabular Linear CFR with the same number of updates: 10.6). The network costs a quarter on top of the
+search's own error; what limits it is the fit (value error 0.16 antes on probe states), not the data. Where the paper
+and the official Liar's Dice code differ, the defaults follow the code: `docs/superpowers/specs/2026-10-08-rebel-design.md`.
+
 ESCHER's paper has no deep Leduc results. Its Leduc experiment is tabular with oracle history
 values (`python -m headsup.algos.oracle`, 500 trajectories per iteration, 1000 iterations):
 
