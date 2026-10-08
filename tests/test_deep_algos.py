@@ -355,3 +355,44 @@ def test_options_without_effect_for_the_algorithm_are_reported(capsys):
     assert all(flag in err for flag in ("--epsilon", "--shared-baseline", "--value-traversals")) and "--mean-regret" not in err
     parse_args(["--algo", "escher", "--preset", "escher"])
     assert capsys.readouterr().err == ""  # a preset's values are not "given"
+
+
+def test_leduc_report_tabulates_nfsp_runs_against_both_papers(tmp_path, capsys, monkeypatch):
+    import json
+
+    from headsup.algos.leduc_report import DEFAULT_ROWS, NFSP_DREAM, NFSP_PAPER, main, table
+
+    # the curves as digitised (the NFSP paper's in antes x 1000, 64 hidden units; the DREAM paper's NFSP in mA/g by nodes)
+    assert NFSP_PAPER == {1e3: 1880, 1e4: 1040, 1e5: 430, 2e5: 257, 5e5: 158, 1e6: 128, 2e6: 77, 3e6: 75}
+    assert NFSP_DREAM == {2e7: 147, 3e7: 116, 5e7: 92, 1e8: 71, 2e8: 61, 3.2e8: 58}
+    its = [1000] + list(range(10_000, 3_000_001, 10_000))  # as headsup.algos.nfsp evaluates: 128 nodes per iteration
+    for seed, factor in ((0, 1.0), (1, 1.2)):
+        curve = [{"iteration": i, "average": factor * 10.0 / i**0.5, "nodes_touched": 128 * i, "env_steps": 128 * i, "episodes": 40 * i,
+                  "epsilon": 0.0, "seconds": 1.0} for i in its]
+        (tmp_path / f"leduc_paper_s{seed}.json").write_text(json.dumps({"algo": "nfsp", "curve": curve}))
+
+    def ours(lo, hi, key=lambda i: i):  # mA/g: the mean over the evaluations in the window, then mean and sd over the two seeds
+        one = np.mean([1e4 / i**0.5 for i in its if lo <= key(i) <= hi])
+        return f"{1.1 * one:.0f} ± {np.std([one, 1.2 * one], ddof=1):.0f}"
+
+    pattern = str(tmp_path / "leduc_paper_s*.json")
+    lines = table([("nfspp", "nfsp", "ours", pattern)], "nfspp", (1e3, 1e5, 1e6, 3e6)).splitlines()
+    assert lines[0] == "| iteration | 1e3 | 1e5 | 1e6 | 3e6 |"
+    assert lines[2] == "| **NFSP (64 units), paper** | **1880** | **430** | **128** | **75** |"
+    assert lines[3] == f"| ours (2) | {ours(1e3, 1e3)} | {ours(9e4, 1.1e5)} | {ours(9e5, 1.1e6)} | {ours(2.7e6, 3.3e6)} |"
+    assert "| **NFSP (64 units), paper** | **614** |" in table([("nfspp", "nfsp", "ours", pattern)], "nfspp", (5e4,))  # log-x interpolation
+    lines = table([("nfspd", "nfsp", "ours", pattern)], "nfspd", (2e7, 1e8, 3.2e8)).splitlines()
+    assert lines[0] == "| nodes touched (128 per iteration) | 2e7 | 1e8 | 3.2e8 |"
+    assert lines[2] == "| **NFSP, DREAM paper** | **147** | **71** | **58** |"
+    nodes = lambda i: 128 * i  # noqa: E731
+    assert lines[3] == f"| ours (2) | {ours(1.8e7, 2.2e7, nodes)} | {ours(9e7, 1.1e8, nodes)} | {ours(2.88e8, 3.52e8, nodes)} |"
+    lines = table([("nfspk", "nfsp", "ours", pattern)], "nfspk", (1e3, 1e6)).splitlines()
+    assert len(lines) == 3 and lines[2].startswith("| ours (2) | 347.9 ± ")  # Kuhn: no published curve, one decimal
+    wanted = {(setup, f"runs/leduc_nfsp/{game}_{preset}_s*.json") for game, setups in (("leduc", ("nfspp", "nfspd")), ("kuhn", ("nfspk",)))
+              for setup in setups for preset in ("paper", "dream")}
+    assert wanted <= {(setup, pattern) for setup, _, _, pattern in DEFAULT_ROWS}
+    monkeypatch.chdir(tmp_path)
+    main([])  # the default report, without any run on disk
+    out = capsys.readouterr().out
+    assert "| **NFSP (64 units), paper** | **1880** | **1040** |" in out and "| **NFSP, DREAM paper** | **147** |" in out
+    assert "NFSP, `--preset dream` (0) | – |" in out
