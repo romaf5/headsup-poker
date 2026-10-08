@@ -732,13 +732,31 @@ def test_a_checkpoint_of_another_seed_is_refused():
     assert _solver("paper", seed=1).load_state_dict(before).iteration == 2
 
 
-def test_cli_writes_the_curve_and_resumes(tmp_path, capsys):
-    from headsup.algos.nfsp import main
+def test_evaluation_schedule():
+    from headsup.algos.nfsp import eval_due
 
+    due = [it for it in range(1, 25_001) if eval_due(it, 10_000, 25_000)]
+    assert due == [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10_000, 20_000, 25_000]  # 1-2-5, the multiples, the last
+    assert [it for it in range(1, 41) if eval_due(it, 20, 40)] == [1, 2, 5, 10, 20, 40]
+    assert not eval_due(20_000, 15_000, 10**6) and eval_due(30_000, 15_000, 10**6)  # past --eval-every: its multiples only
+
+
+def test_cli_writes_the_curve_and_resumes(tmp_path, capsys, monkeypatch):
+    import headsup.algos.nfsp as nfsp
+
+    main = nfsp.main
     ck, js = tmp_path / "ck.pt", tmp_path / "run.json"
     common = ["--game", "kuhn", "--preset", "paper", "--seed", "3", "--eval-every", "20", "--eta", "0.2"]
     args = common + ["--checkpoint", str(ck), "--checkpoint-minutes", "0", "--json", str(js)]
+    on_disk, evaluate = [], nfsp.NFSPSolver.evaluate
+
+    def spy(self):  # the curve file as the next evaluation finds it
+        on_disk.append(len(json.load(open(js))["curve"]) if js.exists() else None)
+        return evaluate(self)
+
+    monkeypatch.setattr(nfsp.NFSPSolver, "evaluate", spy)
     main(args + ["--iterations", "40"])
+    assert on_disk == [None, 1, 2, 3, 4, 5]  # written at every evaluation, not at the end: a killed run keeps its curve
     out = capsys.readouterr().out
     assert "kuhn nfsp paper it 40: exploitability" in out and "nodes 5.12e+03" in out
     run = json.load(open(js))
@@ -749,18 +767,67 @@ def test_cli_writes_the_curve_and_resumes(tmp_path, capsys):
     assert last["epsilon"] == pytest.approx(0.06 / 40**0.5)
     assert (run["game"], run["algo"], run["preset"]) == ("kuhn", "nfsp", "paper")
     assert run["config"]["eta"] == 0.2 and run["config"]["lr_pi"] == 0.005 and run["args"]["seed"] == 3
-    assert ck.exists() and not (tmp_path / "ck.pt.tmp").exists()
+    saved = torch.load(ck, weights_only=False)
+    assert saved["solver"]["iteration"] == 40 and saved["solver"]["seed"] == 3 and saved["seconds"] >= last["seconds"] > 0
+    saved["seconds"] = 5000.0  # as if the first part had taken that long: the clock goes on from there
+    torch.save(saved, ck)
     main(args + ["--iterations", "70"])  # resumes at 40
     assert "resumed from" in capsys.readouterr().out
     curve = json.load(open(js))["curve"]
     assert [c["iteration"] for c in curve] == [1, 2, 5, 10, 20, 40, 60, 70]
+    seconds = [c["seconds"] for c in curve]
+    assert seconds[:6] == sorted(seconds[:6]) and 5000.0 < seconds[6] < seconds[7] < 5060.0
+    assert torch.load(ck, weights_only=False)["seconds"] >= seconds[7]
     straight = tmp_path / "straight.json"
     main(common + ["--json", str(straight), "--iterations", "70"])  # no checkpoint: one uninterrupted run
     assert [c["average"] for c in json.load(open(straight))["curve"]] == [c["average"] for c in curve]
-    with pytest.raises(ValueError, match="settings"):
+    with pytest.raises(ValueError, match="settings.*eta"):
         main(["--game", "kuhn", "--preset", "paper", "--seed", "3", "--eta", "0.5", "--checkpoint", str(ck), "--iterations", "80"])
+    with pytest.raises(ValueError, match="settings.*seed = 3 .here: 4."):  # not this run under another seed's name
+        main(["--game", "kuhn", "--preset", "paper", "--seed", "4", "--eta", "0.2", "--checkpoint", str(ck), "--iterations", "80"])
     with pytest.raises(SystemExit):
         main(["--game", "kuhn", "--device", "cuda", "--iterations", "1"])
+    capsys.readouterr()
+
+
+def test_cli_saves_atomically_once_per_interval_and_at_the_end(tmp_path, capsys, monkeypatch):
+    import os
+
+    from headsup.algos.nfsp import main
+
+    replaced, replace = [], os.replace
+
+    def spy(source, target):  # the new file is complete under another name before it takes the old one's
+        assert os.path.getsize(source) > 0
+        replaced.append((str(source), str(target)))
+        return replace(source, target)
+
+    monkeypatch.setattr(os, "replace", spy)
+    ck, js = tmp_path / "ck.pt", tmp_path / "run.json"
+    args = ["--game", "kuhn", "--eval-every", "20", "--checkpoint", str(ck), "--json", str(js)]
+    main(args + ["--iterations", "40"])  # the default: at most one checkpoint per 10 minutes - and the one at the end
+    assert [pair for pair in replaced if pair[1] == str(ck)] == [(str(ck) + ".tmp", str(ck))]
+    assert torch.load(ck, weights_only=False)["solver"]["iteration"] == 40
+    curves = [pair for pair in replaced if pair[1] == str(js)]
+    assert len(curves) >= 6 and set(curves) == {(str(js) + ".tmp", str(js))}  # the curve file too: one per evaluation, never half-written
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["ck.pt", "run.json"]
+    del replaced[:]
+    main(args + ["--iterations", "70", "--checkpoint-minutes", "0"])  # no interval: a checkpoint at every evaluation (60, 70)
+    assert [pair for pair in replaced if pair[1] == str(ck)] == [(str(ck) + ".tmp", str(ck))] * 2
+    assert torch.load(ck, weights_only=False)["solver"]["iteration"] == 70
+    capsys.readouterr()
+
+
+def test_cli_seed_reaches_the_solver(tmp_path, capsys):
+    from headsup.algos.nfsp import main
+
+    curves = {}
+    for name, seed in (("a", 3), ("b", 3), ("c", 4)):
+        main(["--game", "kuhn", "--seed", str(seed), "--iterations", "30", "--eval-every", "10", "--json", str(tmp_path / name)])
+        run = json.load(open(tmp_path / name))
+        curves[name] = [c["average"] for c in run["curve"]]
+        assert run["args"]["seed"] == seed and len(curves[name]) == 6
+    assert curves["a"] == curves["b"] and all(x != y for x, y in zip(curves["a"], curves["c"]))  # from the first evaluation on
     capsys.readouterr()
 
 

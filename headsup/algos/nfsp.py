@@ -616,10 +616,11 @@ def main(argv=None):
     last_save = time.perf_counter()
 
     def dump():
-        if args.json:
-            with open(args.json, "w") as f:
+        if args.json:  # atomic, as the checkpoint: a run killed while writing keeps the curve it had
+            with open(args.json + ".tmp", "w") as f:
                 json.dump({"game": args.game, "algo": "nfsp", "preset": args.preset, "args": vars(args), "config": solver.config,
                            "curve": curve}, f, indent=2)
+            os.replace(args.json + ".tmp", args.json)
 
     for it in range(solver.iteration + 1, args.iterations + 1):
         solver.iterate()
