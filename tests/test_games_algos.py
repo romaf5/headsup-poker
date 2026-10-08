@@ -105,8 +105,8 @@ def test_info_state_is_perfect_recall(name):
     walk(game.new_initial_state())
 
 
-# measured (antes): Kuhn after 200 iterations 0.0012 / 0.0000, Leduc after 100 iterations 0.0086 / 0.0204 (DCFR 0.0078, PCFR+ 0.0198)
-@pytest.mark.parametrize("variant,bound", [("dcfr+", 0.012), ("pdcfr+", 0.027)])
+# measured (antes): Kuhn after 200 iterations 0.0012 / 0.0000, Leduc after 100 iterations 0.0086 / 0.0177 (DCFR 0.0078, PCFR+ 0.0198)
+@pytest.mark.parametrize("variant,bound", [("dcfr+", 0.012), ("pdcfr+", 0.023)])
 def test_discounted_plus_variants_converge(variant, bound):
     """DCFR+ / PDCFR+ (Xu et al. 2024, arXiv 2404.13891): discounted regrets floored at zero, predictive strategy."""
     kuhn = make_game("kuhn")
@@ -116,3 +116,18 @@ def test_discounted_plus_variants_converge(variant, bound):
     leduc = make_game("leduc")
     assert exploitability(leduc, CFR(leduc, variant).iterate(100).average_policy())[0] < bound
     assert CFR(kuhn, "dcfr").gamma == 2.0 and CFR(kuhn, "dcfr+").gamma == 4.0 and CFR(kuhn, "pdcfr+").alpha == 2.3
+
+
+def test_pdcfr_plus_predicts_with_the_discount_of_the_next_update():
+    """An infoset updated in iteration t predicts with d_(t+1) from then on - also during the other player's walk
+    later in the same iteration (alternating updates), where it used d_t."""
+    s = CFR(make_game("kuhn"), "pdcfr+")
+    legal = np.array([True, True, False])
+    s.regret["x"] = np.array([2.0, 0.0, 0.0])
+    s.last_regret["x"] = np.array([-1.0, 1.0, 0.0])
+    s.iteration, s.last_update["x"] = 3, 3  # already updated in the current iteration
+    d4 = 3**2.3 / (3**2.3 + 1)
+    np.testing.assert_allclose(s._sigma("x", legal), np.array([2 * d4 - 1, 1.0, 0.0]) / (2 * d4))
+    s.last_update["x"] = 2  # not yet updated in iteration 3
+    d3 = 2**2.3 / (2**2.3 + 1)
+    np.testing.assert_allclose(s._sigma("x", legal), np.array([2 * d3 - 1, 1.0, 0.0]) / (2 * d3))

@@ -61,6 +61,7 @@ class CFR(_Tables):
         self.variant = variant
         a, g = _DISCOUNTS.get(variant, (1.5, 2.0))
         self.alpha, self.beta, self.gamma = (a if alpha is None else alpha), beta, (g if gamma is None else gamma)
+        self.last_update = {}  # (p)dcfr+: the iteration of each infoset's latest regret update
         self._legal = {}
 
     def _plus_discount(self, t):
@@ -70,10 +71,10 @@ class CFR(_Tables):
 
     def _sigma(self, key, legal):
         r = self._get(self.regret, key)
-        if self.variant == "pdcfr+":  # the predicted next regret: [R d + the last instantaneous regret]^+
-            last = self.last_regret.get(key)
+        if self.variant == "pdcfr+":  # the predicted next regret [R_t d_(t+1) + r_t]^+, t = the infoset's latest update
+            last = self.last_regret.get(key)  # (with alternating updates the other player may already be one update ahead)
             if last is not None:
-                return regret_matching(np.maximum(r * self._plus_discount(self.iteration) + last, 0.0), legal)
+                return regret_matching(np.maximum(r * self._plus_discount(self.last_update[key] + 1) + last, 0.0), legal)
             return regret_matching(r, legal)
         pred = self.last_regret.get(key) if self.variant == "pcfr+" else None
         return regret_matching(r, legal, pred)
@@ -118,6 +119,7 @@ class CFR(_Tables):
             elif plus:  # discount the floored regrets, add, floor at zero
                 np.maximum(R * self._plus_discount(t) + r, 0.0, out=R)
                 self.last_regret[key] = r
+                self.last_update[key] = t
             else:  # cfr+ / pcfr+: regret floor at zero once per iteration
                 np.maximum(R + r, 0.0, out=R)
                 self.last_regret[key] = r
