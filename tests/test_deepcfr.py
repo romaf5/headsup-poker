@@ -361,3 +361,53 @@ def test_masked_loss_can_be_switched_off_on_resume():
     assert p.parse_args(["--masked-loss"]).masked_loss and not p.parse_args(["--no-masked-loss"]).masked_loss
     dest = {a.dest for a in p._actions if "--no-masked-loss" in a.option_strings}
     assert dest == {"masked_loss"}  # main() detects it as given, so the checkpoint's value is not inherited
+
+
+def test_buffer_checkpoints_hold_only_the_stored_rows(tmp_path):
+    """Host-resident buffers: a slice of the storage is a view, and saving a view writes the whole capacity
+    (267 MB for 1000 rows of a 1M buffer; ~32 GB per checkpoint with the paper preset)."""
+    import os
+
+    from headsup.deepcfr.memory import CircularBuffer
+
+    buf = ReservoirBuffer(200_000, "cpu", obs_dim=31, legal_dim=4, seed=0)
+    buf.add(np.zeros((10, 31), np.float32), np.ones(10, np.float32), np.zeros((10, 4), np.float32), np.ones((10, 4), bool))
+    buf.save(tmp_path / "reservoir.pt")
+    assert os.path.getsize(tmp_path / "reservoir.pt") < 100_000
+    fifo = CircularBuffer(200_000, "cpu", obs_dim=86)
+    fifo.add(np.zeros((10, 86), np.float32), np.zeros(10), np.zeros(10, np.float32))
+    torch.save(fifo.state_dict(), tmp_path / "fifo.pt")
+    assert os.path.getsize(tmp_path / "fifo.pt") < 100_000
+    other = ReservoirBuffer(200_000, "cpu", obs_dim=31, legal_dim=4).load(tmp_path / "reservoir.pt")
+    assert len(other) == 10 and other.legal[:10].all()
+
+
+def test_circular_buffer_loads_a_wrapped_fifo_in_order():
+    """A wrapped FIFO loaded into a larger (or smaller) buffer keeps exactly its rows, oldest first: with the saved
+    head kept, new rows overwrote old ones while the size grew over rows that were never written."""
+    from headsup.deepcfr.memory import CircularBuffer
+
+    def rows(n0, n1):
+        t = np.arange(n0, n1, dtype=np.float32)
+        return np.repeat(t[:, None], 3, 1), np.arange(n0, n1) % 4, t
+
+    small = CircularBuffer(10, "cpu", obs_dim=3)
+    small.add(*rows(0, 7))
+    small.add(*rows(7, 25))  # holds 15..24, wrapped: the oldest row sits at position 7
+    assert small.head == 7 and small.target[7] == 15
+    state = small.state_dict()
+    big = CircularBuffer(16, "cpu", obs_dim=3)
+    big.load_state_dict(state)
+    assert big.size == 10 and big.target[:10].tolist() == list(range(15, 25))
+    big.add(*rows(25, 28))
+    assert big.size == 13 and sorted(big.target[:13].tolist()) == list(range(15, 28))
+    assert (big.obs[:13, 0] == big.target[:13]).all() and (big.action[:13] == big.target[:13].long() % 4).all()
+    big.add(*rows(28, 40))  # wraps: the oldest rows go first
+    assert sorted(big.target[:16].tolist()) == list(range(24, 40))
+    tiny = CircularBuffer(4, "cpu", obs_dim=3)
+    tiny.load_state_dict(state)  # a smaller buffer keeps the newest rows
+    assert tiny.size == 4 and sorted(tiny.target[:4].tolist()) == [21, 22, 23, 24]
+    same = CircularBuffer(10, "cpu", obs_dim=3)
+    same.load_state_dict(state)
+    same.add(*rows(25, 27))
+    assert sorted(same.target[:10].tolist()) == list(range(17, 27))

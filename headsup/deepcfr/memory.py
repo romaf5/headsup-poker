@@ -27,6 +27,12 @@ OBS_INT_DIM = 23  # 7 x (rank+1, suit+1, card+1), stage, first_to_act: all < 256
 OBS_INT_MAX = torch.tensor([13, 4, 52] * 7 + [3, 1], dtype=torch.uint8)  # valid upper bounds per column
 
 
+def _rows(x, n):
+    """The first n rows on the CPU as their own tensor: a slice of host storage is a view, and saving a view
+    writes the whole underlying storage (the full capacity instead of the stored rows)."""
+    return x[:n].to("cpu", copy=True)
+
+
 class ReservoirBuffer:
     def __init__(self, capacity, device, obs_dim=OBS_DIM, target_dim=NUM_ACTIONS, seed=None, sample_device=None, int_dim=OBS_INT_DIM,
                  legal_dim=0):
@@ -171,12 +177,13 @@ class ReservoirBuffer:
         return torch.cat([self.obs_int[: self.size].to(torch.float32), self.obs_float[: self.size]], dim=1)
 
     def state_dict(self):
+        n = self.size
         return {
-            "obs_int": self.obs_int[: self.size].cpu(),
-            "obs_float": self.obs_float[: self.size].cpu(),
-            "t": self.t[: self.size].cpu(),
-            "target": self.target[: self.size].cpu(),
-            **({"legal": self.legal[: self.size].cpu()} if self.legal is not None else {}),
+            "obs_int": _rows(self.obs_int, n),
+            "obs_float": _rows(self.obs_float, n),
+            "t": _rows(self.t, n),
+            "target": _rows(self.target, n),
+            **({"legal": _rows(self.legal, n)} if self.legal is not None else {}),
             "capacity": self.capacity,
             "obs_dim": self.obs_dim,
             "size": self.size,
@@ -254,12 +261,20 @@ class CircularBuffer:
         return self.obs[idx], self.action[idx], self.target[idx]
 
     def state_dict(self):
-        return {"obs": self.obs[: self.size].cpu(), "action": self.action[: self.size].cpu(), "target": self.target[: self.size].cpu(),
+        n = self.size
+        return {"obs": _rows(self.obs, n), "action": _rows(self.action, n), "target": _rows(self.target, n),
                 "head": self.head, "capacity": self.capacity}
 
     def load_state_dict(self, state):
-        n = len(state["action"])
-        self.obs[:n] = state["obs"].to(self.device)
-        self.action[:n] = state["action"].to(self.device)
-        self.target[:n] = state["target"].to(self.device)
-        self.size, self.head = n, int(state["head"]) % self.capacity
+        """Loads the saved rows oldest first (a wrapped FIFO's oldest row sits at its head), so the buffer may
+        have another capacity: a smaller one keeps the newest rows, a larger one goes on filling behind them."""
+        n, head = len(state["action"]), int(state["head"])
+        order = torch.arange(n)
+        if n and n == int(state.get("capacity", n)) and head % n:
+            order = torch.cat([torch.arange(head, n), torch.arange(head)])
+        order = order[-self.capacity:]
+        n = len(order)
+        self.obs[:n] = state["obs"][order].to(self.device)
+        self.action[:n] = state["action"][order].to(self.device)
+        self.target[:n] = state["target"][order].to(self.device)
+        self.size, self.head = n, n % self.capacity
