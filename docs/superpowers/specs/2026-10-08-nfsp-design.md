@@ -190,9 +190,9 @@ Not copied from OpenSpiel: the inner DQN's counters that only advance in best-re
 
 ## Tests (`tests/test_nfsp.py`, `tests/test_deep_algos.py`)
 
-66 tests, under 30 s on one core. 88 one-line mutations of `nfsp.py` were run against them (the list is in the plan):
-87 were killed at once; the survivor (`Q` trained before a minibatch was stored: the test's memories were empty) and
-two mutants that only an indirect test caught led to stronger tests; all 88 are killed now.
+66 tests, 24-34 s on one core of the loaded machine. 88 one-line mutations of `nfsp.py` were run against them (the
+list is in the plan): 87 were killed at once; the survivor (`Q` trained before a minibatch was stored: the test's
+memories were empty) and two mutants that only an indirect test caught led to stronger tests; all 88 are killed now.
 
 - The formulas: `epsilon` (both schedules), `td_target` (target network values, legal-masked max, nothing added at
   terminals, Double DQN), `cross_entropy` (loss and gradient equal to torch's on masked logits).
