@@ -142,6 +142,9 @@ iterations) are not comparable with the paper and are being re-run with the pape
 Best-response exploitability of the NL strategies is being re-measured (the earlier estimates missed the board
 chance factor).
 
+Every known difference between this code and the papers (fixed, chosen, or still open) is listed in
+[docs/paper-fidelity.md](docs/paper-fidelity.md).
+
 ## Layout
 
 ```
