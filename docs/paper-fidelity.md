@@ -98,26 +98,16 @@ the linear discount, external sampling, blueprint play (average strategy), the s
 the belief updates, final-iterate play in Pluribus mode, the vector Linear CFR, DCFR's constants, and LBR's action
 values (equal to the paper's Fig. 1 formula to 5.5e-14).
 
-Open (the next batch of work; these change how the `pluribus` bot plays and need a new blueprint and new measurements):
-
-1. **Bucket assignment is stochastic.** The flop / turn bucket of a (hand, board) comes from 500 Monte-Carlo runouts per
-   call: over 40 seeds it has a standard deviation of 5 of 200 buckets and lands in its modal bucket 16 % of the time.
-   The paper puts every situation into one bucket. Fix: a deterministic mapping (cached per board, or a seeded estimate).
-2. **Search re-solves at every decision of a round** and freezes its own earlier action as a one-hot row, which then
-   inflates the real hand's weight in its own range by 1 / sigma(a). The paper solves once per round and freezes
-   sigma(I). 8.5 % of post-flop rounds are affected.
-3. **The opponent's belief starts conditioned on the searcher's hole cards**; the paper keeps public beliefs (1/1326 each).
-4. **Later-round bucket regrets in the vector solver ignore the solving player's own range weights.**
-5. **LBR against a search player queries its blueprint**, not the searched strategy (total-variation distance 0.40 between
-   the two). The bound stays valid but is not the paper's LBR; needs 2 and 3 first.
-6. **Pruning never fires at our budgets**: the threshold (-3e6) is scaled by the stack only; after 20 M iterations the most
-   negative regret is -1.39e6. The shipped blueprint is Linear MCCFR without pruning.
-7. **Average strategy**: reach-weighted at every sampled opponent infoset on every round (better in our measurement:
-   508 / 541 against 629 / 663 mbb/g with Pluribus's counters every 10,000 iterations), not Algorithm 1's round-1
-   counters plus later-round snapshots. By choice; `--average counters --strategy-every N` selects the counters.
-8. **Depth-limited mode** (`search:<net>` without `@pluribus`): one sampled continuation by default, where both papers
-   warn about fixed leaf values and use four; it plays the average rather than the final iterate; `@leaf4` cannot be used
-   with a tabular blueprint.
-9. Linear-CFR / pruning schedule: 40 % / 20 % of the run against Pluribus's 3.5 % / 1.7 % (the help text now gives
-   Pluribus's proportions; the defaults are unchanged until a blueprint trained with them has been measured).
-10. LBR: flop equities from 200 Monte-Carlo runouts (paper: exhaustive), no round-restricted variants.
+| item | status |
+|---|---|
+| Bucket assignment was stochastic: the flop / turn bucket of a (hand, board) came from a fresh Monte-Carlo estimate at every lookup (standard deviation 5 of 200 buckets, modal bucket 16 % of the time), and 1326-hand queries used another estimator. The paper puts every situation into one bucket. | **fixed** - the estimate is seeded by the cards; the exact per-board table abstraction (`--abstraction table`, potential-aware k-means as in the paper) uses all 1,081 completions of a flop; `test_bucket_of_a_situation_is_a_function_of_the_cards` |
+| Search re-solved at every decision of a round and froze its own earlier action as a one-hot row, which inflated the real hand's weight in its own range by 1 / sigma(a) (8.5 % of post-flop rounds). Algorithm 2 searches when a round begins. | **fixed** - one solve per betting round, every decision reads it; `test_pluribus_mode_solves_once_per_round_with_public_beliefs` |
+| The opponent's belief started conditioned on the searcher's hole cards; the paper keeps beliefs "from an outside observer's perspective" (1/1326 each). | **fixed** - public beliefs in Pluribus mode (same test) |
+| Later-round bucket regrets in the vector solver ignored the solving player's own range weights (the subgame's root deals hands in proportion to their reach). | **fixed** - `test_bucket_regrets_are_weighted_by_the_solving_players_range` |
+| LBR against a search player queried its blueprint, not the searched strategy (total-variation distance 0.40 between the two). | **fixed** - the player answers for every hand from its round solve (`all_hands_probs`), and LBR asks it; `test_lbr_measures_the_searched_strategy_of_a_pluribus_player` |
+| Pruning never fired at our budgets: the threshold (-3e6) was scaled by the stack only; after 20 M iterations the most negative regret is -1.39e6. | **fixed** - the threshold is -scale x stack x iterations (`--prune-scale`); every chunk reports the share of regrets below it |
+| Average strategy: reach-weighted at every sampled opponent infoset on every round, not Algorithm 1's round-1 counters plus later-round snapshots. | **by choice** - better in our measurement (508 / 541 against 629 / 663 mbb/g with the counters every 10,000 iterations); `--average counters --strategy-every N` selects the counters |
+| Linear-CFR / pruning schedule: 40 % / 20 % of the run against Pluribus's 3.5 % / 1.7 %. | **by choice** for runs of tens of millions of iterations (the first 40 % are down-weighted); the help text gives Pluribus's proportions |
+| Abstraction: 200 buckets per round by expected hand strength (`mc`) or by (mean, std) of the equity over the completions (`table`); Pluribus clusters equity distributions with k-means. | **by choice** - `table` is the closer one |
+| Depth-limited mode (`search:<net>` without `@pluribus`): one sampled continuation by default, where both papers warn about fixed leaf values and let the players choose among four (`@leaf4`); it plays the average rather than the final iterate; `@leaf4` cannot be used with a tabular blueprint. | **open** - documented in `headsup/search.py`; the default is unchanged until it has been measured |
+| LBR: flop equities from 200 Monte-Carlo runouts (paper: exhaustive); no round-restricted variants (the paper's Table 2). | **open** |
