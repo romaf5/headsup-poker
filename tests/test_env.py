@@ -66,3 +66,43 @@ def test_make_player_specs():
     assert make_player("call")(obs).tolist() == [1, 1, 1]
     assert make_player("allin")(obs).tolist() == [3, 3, 3]
     assert make_player("cfr", device="cpu", seed=0)(obs).shape == (3,)
+
+
+class _FoldHalfOrCall:
+    """As small blind folds its first decision with probability 1/2, otherwise check/calls: against a calling
+    opponent that is exactly -0.25 chips/hand (it is the small blind in half of the hands and folds half of those)."""
+
+    def __init__(self, seed, game):
+        self.rng, self.game = np.random.default_rng(seed), game
+
+    def __call__(self, obs, ids=None):
+        first_sb = (obs[:, 21] == 0) & (obs[:, 22] == 0) & (obs[:, 32] == 0)  # pre-flop, small blind, no action yet
+        return np.where(first_sb & (self.rng.random(len(obs)) < 0.5), 0, 1).astype(np.int64)
+
+
+def test_play_hands_does_not_favour_short_hands():
+    """Every table contributes the same number of hands: taking the first N hands to finish across 1024 parallel
+    tables over-represented the short ones (here the folds: -0.32 instead of -0.25 with 2 hands per table)."""
+    from headsup.env import make_vec_env
+    from headsup.game import DEFAULT_GAME
+
+    means = []
+    for seed in range(20):
+        r = play_hands(make_vec_env(1024, "call", seed=seed, game=DEFAULT_GAME), _FoldHalfOrCall(seed + 999, DEFAULT_GAME), 2048)
+        assert len(r) == 2048
+        means.append(r.mean())
+    assert abs(np.mean(means) + 0.25) < 0.035, np.mean(means)  # standard error of the 20-seed mean: ~0.009
+    assert len(play_hands(make_vec_env(64, "call", seed=0, game=DEFAULT_GAME), _FoldHalfOrCall(1, DEFAULT_GAME), 100)) == 100
+
+
+def test_play_hands_refuses_an_agent_of_another_tree():
+    """Same number of actions, different raise sizes: not the same game (only the action count was compared)."""
+    import pytest
+
+    from headsup.env import make_vec_env
+    from headsup.game import DEFAULT_GAME, GameConfig
+
+    pot = GameConfig(bet_sizes=(1.0,), mask_redundant=False)
+    assert pot.num_actions == DEFAULT_GAME.num_actions
+    with pytest.raises(ValueError, match="different game"):
+        play_hands(make_vec_env(4, "call", seed=0, game=DEFAULT_GAME), RandomPlayer(seed=0, game=pot), 8)

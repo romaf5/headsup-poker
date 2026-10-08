@@ -208,27 +208,33 @@ class SingleAgentEnv:
 
 
 def play_hands(vec_env, agent, num_hands, progress=False):
-    """Run ``num_hands`` complete hands of ``agent`` in ``vec_env``; returns per-hand rewards."""
-    rewards = []
+    """Run ``num_hands`` complete hands of ``agent`` in ``vec_env``; returns per-hand rewards.  Every table
+    plays the same number of hands (ceil(num_hands / num_envs)): the first hands to finish across the tables are
+    the short ones, so taking those would bias the mean."""
     agent_game, env_game = getattr(agent, "game", None), getattr(vec_env, "game", None)
-    if agent_game is not None and env_game is not None and agent_game.num_actions != env_game.num_actions:
-        raise ValueError(f"the agent plays a {agent_game.num_actions}-action game, the env a {env_game.num_actions}-action one")
+    if agent_game is not None and env_game is not None and agent_game.tree_dict() != env_game.tree_dict():
+        raise ValueError(f"the agent plays a different game than the env: {agent_game.tree_dict()} vs {env_game.tree_dict()}")
     obs = vec_env.reset()
     bar = None
     if progress:
         from tqdm import tqdm
 
         bar = tqdm(total=num_hands, leave=False)
-    ids = np.arange(vec_env.num_envs)
-    while len(rewards) < num_hands:
+    n = vec_env.num_envs
+    ids = np.arange(n)
+    quota = -(-num_hands // n)
+    rewards = np.zeros((quota, n), dtype=np.float32)  # [a table's k-th hand, table]
+    played = np.zeros(n, dtype=np.int64)
+    while (played < quota).any():
         obs, r, d, _ = vec_env.step(_call_player(agent, obs, ids))
-        got = r[d]
-        rewards.extend(got.tolist())
+        done = np.flatnonzero(np.asarray(d, dtype=bool) & (played < quota))
+        rewards[played[done], done] = np.asarray(r)[done]
+        played[done] += 1
         if bar is not None:
-            bar.update(len(got))
+            bar.update(len(done))
     if bar is not None:
         bar.close()
-    return np.asarray(rewards[:num_hands], dtype=np.float32)
+    return rewards.reshape(-1)[:num_hands]
 
 
 class NativeVecEnv:
