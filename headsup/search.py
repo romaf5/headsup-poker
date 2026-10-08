@@ -10,8 +10,10 @@ updated ranges).  The subgame is depth-limited to the end of the current betting
 Brown, Sandholm & Amos (2018, *Depth-Limited Solving for Imperfect-Information Games*): at a
 street-end leaf the hand is rolled out with a continuation strategy (the blueprint: the
 DeepCFR policy net, the last SD-CFR iterate or a thinned iterate bank; several can be given
-and are sampled per rollout, which is how Modicum / Pluribus estimate leaf values with a
-handful of continuation strategies).  Before the river the solver is external-sampling MCCFR
+and are sampled per rollout).  That default fixes the leaf values, which both papers warn makes
+the solution exploitable: in Modicum and Pluribus the players *choose* among a handful of
+continuation strategies at every leaf - ``@leaf4`` (the blueprint and its fold-, call- and
+raise-biased versions, chosen by both players).  Before the river the solver is external-sampling MCCFR
 with tabular regrets over (public sequence, hand) infosets and linear averaging (LCFR - with
 sampled regrets it beat DCFR / CFR+ / PCFR+ in our tests), the hero's real hand being dealt on
 half of its own traversals ("targeted" sampling); on the river every leaf is terminal and the
@@ -23,13 +25,16 @@ exploitability in well under a second.  Both solvers are C++ (``headsup_cpp.Subg
 the solved strategies on river subgames - the correctness check.
 
 Pluribus mode (``@pluribus``; Brown & Sandholm 2019, *Superhuman AI for multiplayer poker*,
-supplementary material): the blueprint plays the first betting round; from the flop on every
-decision re-solves the *whole remaining game* from the start of the current betting round
+supplementary material, Algorithm 2): the blueprint plays the first betting round; from the flop
+on the *whole remaining game* is solved once per betting round, from the round's start
 (``VectorSolver``: vector-form Linear CFR with public chance sampling, lossless hands in the
-current round, ``buckets`` equity buckets on later rounds), the hero's actions already taken
-in the round frozen for its real hand only, playing the final iterate's strategy; the ranges
-at the start of a round come from Bayes' rule with the previous round's solve (its average
-strategy, for both players - "nested unsafe search"), preflop with the blueprint.
+current round, ``buckets`` equity buckets on later rounds, their regrets weighted by the player's
+range), and every decision of the round plays the final iterate's strategy at its node.  The
+beliefs are public - both players' ranges start at 1/1326 per pair of cards, "from an outside
+observer's perspective" - and at the start of a round they come from Bayes' rule with the previous
+round's solve (its average strategy, for both players: "nested unsafe search"), pre-flop with the
+blueprint.  Since no solve depends on the hand the player holds, it can answer for every hand
+(``all_hands_probs``), which is what Local Best Response needs to measure the searched strategy.
 
 Player spec: ``search:<blueprint spec>[@it<N>][@rit<N>][@rv<variant>][@focus<f>][@cont<policy|iterate|bank>][@thin<K>]``,
 e.g. ``search:cfr:runs/x/policy.pth@it20000@rit200`` (``@leaf4``: Pluribus's four biased continuation

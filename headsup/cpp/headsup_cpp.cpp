@@ -1452,8 +1452,9 @@ void equity_vs_all(int c0, int c1, const int* board, int n_board, int samples, i
 // Unsafe subgame solving (Brown & Sandholm 2017) with the depth limit at the end of the current
 // betting round, solved by external-sampling MCCFR with tabular regrets over (public sequence,
 // hand) infosets and linear (LCFR) averaging; beyond the depth limit both players follow a
-// blueprint continuation strategy (one of the given network pairs, sampled per rollout - Brown,
-// Sandholm & Amos 2018 use several biased continuations, Pluribus rolls the blueprint out).  The
+// blueprint continuation strategy (one of the given network pairs, sampled per rollout; with
+// set_leaf_choices(4) both players choose among the blueprint and its fold-, call- and raise-biased
+// versions at every leaf, as Pluribus does - Brown, Sandholm & Amos 2018 let the opponent choose).  The
 // root is a chance node dealing (hero, villain) hands from the given ranges (the blueprint's
 // reach probabilities computed by the caller); unknown board cards are dealt per traversal.
 struct Continuation {
