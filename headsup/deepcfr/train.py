@@ -269,8 +269,10 @@ class DeepCFRTrainer:
                             legal_dim=num_actions if self.masked_loss else 0)
             if self.use_deepcfr else None
         )
-        # SD-CFR: keep every iteration's advantage net (iterate 0 = the untrained, uniform net)
+        # SD-CFR: keep every iteration's advantage net.  The bank starts with the untrained net (iteration 0: it plays
+        # iteration 1 and has weight 0 in the average); ``iterate_first`` = the iteration of the bank's first net
         self.iterates = [[n.state_dict_cpu()] for n in self.nets] if self.use_sdcfr else None
+        self.iterate_first = 0
         self.runner = TraversalRunner(args.workers, backend=args.backend, game=self.game)
         # history value networks (both players' cards): DREAM baselines Q_p(h, a) per player, the
         # ESCHER value net q(h, a) (player 0's return; re-fitted every iteration on fresh trajectories)
@@ -313,6 +315,7 @@ class DeepCFRTrainer:
             "adv_memory": [m.state_dict() for m in self.adv_memory],
             "strat_memory": self.strat_memory.state_dict() if self.strat_memory is not None else None,
             "iterates": self._stacked_iterates() if self.iterates is not None else None,
+            "iterate_first": self.iterate_first,
             "args": vars(self.args),
             "model_config": dict(self.model_config),
             "value_nets": [n.state_dict() for n in self.value_nets],
@@ -327,6 +330,15 @@ class DeepCFRTrainer:
             self.save_iterates()
         return path
 
+    def _iterate_ids(self):
+        """The iteration each net of the bank was trained in."""
+        return [self.iterate_first + i for i in range(len(self.iterates[0]))]
+
+    def _bank(self):
+        from headsup.sdcfr import IterateBank
+
+        return IterateBank(self._stacked_iterates(), self.device, self.model_config, iterations=self._iterate_ids())
+
     def _stacked_iterates(self):
         return {s: {k: torch.stack([sd[k] for sd in dicts]) for k in dicts[0]} for s, dicts in enumerate(self.iterates)}
 
@@ -334,13 +346,13 @@ class DeepCFRTrainer:
         """Write the SD-CFR iterate bank (all advantage nets) in IterateBank format."""
         path = path or os.path.join(self.args.out, "iterates.pt")
         stacked = self._stacked_iterates()
-        torch.save({"seats": stacked, "T": len(self.iterates[0]), "config": dict(self.model_config)}, path)
+        torch.save({"seats": stacked, "T": len(self.iterates[0]), "config": dict(self.model_config), "iterations": self._iterate_ids()}, path)
         return path
 
     def sdcfr_player(self, mode="sample", seed=None):
         from headsup.sdcfr import IterateBank, SDCFRPlayer
 
-        bank = IterateBank(self._stacked_iterates(), self.device, self.model_config)
+        bank = self._bank()
         return SDCFRPlayer(bank, mode=mode, seed=seed)
 
     @staticmethod
@@ -385,7 +397,10 @@ class DeepCFRTrainer:
                     [{k: v[t].clone() for k, v in d.items()} for t in range(next(iter(d.values())).shape[0])]
                     for _, d in sorted(stacked.items())
                 ]
-            else:
+                self.iterate_first = int(state.get("iterate_first", 0))
+            else:  # the bank starts with the checkpoint's nets, as the nets of its iteration
+                self.iterates = [[n.state_dict_cpu()] for n in self.nets]
+                self.iterate_first = self.iteration
                 print("(checkpoint has no iterate bank: SD-CFR average will only cover iterations from here on)")
         print(f"resumed from {path} at iteration {self.iteration}")
 
@@ -572,7 +587,7 @@ class DeepCFRTrainer:
         if self.iterates is not None:
             from headsup.sdcfr import IterateBank, SDCFRPlayer
 
-            bank = IterateBank(self._stacked_iterates(), self.device, self.model_config)
+            bank = self._bank()
             targets["sdcfr"] = (SDCFRPlayer(bank, mode="sample", seed=a.seed), SDCFRPlayer(bank.thin(a.lbr_model_iterates), mode="exact"))
         if policy is not None:
             pol = TorchPolicyPlayer(policy, device=self.device, seed=a.seed)

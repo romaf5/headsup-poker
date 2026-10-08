@@ -5,7 +5,9 @@ SD-CFR instead keeps the advantage network of *every* iteration and derives the 
 average strategy directly from them at play time:
 
 * **exact** mode: at each own decision, sigma_bar(I) = sum_t w_t * pi_t(I) * sigma_t(I) /
-  sum_t w_t * pi_t(I), where sigma_t = regret matching on iterate t, w_t = t and pi_t(I) is
+  sum_t w_t * pi_t(I), where sigma_t = regret matching on the network trained in iteration t,
+  w_t = t ("each D^t is assigned sampling weight t", SD-CFR 5.1 and the authors' code; the
+  untrained network a run starts with has weight 0) and pi_t(I) is
   the player's own reach probability of I under sigma_t (a running product over the own
   decisions of the current hand, so it needs per-table state);
 * **sample** mode: draw one iteration t ~ w_t at the start of each hand and follow sigma_t
@@ -29,14 +31,19 @@ class IterateBank:
     """Stacked parameters of the advantage nets of all iterations, for both seats.
 
     ``config`` is the nets' variant (see :class:`headsup.model.BaseModel`), including the
-    regret-matching fallback the run was trained with.
+    regret-matching fallback the run was trained with.  ``iterations``: the iteration each stored
+    network was trained in (default 0, 1, 2, ...: a trainer's bank, which starts with the untrained
+    network); the network of iteration t has weight t^gamma in the average.
     """
 
-    def __init__(self, stacked, device, config, weight_power=1.0):
+    def __init__(self, stacked, device, config, weight_power=1.0, iterations=None):
         # stacked: {seat: {param_name: tensor (T, ...)}}
         self.device = torch.device(device)
         self.params = {s: {k: v.to(self.device) for k, v in d.items()} for s, d in stacked.items()}
         self.T = next(iter(self.params[0].values())).shape[0]
+        self.iterations = torch.arange(self.T) if iterations is None else torch.as_tensor(list(iterations), dtype=torch.long)
+        if len(self.iterations) != self.T:
+            raise ValueError(f"{self.T} stored networks but {len(self.iterations)} iteration numbers")
         self.set_weight_power(weight_power)
         self.config = normalize_config(config)
         self._base = BaseModel(config=self.config).to(self.device).eval()
@@ -49,16 +56,22 @@ class IterateBank:
         self._vmapped = vmap(self._fn, in_dims=(0, None))
 
     def set_weight_power(self, gamma):
-        """Iterate t gets weight t^gamma: 1 = linear CFR (default), 2 = DCFR's average-strategy discount."""
+        """The network of iteration t gets weight t^gamma: 1 = linear CFR (default), 2 = DCFR's average-strategy
+        discount.  The untrained network (iteration 0) has weight 0 - unless it is all there is."""
         self.weight_power = float(gamma)
-        self.weights = torch.arange(1, self.T + 1, dtype=torch.float32, device=self.device) ** self.weight_power
+        w = self.iterations.to(device=self.device, dtype=torch.float32) ** self.weight_power
+        self.weights = w if float(w.sum()) > 0 else torch.ones_like(w)
 
     def truncate(self, n):
-        """The bank of the first ``n`` iterates (= the average strategy after n iterations)."""
-        if n >= self.T:
+        """The bank after iteration ``n`` (= that iteration's average strategy): the networks of iterations <= n."""
+        keep = torch.nonzero(self.iterations <= n).flatten()
+        if len(keep) == self.T:
             return self
-        stacked = {s: {k: v[:n] for k, v in d.items()} for s, d in self.params.items()}
-        return IterateBank(stacked, self.device, self.config, self.weight_power)
+        if len(keep) == 0:
+            raise ValueError(f"the bank holds no network of an iteration <= {n} (its first is {int(self.iterations[0])})")
+        idx = keep.to(self.device)
+        stacked = {s: {k: v.index_select(0, idx) for k, v in d.items()} for s, d in self.params.items()}
+        return IterateBank(stacked, self.device, self.config, self.weight_power, self.iterations[keep])
 
     def thin(self, k):
         """A bank of ``k`` representative iterates approximating this one's average strategy.
@@ -78,14 +91,15 @@ class IterateBank:
         first = torch.cat([last.new_zeros(1), last[:-1] + 1])
         bin_w = torch.stack([w[a : b + 1].sum() for a, b in zip(first.tolist(), last.tolist())]).float()
         stacked = {s: {n: v.index_select(0, last) for n, v in d.items()} for s, d in self.params.items()}
-        bank = IterateBank(stacked, self.device, self.config, self.weight_power)
+        bank = IterateBank(stacked, self.device, self.config, self.weight_power, self.iterations[last.cpu()])
         bank.weights = bin_w
         bank.thinned_from = self.T
         return bank
 
     @staticmethod
-    def from_state_dicts(seat_dicts, device, config):
-        """seat_dicts: [[state_dict_t0, state_dict_t1, ...] for seat 0, [...] for seat 1]."""
+    def from_state_dicts(seat_dicts, device, config, iterations=None):
+        """seat_dicts: [[state_dict, state_dict, ...] for seat 0, [...] for seat 1] - the networks of
+        ``iterations`` (default 1, 2, ..., T: trained networks only)."""
         config = normalize_config(config)
         stacked = {}
         for seat, dicts in enumerate(seat_dicts):
@@ -96,18 +110,21 @@ class IterateBank:
                 models.append(m)
             params, _ = stack_module_state(models)
             stacked[seat] = {k: v.detach() for k, v in params.items()}
-        return IterateBank(stacked, device, config)
+        n = len(seat_dicts[0])
+        return IterateBank(stacked, device, config, iterations=range(1, n + 1) if iterations is None else iterations)
 
     def save(self, path):
         torch.save(
-            {"seats": {s: {k: v.cpu() for k, v in d.items()} for s, d in self.params.items()}, "T": self.T, "config": dict(self.config)},
+            {"seats": {s: {k: v.cpu() for k, v in d.items()} for s, d in self.params.items()}, "T": self.T, "config": dict(self.config),
+             "iterations": self.iterations.tolist()},
             path,
         )
 
     @staticmethod
     def load(path, device, weight_power=1.0):
         data = torch.load(path, map_location="cpu", weights_only=True)
-        return IterateBank({int(s): d for s, d in data["seats"].items()}, device, data["config"], weight_power)
+        # files written before the iteration numbers were stored have the trainer's layout: untrained, 1, 2, ...
+        return IterateBank({int(s): d for s, d in data["seats"].items()}, device, data["config"], weight_power, data.get("iterations"))
 
     # rows per vmapped forward: keeps the (T, rows, dim) activations at ~1 GB so big LBR queries
     # (100k+ rows x many iterates) do not run the GPU allocator against its limit
@@ -171,7 +188,7 @@ class SDCFRPlayer:
     @staticmethod
     def load(path, device, mode="sample", seed=None, weight_power=1.0, iterations=None, thin=None):
         bank = IterateBank.load(path, device, weight_power)
-        if iterations:
+        if iterations is not None:
             bank = bank.truncate(iterations)
         if thin:
             bank = bank.thin(thin)

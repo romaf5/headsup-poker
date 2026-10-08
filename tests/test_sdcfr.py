@@ -67,8 +67,8 @@ def test_truncated_bank_and_specs(tmp_path):
     p = make_player(f"sdcfr:{tmp_path / 'it.pt'}@t3@exact", device="cpu", seed=0)
     assert p.bank.T == 3 and p.mode == "exact"
     assert make_player(f"sdcfr:{tmp_path / 'it.pt'}@k2", device="cpu", seed=0).bank.T == 2
-    it = make_player(f"iterate:{tmp_path / 'it.pt'}@t2", device="cpu", seed=0)
-    ref = RegretMatchingPlayer([nets[0][2], nets[1][2]], device="cpu")
+    it = make_player(f"iterate:{tmp_path / 'it.pt'}@t2", device="cpu", seed=0)  # this bank holds iterations 1..5
+    ref = RegretMatchingPlayer([nets[0][1], nets[1][1]], device="cpu")
     np.testing.assert_allclose(it.probs(obs), ref.probs(obs), atol=1e-6)
 
 
@@ -159,3 +159,37 @@ def test_exact_average_off_every_iterates_path_is_still_a_distribution():
     np.testing.assert_allclose(probs.sum(1), 1.0, atol=1e-6)
     player.reach[:8] = 1.0
     np.testing.assert_allclose(probs, player.probs(obs, ids), atol=1e-6)  # = the plain weighted average
+
+
+def test_bank_weights_follow_the_authors(tmp_path):
+    """SD-CFR 5.1 and the authors' code: "each D^t is assigned sampling weight t" - the network trained in
+    iteration t has weight t and the untrained one a run starts with is not part of the average (ours gave bank
+    index i the weight i + 1, the untrained network included, and @tN stopped one iteration short)."""
+    from headsup.players import make_player
+
+    nets, _ = _bank(4)
+    dicts = [[m.state_dict() for m in seat] for seat in nets]
+    cfg = nets[0][0].config
+    bank = IterateBank.from_state_dicts(dicts, "cpu", cfg, iterations=range(4))  # a trainer's bank: untrained + iterations 1..3
+    assert bank.iterations.tolist() == [0, 1, 2, 3] and bank.weights.tolist() == [0.0, 1.0, 2.0, 3.0]
+    bank.set_weight_power(2.0)
+    assert bank.weights.tolist() == [0.0, 1.0, 4.0, 9.0]
+    bank.set_weight_power(1.0)
+    assert IterateBank.from_state_dicts(dicts, "cpu", cfg).weights.tolist() == [1.0, 2.0, 3.0, 4.0]  # hand-built: iterations 1..T
+    two = bank.truncate(2)  # the average after two iterations
+    assert two.iterations.tolist() == [0, 1, 2] and two.weights.tolist() == [0.0, 1.0, 2.0] and bank.truncate(3) is bank
+    assert bank.truncate(0).weights.tolist() == [1.0]  # only the untrained network: it is the strategy
+    assert bank.thin(2).weights.sum().item() == pytest.approx(6.0)
+    bank.save(tmp_path / "b.pt")
+    assert IterateBank.load(tmp_path / "b.pt", "cpu").iterations.tolist() == [0, 1, 2, 3]
+    data = torch.load(tmp_path / "b.pt", weights_only=True)
+    del data["iterations"]  # a file written before: the trainer's layout
+    torch.save(data, tmp_path / "old.pt")
+    assert IterateBank.load(tmp_path / "old.pt", "cpu").weights.tolist() == [0.0, 1.0, 2.0, 3.0]
+    p = make_player(f"sdcfr:{tmp_path / 'b.pt'}@t2@exact", device="cpu", seed=0)
+    assert p.bank.T == 3 and p._w.tolist() == pytest.approx([0.0, 1 / 3, 2 / 3])
+    obs = _observations(40)
+    it = make_player(f"iterate:{tmp_path / 'old.pt'}@t2", device="cpu", seed=0)  # the network of iteration 2
+    np.testing.assert_allclose(it.probs(obs), RegretMatchingPlayer([nets[0][2], nets[1][2]], device="cpu").probs(obs), atol=1e-6)
+    last = make_player(f"iterate:{tmp_path / 'b.pt'}", device="cpu", seed=0)
+    np.testing.assert_allclose(last.probs(obs), RegretMatchingPlayer([nets[0][3], nets[1][3]], device="cpu").probs(obs), atol=1e-6)

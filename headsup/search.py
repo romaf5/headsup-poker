@@ -150,7 +150,7 @@ def _continuations(spec, device, kind, thin):
 
     from headsup import native
     from headsup.model import BaseModel, load_model
-    from headsup.players import parse_sdcfr_spec
+    from headsup.players import bank_index, parse_sdcfr_spec
 
     k, _, arg = spec.partition(":")
     k = k.lower()
@@ -164,12 +164,14 @@ def _continuations(spec, device, kind, thin):
     if k in ("sdcfr", "iterate"):
         path, _, gamma, iterations, _ = parse_sdcfr_spec(arg)
         data = torch.load(path, map_location="cpu", weights_only=True)
-        T = data["T"] if iterations is None else min(iterations, data["T"])
-        weights = np.arange(1, T + 1, dtype=np.float64) ** gamma
-        if k == "iterate":  # the one strategy the `iterate:` player itself plays (headsup.players.make_player)
-            picks, w = [data["T"] - 1 if iterations is None else min(iterations, data["T"] - 1)], [1.0]
-        elif kind in ("policy", "iterate"):
+        T = bank_index(data, iterations) + 1  # the networks of the iterations up to the requested one
+        its = np.asarray(list(data.get("iterations") or range(data["T"]))[:T], dtype=np.float64)
+        weights = its ** gamma if (its ** gamma).sum() > 0 else np.ones(T)  # as IterateBank: iteration t has weight t^gamma
+        if k == "iterate" or kind in ("policy", "iterate"):  # the last network: what an `iterate:` player plays
             picks, w = [T - 1], [1.0]
+        elif thin >= T:  # bank, small enough to use whole (as IterateBank.thin): every network that has weight
+            picks = [i for i in range(T) if weights[i] > 0]
+            w = [float(weights[i]) for i in picks]
         else:  # bank: representative iterates of equal-weight bins (see IterateBank.thin)
             n = max(1, min(thin, T))
             cum = np.cumsum(weights) / weights.sum()

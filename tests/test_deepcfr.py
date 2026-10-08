@@ -437,7 +437,7 @@ def test_interrupt_inside_an_iteration_keeps_the_checkpoint_consistent(tmp_path,
     assert state["iteration"] == 2
     assert [next(iter(d.values())).shape[0] for _, d in sorted(state["iterates"].items())] == [3, 3]  # untrained + 2 iterations each
     bank = torch.load(tmp_path / "iterates.pt", map_location="cpu", weights_only=True)
-    assert bank["T"] == 3
+    assert bank["T"] == 3 and bank["iterations"] == [0, 1, 2]  # the untrained nets, then one per iteration
     monkeypatch.setattr(train, "train_advantage_net", real)
     train.main(["--resume", str(tmp_path / "checkpoint.pt"), "--iterations", "4"] + common)
     state = torch.load(tmp_path / "checkpoint.pt", map_location="cpu", weights_only=True)
@@ -664,3 +664,20 @@ def test_untrained_networks_play_uniformly_in_the_first_iteration():
     np.testing.assert_allclose(sigma, legal / legal.sum(1, keepdims=True), atol=1e-7)
     _, strat, _ = run_traversals_python([w, w], 1, 40, 1.0, seed=0, decks=decks)
     np.testing.assert_allclose(strat.target, strat.legal / strat.legal.sum(1, keepdims=True), atol=1e-7)
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_bank_started_from_a_checkpoint_without_one_knows_its_iterations(tmp_path):
+    """Resuming a Deep CFR checkpoint as SD-CFR: the bank starts with the checkpoint's networks as the networks of
+    its iteration (it started with fresh untrained ones, so iteration 3's network was weighted like iteration 1's)."""
+    import headsup.deepcfr.train as train
+
+    out = tmp_path / "run"
+    train.main(["--algo", "deepcfr", "--iterations", "2", "--checkpoint-every", "1", "--out", str(out)] + _TINY)
+    train.main(["--resume", str(out / "checkpoint.pt"), "--algo", "sdcfr", "--iterations", "4"] + _TINY)
+    bank = torch.load(out / "iterates.pt", map_location="cpu", weights_only=True)
+    assert bank["iterations"] == [2, 3, 4]
+    state = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=True)
+    assert state["iterate_first"] == 2
+    head = "action_head.weight"
+    assert bank["seats"][0][head][0].abs().sum() > 0  # the first stored net is the trained one of iteration 2

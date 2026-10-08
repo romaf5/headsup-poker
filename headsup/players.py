@@ -290,6 +290,18 @@ def parse_sdcfr_spec(arg):
     return path, mode, gamma, iterations, thin
 
 
+def bank_index(data, iteration=None):
+    """Index of the network of ``iteration`` in an iterate-bank file (the last one at or before it; default: the
+    last network).  Files without iteration numbers have the trainer's layout: untrained, 1, 2, ..."""
+    its = list(data.get("iterations") or range(data["T"]))
+    if iteration is None:
+        return len(its) - 1
+    at_or_before = [i for i, it in enumerate(its) if it <= iteration]
+    if not at_or_before:
+        raise ValueError(f"the bank holds no network of an iteration <= {iteration} (its first is {its[0]})")
+    return at_or_before[-1]
+
+
 def pluribus_spec(spec):
     """The ``search:`` argument that ``pluribus[@options]`` stands for (the shipped blueprint, Pluribus mode)."""
     from headsup.paths import DEFAULT_BLUEPRINT_PATH
@@ -367,7 +379,7 @@ def make_player(spec: str, device=None, deterministic=False, seed=None, game=Non
         path, _, _, iterations, _ = parse_sdcfr_spec(arg)
         device = get_device(device) if not hasattr(device, "type") else device
         data = torch.load(path, map_location="cpu", weights_only=True)
-        t = data["T"] - 1 if iterations is None else min(iterations, data["T"] - 1)
+        t = bank_index(data, iterations)
         nets = []
         for seat in (0, 1):
             net = BaseModel(config=data["config"])

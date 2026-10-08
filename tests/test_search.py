@@ -283,7 +283,7 @@ def _random_bank(path, T=3, tag=False):
             m = BaseModel(config=cfg)
             with torch.no_grad():
                 if tag:
-                    m.action_head.bias.fill_(float(t))  # the bias tells which bank index a net is
+                    m.action_head.bias.fill_(float(t + 1))  # the bias tells which iteration's net it is (the bank holds 1..T)
                 else:
                     torch.nn.init.normal_(m.action_head.weight, std=1.5)
                     torch.nn.init.normal_(m.action_head.bias, std=1.5)
@@ -312,6 +312,12 @@ def test_iterate_blueprint_and_its_continuation_use_the_same_iterate(tmp_path, m
         seen.clear()
         search._continuations(f"iterate:{path}@t{n}", "cpu", "iterate", 8)
         assert played == n and seen and set(seen) == {float(n)}
+        seen.clear()  # an SD-CFR blueprint after n iterations: its last network for the "iterate" continuation
+        search._continuations(f"sdcfr:{path}@t{n}", "cpu", "iterate", 8)
+        assert set(seen) == {float(n)}
+    seen.clear()  # "bank" continuation: representatives of the iterations <= 4, weighted by iteration
+    _, _, _, w = search._continuations(f"sdcfr:{path}@t4", "cpu", "bank", 8)
+    assert sorted(set(seen)) == [1.0, 2.0, 3.0, 4.0] and w == [1.0, 2.0, 3.0, 4.0]
 
 
 def test_pluribus_mode_plays_the_sdcfr_average_at_a_second_preflop_decision(tmp_path):
