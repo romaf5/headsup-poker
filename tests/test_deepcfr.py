@@ -681,3 +681,42 @@ def test_bank_started_from_a_checkpoint_without_one_knows_its_iterations(tmp_pat
     assert state["iterate_first"] == 2
     head = "action_head.weight"
     assert bank["seats"][0][head][0].abs().sum() > 0  # the first stored net is the trained one of iteration 2
+
+
+def test_dream_and_escher_defaults_follow_their_papers():
+    """DREAM 5: "picking the action with the highest advantage with probability 1 when all are negative"; both
+    authors' networks mask illegal outputs (ours fitted them to zero targets by default)."""
+    import headsup.deepcfr.train as train
+
+    for algo in ("dream", "escher"):
+        a = train.cli_args(["--algo", algo])
+        assert (a.rm_fallback, a.masked_loss) == ("argmax", True)
+        a = train.cli_args(["--algo", algo, "--rm-fallback", "uniform", "--no-masked-loss"])
+        assert (a.rm_fallback, a.masked_loss) == ("uniform", False)
+    a = train.cli_args(["--algo", "sdcfr"])
+    assert (a.rm_fallback, a.masked_loss) == ("uniform", False)
+    # ESCHER's Table 3 as a preset; explicit flags win
+    a = train.cli_args(["--algo", "escher", "--preset", "escher", "--q-batch", "256"])
+    assert (a.traversals, a.value_trajectories, a.batch_size, a.value_steps, a.q_steps, a.q_batch, a.policy_steps, a.policy_batch_size) == (
+        1000, 1000, 2048, 5000, 5000, 256, 10000, 2048)
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_escher_value_net_sees_all_trajectories_of_its_iteration(tmp_path):
+    """ESCHER's value net is refitted on this iteration's trajectories; they went through the DREAM baseline's FIFO
+    (--q-capacity), which silently kept the newest rows only."""
+    import headsup.deepcfr.train as train
+
+    trainer = train.DeepCFRTrainer(train.cli_args(["--algo", "escher", "--q-capacity", "40", "--iterations", "1", "--out", str(tmp_path)] + _TINY))
+    seen = []
+    collect = trainer.runner.collect_escher_values
+
+    def spy(*args, **kw):
+        val, nodes = collect(*args, **kw)
+        seen.append(len(val))
+        return val, nodes
+
+    trainer.runner.collect_escher_values = spy
+    trainer.cfr_iteration()
+    assert seen[0] > 40 and len(trainer.value_memory[0]) == seen[0]
+    trainer.runner.close()

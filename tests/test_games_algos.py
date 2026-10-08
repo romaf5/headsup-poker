@@ -177,3 +177,50 @@ def test_small_game_solvers_refuse_holdem_presets():
     for main in (deep.main, oracle.main):
         with pytest.raises(ValueError, match="small game"):
             main(["--game", "fhp", "--iterations", "1"])
+
+
+@pytest.mark.parametrize("algo", ["escher", "dream"])
+def test_oracle_importance_weighted_average_is_unbiased(algo):
+    """--average own_is (how OpenSpiel's outcome sampling accumulates the average, which the ESCHER paper's tabular
+    experiment uses): the update player's infosets get its own reach x sigma / sampling reach.  In expectation that is
+    the exact reach-weighted strategy of every history of the infoset."""
+    from headsup.algos.oracle import OracleSampler
+
+    g = make_game("kuhn")
+    rng = np.random.default_rng(0)
+    s = OracleSampler(g, algo, trajectories=1, epsilon=0.5, seed=0, average="own_is")
+    exact = OracleSampler(g, algo, trajectories=1, epsilon=0.5, seed=0, average="exact")
+    stack = [g.new_initial_state()]
+    while stack:  # random regrets: a mixed strategy at every infoset
+        st = stack.pop()
+        if st.is_terminal():
+            continue
+        if st.is_chance():
+            stack.extend(st.child(a) for a, _ in st.chance_outcomes())
+            continue
+        key = st.info_key(st.current_player)
+        if key not in s.regret:
+            s.regret[key] = exact.regret[key] = np.where(st.legal_mask(), rng.random(g.num_actions) + 0.1, 0.0)
+        stack.extend(st.child(a) for a in st.legal_actions())
+    exact._accumulate_average(g.new_initial_state(), 0, 1.0)
+    q_tab = {}
+    s._values(g.new_initial_state(), q_tab)
+    n = 60000
+    for _ in range(n):
+        if algo == "escher":
+            s._escher(0, q_tab, {})
+        else:
+            s._dream(g.new_initial_state(), 0, 1.0, q_tab, {})
+    assert set(s.strategy_sum) == set(exact.strategy_sum) and len(s.strategy_sum) == 6  # player 0's infosets only
+    for key, want in exact.strategy_sum.items():
+        np.testing.assert_allclose(s.strategy_sum[key] / n, want, atol=0.06)
+
+
+def test_oracle_reports_the_pooled_regret_variance():
+    """The ESCHER paper's variance pools all regret estimates of an iteration (legal actions); the within-infoset
+    variance we reported is a different, smaller number (3.7 vs 5.1 for ESCHER, 120 vs 280 for DREAM on Leduc)."""
+    from headsup.algos.oracle import OracleSampler
+
+    s = OracleSampler(make_game("kuhn"), "dream", trajectories=200, epsilon=0.5, seed=0).iterate(3)
+    assert len(s.variance) == len(s.variance_pooled) == 3 and all(v > 0 for v in s.variance_pooled)
+    assert np.mean(s.variance_pooled) > np.mean(s.variance)  # pooling adds the spread between infosets

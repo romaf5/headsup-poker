@@ -32,15 +32,20 @@ from headsup.algos.tabular import MCCFR, regret_matching
 
 class OracleSampler:
     def __init__(self, game, algo="escher", trajectories=500, epsilon=0.5, seed=0, average="exact"):
-        """``average``: "exact" (pi_i(I) sigma(I) at every infoset, full tree walk) or "sampled" (sigma(I)
+        """``average``: "exact" (pi_i(I) sigma(I) at every infoset, full tree walk), "sampled" (sigma(I)
         added at the opponent's infosets the trajectories visit - it plays sigma, so visits follow its
-        own reach, as ESCHER's code fills its average-policy buffer; noisier)."""
-        assert algo in ("escher", "dream") and average in ("exact", "sampled")
+        own reach, as ESCHER's code fills its average-policy buffer; noisier) or "own_is" (the update
+        player's infosets get own reach x sigma(I) / sampling reach of the history, as OpenSpiel's outcome
+        sampling does and with it the ESCHER paper's tabular experiment: unbiased, with the variance of the
+        importance weights - this, not the regret estimator, limits that experiment's curves)."""
+        assert algo in ("escher", "dream") and average in ("exact", "sampled", "own_is")
         self.game, self.algo, self.k, self.epsilon, self.average = game, algo, trajectories, epsilon, average
         self.rng = np.random.default_rng(seed)
         self.regret, self.strategy_sum = {}, {}
         self.iteration = 0
         self.variance = []  # per iteration: mean over (infoset, action) of the estimator's sample variance
+        self.variance_pooled = []  # per iteration: variance of all regret estimates (legal actions) - the ESCHER paper's number
+        self._legal = {}  # infoset -> legal mask
 
     # -- strategies -------------------------------------------------------------------------------
     def sigma(self, state):
@@ -65,11 +70,27 @@ class OracleSampler:
         return v
 
     # -- estimators -------------------------------------------------------------------------------
+    def _chance(self, state):
+        """(child, probability) of a sampled chance outcome."""
+        outcomes = state.chance_outcomes()
+        a, prob = outcomes[self.rng.choice(len(outcomes), p=[q for _, q in outcomes])]
+        return state.child(a), prob
+
+    def _own_is_average(self, state, sig, my_reach, sample_reach):
+        if self.average == "own_is":
+            key = state.info_key(state.current_player)
+            s = self.strategy_sum.get(key)
+            if s is None:
+                s = self.strategy_sum[key] = np.zeros(self.game.num_actions)
+            s += my_reach / sample_reach * sig
+
     def _escher(self, p, q_tab, acc):
         state = self.game.new_initial_state()
+        my_reach = sample_reach = 1.0  # the update player's reach under sigma; the probability of sampling the history
         while not state.is_terminal():
             if state.is_chance():
-                state = state.child(state.sample_chance(self.rng))
+                state, prob = self._chance(state)
+                sample_reach *= prob
                 continue
             legal = state.legal_mask()
             sig = self.sigma(state)
@@ -77,18 +98,25 @@ class OracleSampler:
                 q = q_tab[state.history_key()] * (1.0 if p == 0 else -1.0)
                 r = np.where(legal, q - sig @ np.where(legal, q, 0.0), 0.0)
                 acc.setdefault(state.info_key(p), []).append(r)
+                self._legal.setdefault(state.info_key(p), legal)
+                self._own_is_average(state, sig, my_reach, sample_reach)
                 a = int(self.rng.choice(np.flatnonzero(legal)))  # the fixed (uniform) sampling policy
+                my_reach *= sig[a]
+                sample_reach /= legal.sum()
             else:
                 self._sampled_average(state, sig)
                 a = int(self.rng.choice(len(sig), p=sig))
+                sample_reach *= sig[a]
             state = state.child(a)
 
-    def _dream(self, state, p, own_reach, q_tab, acc):
-        """Baseline-corrected sampled value of ``state`` for p; appends the regret estimates."""
+    def _dream(self, state, p, own_reach, q_tab, acc, my_reach=1.0, sample_reach=1.0):
+        """Baseline-corrected sampled value of ``state`` for p; appends the regret estimates.  ``own_reach``: p's
+        sampling reach; ``my_reach``: p's reach under sigma; ``sample_reach``: the probability of sampling the history."""
         if state.is_terminal():
             return state.returns()[p]
         if state.is_chance():
-            return self._dream(state.child(state.sample_chance(self.rng)), p, own_reach, q_tab, acc)
+            child, prob = self._chance(state)
+            return self._dream(child, p, own_reach, q_tab, acc, my_reach, sample_reach * prob)
         legal = state.legal_mask()
         sig = self.sigma(state)
         if state.current_player != p:
@@ -98,12 +126,17 @@ class OracleSampler:
         xi = self.epsilon * legal / legal.sum() + (1 - self.epsilon) * sig if state.current_player == p else sig
         a = int(self.rng.choice(len(xi), p=xi / xi.sum()))
         b = np.where(legal, q_tab[state.history_key()] * (1.0 if p == 0 else -1.0), 0.0)
-        child_reach = own_reach * (xi[a] if state.current_player == p else 1.0)
+        own = state.current_player == p
+        if own:
+            self._own_is_average(state, sig, my_reach, sample_reach)
+        child_reach = own_reach * (xi[a] if own else 1.0)
         va = b.copy()
-        va[a] = b[a] + (self._dream(state.child(a), p, child_reach, q_tab, acc) - b[a]) / xi[a]
+        va[a] = b[a] + (self._dream(state.child(a), p, child_reach, q_tab, acc, my_reach * (sig[a] if own else 1.0),
+                                    sample_reach * xi[a]) - b[a]) / xi[a]
         v = float(sig @ va)
-        if state.current_player == p:
+        if own:
             acc.setdefault(state.info_key(p), []).append(np.where(legal, va - v, 0.0) / own_reach)
+            self._legal.setdefault(state.info_key(p), legal)
         return v
 
     def _sampled_average(self, state, sig, weight=1.0):
@@ -142,7 +175,7 @@ class OracleSampler:
             if self.average == "exact":
                 for p in (0, 1):
                     self._accumulate_average(self.game.new_initial_state(), p, 1.0)
-            var = []
+            var, pooled = [], []
             for p in (0, 1):  # alternating: player 1 sees player 0's updated strategy (and fresh oracle values)
                 q_tab = {}
                 self._values(self.game.new_initial_state(), q_tab)
@@ -160,7 +193,9 @@ class OracleSampler:
                     R += rs.sum(axis=0) / self.k  # an unbiased (up to the fixed per-infoset scale) iteration regret
                     if len(rs) > 1:
                         var.append(rs.var(axis=0, ddof=1).mean())
+                    pooled.append(rs[:, self._legal[key]].ravel())
             self.variance.append(float(np.mean(var)) if var else float("nan"))
+            self.variance_pooled.append(float(np.concatenate(pooled).var()) if pooled else float("nan"))
         return self
 
     def average_policy(self):
@@ -178,7 +213,9 @@ def main(argv=None):
     p.add_argument("--trajectories", type=int, default=500, help="sampled trajectories per player and iteration")
     p.add_argument("--epsilon", type=float, default=0.5, help="DREAM / OS: exploration of the update player")
     p.add_argument("--eval", default="1,2,5,10,20,50,100,200,500,1000")
-    p.add_argument("--average", default="exact", choices=["exact", "sampled"])
+    p.add_argument("--average", default="exact", choices=["exact", "sampled", "own_is"],
+                   help="how the average strategy is accumulated: exactly (default), at the opponent's sampled infosets, or "
+                        "importance-weighted at the update player's (OpenSpiel's outcome sampling: the ESCHER paper's Fig. 3)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", default=None)
     args = p.parse_args(argv)
@@ -198,8 +235,9 @@ def main(argv=None):
         row = {"iteration": it, "nash_conv": nash_conv, "seconds": time.perf_counter() - t0}
         if args.algo != "os":
             row["variance"] = float(np.nanmean(solver.variance))
+            row["variance_pooled"] = float(np.nanmean(solver.variance_pooled))
         curve.append(row)
-        print(f"{args.game} tabular {args.algo} it {it}: NashConv {nash_conv:.4f}" + (f"  regret-estimator variance {row['variance']:.3g}" if "variance" in row else "")
+        print(f"{args.game} tabular {args.algo} it {it}: NashConv {nash_conv:.4f}" + (f"  regret-estimator variance {row['variance_pooled']:.3g} pooled / {row['variance']:.3g} within infosets" if "variance" in row else "")
               + f"  ({row['seconds']:.0f}s)", flush=True)
     if args.json:
         with open(args.json, "w") as f:

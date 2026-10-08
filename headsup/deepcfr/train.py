@@ -30,12 +30,18 @@ from headsup.game import GameConfig, parse_bet_sizes
 from headsup.model import ARCHS, CARDS, FEATURES, RM_FALLBACKS, BaseModel, count_parameters, normalize_config
 
 # Hyperparameter presets (--preset); explicit flags always win.  "paper" = Brown et al. (2019)
-# for FHP/HULH and the SD-CFR paper's average-strategy fit (20,000 updates x batch 20,480).
+# for FHP/HULH and the SD-CFR paper's average-strategy fit (20,000 updates x batch 20,480); "escher" = Table 3
+# of McAleer et al. (2023): 1,000 regret and value trajectories, batch 2,048, 5,000 / 5,000 / 10,000 steps.
 PRESETS = {
     "default": dict(traversals=10_000, batch_size=16384, value_steps=4000, adv_capacity=10_000_000,
-                    strat_capacity=10_000_000, policy_epochs=50, policy_steps=None, policy_batch_size=None),
+                    strat_capacity=10_000_000, policy_epochs=50, policy_steps=None, policy_batch_size=None,
+                    q_steps=1000, q_batch=512, value_trajectories=None),
     "paper": dict(traversals=10_000, batch_size=10_000, value_steps=4000, adv_capacity=40_000_000,
-                  strat_capacity=40_000_000, policy_epochs=None, policy_steps=20_000, policy_batch_size=20_480),
+                  strat_capacity=40_000_000, policy_epochs=None, policy_steps=20_000, policy_batch_size=20_480,
+                  q_steps=1000, q_batch=512, value_trajectories=None),
+    "escher": dict(traversals=1000, batch_size=2048, value_steps=5000, adv_capacity=10_000_000,
+                   strat_capacity=10_000_000, policy_epochs=None, policy_steps=10_000, policy_batch_size=2048,
+                   q_steps=5000, q_batch=2048, value_trajectories=1000),
 }
 
 
@@ -468,6 +474,8 @@ class DeepCFRTrainer:
         if self.algo == "escher":  # a fresh value net on this iteration's trajectories (ESCHER's reference code)
             t0 = time.perf_counter()
             val, _ = self.runner.collect_escher_values(weights, a.value_trajectories or a.traversals, self._seed(), a.value_epsilon)
+            if len(val) > self.value_memory[0].capacity:  # this iteration's trajectories, all of them (--q-capacity is the
+                self.value_memory[0] = CircularBuffer(len(val), self.device, self.value_nets[0].obs_dim, seed=a.seed + 10)  # DREAM FIFO's)
             self.value_memory[0].clear()
             self.value_memory[0].add(val.obs, val.t, val.target[np.arange(len(val)), val.t.astype(int)])
             self.value_nets[0] = BaseModel(config=self.value_config).to(self.device).eval()
@@ -742,15 +750,16 @@ def build_parser():
                         "dream: outcome sampling with learned baselines + SD-CFR averaging (Steinberger et al. 2020); "
                         "escher: outcome sampling with a history value net + average policy net (McAleer et al. 2023)")
     p.add_argument("--epsilon", type=float, default=0.5, help="DREAM: exploration of the traverser (xi = eps * uniform + (1 - eps) * sigma)")
-    p.add_argument("--q-steps", type=int, default=1000, help="DREAM / ESCHER: value-net SGD steps per iteration (paper: 1000)")
-    p.add_argument("--q-batch", type=int, default=512, help="DREAM / ESCHER: value-net batch size (paper: 512)")
+    p.add_argument("--q-steps", type=int, default=None, help="DREAM / ESCHER: value-net SGD steps per iteration (default 1000, the DREAM paper's)")
+    p.add_argument("--q-batch", type=int, default=None, help="DREAM / ESCHER: value-net batch size (default 512, the DREAM paper's)")
     p.add_argument("--q-capacity", type=int, default=200_000, help="DREAM / ESCHER: value-net FIFO capacity (paper: 200 000)")
     p.add_argument("--value-trajectories", type=int, default=None, help="ESCHER: value trajectories per iteration (default: --traversals)")
     p.add_argument("--value-epsilon", type=float, default=0.01, help="ESCHER: uniform exploration of the value trajectories (reference code: 0.01)")
     p.add_argument("--iterations", type=int, default=300, help="CFR iterations")
     p.add_argument("--preset", default="default", choices=sorted(PRESETS),
                    help="hyperparameter preset; 'paper' = DeepCFR / SD-CFR papers (10k traversals, batch 10k, 40M memories, "
-                        "policy 20k updates x 20480); explicit flags override")
+                        "policy 20k updates x 20480); 'escher' = the ESCHER paper's Table 3 (1,000 regret and value trajectories, "
+                        "batch 2,048, 5,000 regret / 5,000 value / 10,000 policy steps); explicit flags override")
     p.add_argument("--traversals", type=int, default=None, help="traversals per seat per iteration (default 10,000)")
     p.add_argument("--workers", type=int, default=None, help="traversal workers (default: cores-1)")
     p.add_argument("--backend", default="auto", choices=["auto", "cpp", "python"], help="traversal backend")
@@ -765,9 +774,10 @@ def build_parser():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--target-scale", default="auto",
                    help="advantage-net fits: divide the regrets by this (auto = their RMS) and scale the output layer back; 'none' = raw chips")
-    p.add_argument("--masked-loss", action=argparse.BooleanOptionalAction, default=False,
+    p.add_argument("--masked-loss", action=argparse.BooleanOptionalAction, default=None,
                    help="losses on legal actions only: the advantage nets' illegal outputs are not fitted and the policy net's softmax "
-                        "runs over the legal actions (the SD-CFR / DREAM / ESCHER authors' nets mask them)")
+                        "runs over the legal actions (the SD-CFR / DREAM / ESCHER authors' nets mask them; default: on for --algo "
+                        "dream / escher, whose samplers store 0 for illegal actions, off otherwise)")
     p.add_argument("--loss-weights", default=None, choices=["paper", "raw"],
                    help="sample weights of the fits at iteration T: paper = t rescaled by 2/T (DeepCFR 5.3; default) | raw = t "
                         "(the loss and its gradient grow with T; the behaviour before 2026-10-08)")
@@ -790,7 +800,8 @@ def build_parser():
     p.add_argument("--cards", default="embed", choices=CARDS, help="card input: embed (rank+suit+card embeddings) | onehot (SD-CFR)")
     p.add_argument("--dim", type=int, default=64, help="hidden / embedding width")
     p.add_argument("--rm-fallback", default=None, choices=RM_FALLBACKS,
-                   help="regret matching when no advantage is positive: uniform (default) | argmax (DeepCFR paper; --preset paper)")
+                   help="regret matching when no advantage is positive: uniform | argmax (DeepCFR / DREAM papers; the default with "
+                        "--preset paper and for --algo dream / escher)")
     # game (action tree; stored in the model config)
     p.add_argument("--game", default="nlhe", choices=["nlhe", "fhp", "hulh"],
                    help="nlhe: the no-limit abstraction below; fhp / hulh: the DeepCFR paper's limit games (blinds 50/100)")
@@ -831,8 +842,11 @@ def resolve_args(args):
         args.policy_steps = None  # an explicit epoch count beats the preset's step count
     if args.policy_steps is None and args.policy_epochs is None:
         args.policy_epochs = PRESETS["default"]["policy_epochs"]
-    if getattr(args, "rm_fallback", None) is None:
-        args.rm_fallback = "argmax" if args.preset == "paper" else "uniform"
+    paper_rules = args.preset == "paper" or getattr(args, "algo", None) in ("dream", "escher")
+    if getattr(args, "rm_fallback", None) is None:  # DeepCFR / DREAM papers: the best action when no advantage is positive
+        args.rm_fallback = "argmax" if paper_rules else "uniform"
+    if getattr(args, "masked_loss", None) is None:
+        args.masked_loss = getattr(args, "algo", None) in ("dream", "escher")
     if getattr(args, "net", None) is None:
         args.net = "deepcfr" if args.preset == "paper" else "current"
     if getattr(args, "loss_weights", None) is None:

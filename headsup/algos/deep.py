@@ -676,9 +676,12 @@ class DeepSolver:
         return {"current": cur, "average": avg}
 
 
-def main(argv=None):
-    from headsup.games import make_small_game
+# ESCHER paper, Table 3: 1,000 regret and value trajectories, batch 2,048, 5,000 regret / 5,000 value / 10,000 policy steps
+PRESETS = {"escher": dict(traversals=1000, value_traversals=1000, adv_steps=5000, adv_batch=2048, q_steps=5000, q_batch=2048,
+                          policy_steps=10000, policy_batch=2048)}
 
+
+def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--game", default="leduc")
     p.add_argument("--algo", default="deepcfr", choices=ALGOS)
@@ -713,7 +716,30 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", default=None)
     p.add_argument("--checkpoint", default=None, help="saved at every evaluation; an existing file is resumed from")
-    args = p.parse_args(argv)
+    p.add_argument("--preset", default=None, choices=sorted(PRESETS),
+                   help="budgets for the options not given: escher = the ESCHER paper's Table 3 (1,000 regret and value "
+                        "trajectories, batch 2,048, 5,000 regret / 5,000 value / 10,000 policy steps)")
+    return p
+
+
+def parse_args(argv=None):
+    """The command line, with the ``--preset``'s budgets for the options that were not given."""
+    args = build_parser().parse_args(argv)
+    if args.preset:
+        probe = build_parser()
+        for action in probe._actions:
+            action.default = argparse.SUPPRESS
+        given = set(vars(probe.parse_args(argv)))
+        for key, value in PRESETS[args.preset].items():
+            if key not in given:
+                setattr(args, key, value)
+    return args
+
+
+def main(argv=None):
+    from headsup.games import make_small_game
+
+    args = parse_args(argv)
     game = make_small_game(args.game)
     solver = DeepSolver(game, args.algo, traversals=args.traversals, adv_steps=args.adv_steps, adv_batch=args.adv_batch,
                         policy_steps=args.policy_steps, policy_batch=args.policy_batch, q_steps=args.q_steps, q_batch=args.q_batch,

@@ -333,3 +333,12 @@ def test_solver_state_dict_is_a_snapshot():
     n_iterates = len(snap["iterates"][0])
     s.iterate(1)
     assert int(snap["q_opts"][0]["state"][0]["step"]) == step and len(snap["iterates"][0]) == n_iterates
+
+
+def test_escher_preset_is_the_papers_table_3():
+    from headsup.algos.deep import parse_args
+
+    a = parse_args(["--algo", "escher", "--preset", "escher", "--q-batch", "256"])
+    assert (a.traversals, a.value_traversals, a.adv_steps, a.adv_batch, a.q_steps, a.q_batch, a.policy_steps, a.policy_batch) == (
+        1000, 1000, 5000, 2048, 5000, 256, 10000, 2048)
+    assert parse_args(["--algo", "escher"]).q_steps == 1000  # without the preset: the defaults

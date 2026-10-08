@@ -102,9 +102,19 @@ What it took, beyond the papers' text (all taken from the authors' code):
   sampler); the paper values are its 3-seed means (single-seed tails excluded).
 
 ESCHER's paper has no deep Leduc results. Its Leduc experiment is tabular with oracle history
-values (`python -m headsup.algos.oracle`, 500 trajectories per iteration). At 1000 iterations we
-measure NashConv 0.44 for OS-MCCFR (paper ≈0.44), 0.15 for DREAM (≈0.37) and 0.10 for ESCHER
-(≈0.54). The regret-estimator variance is 3.5 for ESCHER vs 132 for DREAM (paper: 5.3 vs 280).
+values (`python -m headsup.algos.oracle`, 500 trajectories per iteration, 1000 iterations):
+
+| NashConv at 1000 iterations | OS-MCCFR | DREAM | ESCHER |
+|---|---|---|---|
+| **McAleer et al. (2023), Fig. 3** | **≈0.44** | **≈0.37** | **≈0.54** |
+| ours, `--average own_is` (3 seeds) | – | 0.51 / 0.48 / 0.48 | 0.87 / 0.28 / 0.51 |
+| ours, exact average (default) | 0.44 | 0.15 | 0.10 |
+
+The paper's curves are limited by how the average strategy is accumulated, not by the regret estimator:
+OpenSpiel's outcome sampling adds own reach × σ / sampling reach at the update player's sampled infosets
+(`--average own_is`), which is unbiased but as noisy as the importance weights; with the exact average ESCHER
+is 5× better than its own figure. The regret-estimator variance, pooled over an iteration's estimates as the paper
+defines it, is 5.1 for ESCHER and 312 for DREAM (paper: 5.3 and 280).
 Tabular references: CFR+ 0.24, DCFR 0.15 mA/g at 1000 iterations.
 
 ### NL abstraction (chips/hand, 1 chip = 500 mbb; ± standard errors)
