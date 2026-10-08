@@ -56,15 +56,18 @@ Open, about the paper's own figures:
   exploitability in mbb/g; policy net by exact best response over all flops, SD-CFR average on 2,000 sampled flops,
   which overstates by ~8 %):
 
-  | | t = 50 | 100 | 200 | 300 |
-  |---|---|---|---|---|
-  | paper, Fig. 3-left, K = 10,000 | 154 | 70 | 51 | 40 |
-  | paper, Fig. 3-middle, 4,000 SGD steps (many more traversals) | 75 | 82 | 72 | 75 |
-  | ours, 10,000 traversals: policy net | | 202 | 113 | 95 |
-  | ours, 10,000 traversals: SD-CFR average | 367 | 199 | | |
-  | ours, 10,000 traversals, `--masked-loss`: policy net | | 206 | 129 | 101 |
-  | ours, 25,000 traversals: SD-CFR average | 178 | 121 | | |
-  | ours, 25,000 traversals, batch 40,000 + cosine from 3e-3: SD-CFR average | 234 | | | |
+  | | t = 50 | 100 | 200 | 300 | 450 |
+  |---|---|---|---|---|---|
+  | paper, Fig. 3-left, K = 10,000 | 154 | 70 | 51 | 40 | 40 |
+  | paper, Fig. 3-middle, 4,000 SGD steps (many more traversals) | 75 | 82 | 72 | 75 | 65 |
+  | ours, 10,000 traversals: policy net | | 202 | 113 | 95 | 78 |
+  | ours, 10,000 traversals: SD-CFR average | 367 | 199 | | | |
+  | ours, 10,000 traversals, `--masked-loss`: policy net (stopped at 300) | | 206 | 129 | 101 | |
+  | ours, 25,000 traversals: SD-CFR average | 178 | 121 | | | |
+  | ours, 25,000 traversals, batch 40,000 + cosine from 3e-3: SD-CFR average | 234 | 134 | | | |
+
+  The 450-iteration policy net (77.7, exact) is where the runs on the three-bet flop with the earlier network ended
+  (80-86): correcting the game, the network, the loss weights and the head initialisation did not move the floor.
 
   What was measured about the gap:
   - *Traversals.* With 25,000 traversals - the paper's nodes touched per iteration - the average is at 178 after 50
@@ -98,7 +101,7 @@ Open, about the paper's own figures:
     `--batch-size 40000 --lr 3e-3 --lr-schedule cosine` gets most of the 16,000-step fit at 1.1-1.6 times the cost of
     the paper's.
   - *The tighter fit in training.* The benchmark is one memory at t = 125. A 100-iteration run with that fit and
-    25,000 traversals (`runs/fhp4_k25_fit`) is worse early: 234 at t = 50 against 178 with the paper's fit. At
+    25,000 traversals (`runs/fhp4_k25_fit`) is worse early: 234 / 134 at t = 50 / 100 against 178 / 121 with the paper's fit. At
     iteration 1 the memory holds ~125,000 samples and 4,000 batches of 40,000 pass over it 1,280 times; the fit then
     reproduces the sampled regrets, noise included. The runs of September with 16,000 steps (three-bet game) showed
     the same shape - 276 / 145 / 87 at t = 50 / 100 / 200 against 179 / 116 / 96 - i.e. a tighter fit pays only once

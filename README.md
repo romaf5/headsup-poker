@@ -161,8 +161,8 @@ It follows the paper's curve to 1e6 iterations and then stays near 110 where the
 three seeds sit at about 80-90, one at 115-145, and single evaluations swing by ±25 % (the average network, not the
 data it is fitted to). The preset divides the rewards by 2.6 (the unit of the DREAM authors' NFSP code): with rewards
 in antes the same settings rose again after 6e5 iterations (220-300 mA/g); the paper does not give its unit. With the
-DREAM paper's NFSP settings (`--preset dream`, one seed so far) the curve flattens at about 150 mA/g from 3e7 nodes
-on, where that paper's baseline goes on to 61 at 2e8 - not reproduced. Open points and the 17 places where the paper,
+DREAM paper's NFSP settings (`--preset dream`, one seed) the curve stays at 141-157 mA/g from 3e7 to 3.2e8 nodes,
+where that paper's baseline goes on to 58 - not reproduced. Open points and the 17 places where the paper,
 the DREAM code and OpenSpiel differ: `docs/superpowers/specs/2026-10-08-nfsp-design.md`.
 
 **ReBeL** (Brown et al. 2020; `headsup.algos.rebel`): CFR search over one betting round with a value network at the
@@ -236,14 +236,14 @@ headsup.algos.fhp_cfr`) follows the paper's dashed reference line:
 network and hyperparameters (`--game fhp --preset paper`; policy net by exact best response over all flops, SD-CFR
 average on 2,000 sampled flops, which overstates by ~8 %):
 
-| | t = 50 | 100 | 200 | 300 |
-|---|---|---|---|---|
-| **paper, 10,000 traversals (Fig. 2 / 3-left)** | **154** | **70** | **51** | **40** |
-| paper's SGD-step sweep at 4,000 steps (Fig. 3-middle) | 75 | 82 | 72 | 75 |
-| ours, 10,000 traversals: policy net | | 202 | 113 | 95 |
-| ours, 10,000 traversals: SD-CFR average | 367 | 199 | | |
-| ours, 25,000 traversals: SD-CFR average | 178 | 121 | | |
-| ours, 25,000 traversals, tighter fit (below): SD-CFR average | 234 | | | |
+| | t = 50 | 100 | 200 | 300 | 450 |
+|---|---|---|---|---|---|
+| **paper, 10,000 traversals (Fig. 2 / 3-left)** | **154** | **70** | **51** | **40** | **40** |
+| paper's SGD-step sweep at 4,000 steps (Fig. 3-middle) | 75 | 82 | 72 | 75 | 65 |
+| ours, 10,000 traversals: policy net | | 202 | 113 | 95 | **78** |
+| ours, 10,000 traversals: SD-CFR average | 367 | 199 | | | |
+| ours, 25,000 traversals: SD-CFR average | 178 | 121 | | | |
+| ours, 25,000 traversals, tighter fit (below): SD-CFR average | 234 | 134 | | | |
 
 Two things were measured about the gap. The paper's "10,000 traversals" touch 2.4 times the nodes of ours per
 iteration, and with 25,000 traversals the first 50 iterations are close to its curve. And the 4,000-step regret fit is
@@ -252,9 +252,10 @@ same samples is good to 4.5, consecutive iterates play visibly different strateg
 held-out loss by 5 % (most of what is left is sampling noise) - as in the paper's own sweep, whose 4,000-step curve
 ends near 65, not 40. `--batch-size 40000 --lr 3e-3 --lr-schedule cosine` gets the 16,000-step fit at 1.1-1.6 times
 the paper's cost on that memory (iteration 125) - but it does not help early: with it the 25,000-traversal run is at
-234 after 50 iterations instead of 178, because a tighter fit also follows the noise of the small early memories (our
-earlier 16,000-step runs were likewise worse before iteration 100 and better from about 200). Whether it lowers the
-floor at 300-450 iterations has not been run. `--weight-average` and `--policy-lr` are the related options. Details,
+234 / 134 after 50 / 100 iterations instead of 178 / 121, because a tighter fit also follows the noise of the small
+early memories (our earlier 16,000-step runs were likewise worse before iteration 100 and better from about 200).
+Whether it lowers the floor at 300-450 iterations has not been run. The 450-iteration result with the paper's settings,
+78, is where the three-bet runs ended too (80-86): the game and network corrections did not move the floor. `--weight-average` and `--policy-lr` are the related options. Details,
 the street split of the error and the fit benchmark: [docs/paper-fidelity.md](docs/paper-fidelity.md).
 
 Every known difference between this code and the papers (fixed, chosen, or still open) is listed in
