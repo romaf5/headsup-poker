@@ -442,3 +442,55 @@ def test_interrupt_inside_an_iteration_keeps_the_checkpoint_consistent(tmp_path,
     train.main(["--resume", str(tmp_path / "checkpoint.pt"), "--iterations", "4"] + common)
     state = torch.load(tmp_path / "checkpoint.pt", map_location="cpu", weights_only=True)
     assert state["iteration"] == 4 and torch.load(tmp_path / "iterates.pt", map_location="cpu", weights_only=True)["T"] == 5
+
+
+_TINY = ["--workers", "2", "--device", "cpu", "--no-compile", "--traversals", "30", "--value-steps", "3", "--batch-size", "64",
+         "--policy-epochs", "1", "--eval-hands", "0", "--eval-every", "0", "--policy-eval-every", "0", "--lbr-every", "0",
+         "--lbr-final-hands", "0", "--no-tensorboard", "--adv-capacity", "20000", "--strat-capacity", "20000", "--q-steps", "3",
+         "--q-batch", "32"]
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_resume_takes_explicit_flags_in_every_spelling_and_continues_in_place(tmp_path):
+    import headsup.deepcfr.train as train
+
+    out = tmp_path / "run"
+    train.main(["--algo", "sdcfr", "--iterations", "1", "--checkpoint-every", "1", "--policy-steps", "7", "--out", str(out)] + _TINY)
+    ck = str(out / "checkpoint.pt")
+    a = train.cli_args(["--resume", ck])
+    assert (a.traversals, a.value_steps, a.checkpoint_every, a.policy_steps) == (30, 3, 1, 7)  # inherited, incl. the checkpoint cadence
+    assert a.out == str(out)  # a resumed run continues in the checkpoint's directory unless --out is given
+    assert train.cli_args(["--resume", ck, "--out", "elsewhere"]).out == "elsewhere"
+    for argv in (["--traversals", "9", "--value-steps", "5"], ["--traversals=9", "--value-steps=5"], ["--trav", "9", "--value-s", "5"]):
+        a = train.cli_args(["--resume", ck] + argv)
+        assert (a.traversals, a.value_steps) == (9, 5), argv
+    a = train.cli_args(["--resume", ck, "--policy-epochs", "5"])  # explicit epochs beat the checkpoint's step count
+    assert (a.policy_epochs, a.policy_steps) == (5, None)
+    assert train.cli_args(["--resume", ck, "--policy-steps", "11"]).policy_steps == 11
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_resume_with_another_algorithm_and_new_learning_rate(tmp_path, capsys):
+    """A checkpoint resumed with another --algo used to crash on the value-net scales (IndexError); the DREAM value
+    optimisers kept the checkpoint's learning rate; the traversal seeds restarted from the first iteration's."""
+    import headsup.deepcfr.train as train
+
+    a_dir, b_dir = tmp_path / "a", tmp_path / "b"
+    train.main(["--algo", "sdcfr", "--iterations", "2", "--checkpoint-every", "1", "--out", str(a_dir)] + _TINY)
+    train.main(["--resume", str(a_dir / "checkpoint.pt"), "--algo", "dream", "--iterations", "3", "--out", str(a_dir)] + _TINY)
+    state = torch.load(a_dir / "checkpoint.pt", map_location="cpu", weights_only=True)
+    assert state["iteration"] == 3 and len(state["value_nets"]) == 2
+    train.main(["--algo", "both", "--iterations", "1", "--checkpoint-every", "1", "--out", str(b_dir)] + _TINY)
+    train.main(["--resume", str(b_dir / "checkpoint.pt"), "--algo", "escher", "--iterations", "2", "--out", str(b_dir)] + _TINY)
+    capsys.readouterr()
+    # sdcfr -> both: the new strategy memory starts empty - say so
+    train.main(["--algo", "sdcfr", "--iterations", "1", "--checkpoint-every", "1", "--out", str(tmp_path / "c")] + _TINY)
+    train.main(["--resume", str(tmp_path / "c" / "checkpoint.pt"), "--algo", "both", "--iterations", "2", "--out", str(tmp_path / "c")] + _TINY)
+    assert "no strategy memory" in capsys.readouterr().out
+    # dream: --lr given on resume reaches the persistent value-net optimisers; the seed stream does not restart
+    trainer = train.DeepCFRTrainer(train.cli_args(["--resume", str(a_dir / "checkpoint.pt"), "--lr", "0.0003", "--out", str(a_dir)] + _TINY))
+    first = [trainer._seed() for _ in range(4)]
+    trainer.load_checkpoint(str(a_dir / "checkpoint.pt"))
+    assert [g["lr"] for o in trainer.value_opts for g in o.param_groups] == [0.0003, 0.0003]
+    assert not set(first) & {trainer._seed() for _ in range(4)}
+    trainer.runner.close()

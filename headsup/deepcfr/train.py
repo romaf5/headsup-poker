@@ -329,16 +329,26 @@ class DeepCFRTrainer:
             n.load_state_dict(sd)
         for m, sd in zip(self.adv_memory, state["adv_memory"]):
             m.load_state_dict(sd)
-        if self.strat_memory is not None and state.get("strat_memory") is not None:
-            self.strat_memory.load_state_dict(state["strat_memory"])
+        if self.strat_memory is not None:
+            if state.get("strat_memory") is not None:
+                self.strat_memory.load_state_dict(state["strat_memory"])
+            else:
+                print("(checkpoint has no strategy memory: the policy net will only see iterations from here on)")
+        # a checkpoint of another algorithm may hold fewer value nets (none): the others start fresh
+        loaded = min(len(self.value_nets), len(state.get("value_nets", [])))
         for n, sd in zip(self.value_nets, state.get("value_nets", [])):
             n.load_state_dict(sd)
         for o, sd in zip(self.value_opts, state.get("value_opts", [])):
             o.load_state_dict(sd)
+            for group in o.param_groups:  # the optimiser state keeps its moments, the run's --lr applies
+                group["lr"] = self.args.lr
         for m, sd in zip(self.value_memory, state.get("value_memory", [])):
             m.load_state_dict(sd)
         # value nets trained before the scaled fits were introduced predict raw chips (scale 1)
-        self.value_scales = list(state.get("value_scales", [1.0] * len(self.value_nets) if state.get("value_nets") else [None] * len(self.value_nets)))
+        scales = list(state.get("value_scales", [1.0] * loaded))
+        self.value_scales = [scales[i] if i < min(loaded, len(scales)) else None for i in range(len(self.value_nets))]
+        # a fresh stream of traversal seeds (the sequence would restart with the first iterations' seeds)
+        self.seed_seq = np.random.SeedSequence([int(self.args.seed), self.iteration])
         if self.iterates is not None:
             stacked = state.get("iterates")
             if stacked is not None:
@@ -766,19 +776,30 @@ def resolve_args(args):
 RESUME_INHERITED = ("algo", "traversals", "adv_capacity", "strat_capacity", "value_steps", "batch_size", "policy_epochs",
                     "policy_steps", "policy_batch_size", "regret_power", "strategy_power", "epsilon", "q_steps", "q_batch",
                     "q_capacity", "value_trajectories", "eval_hands", "eval_every", "policy_eval_every", "lbr_every", "lbr_hands",
-                    "lbr_final_hands", "lbr_tables", "lbr_model_iterates", "seed", "lr", "target_scale", "value_epsilon", "masked_loss")
+                    "lbr_final_hands", "lbr_tables", "lbr_model_iterates", "seed", "lr", "target_scale", "value_epsilon", "masked_loss",
+                    "checkpoint_every")
 
 
-def main(argv=None):
+def cli_args(argv=None):
+    """The run's arguments: the command line, completed from the checkpoint (--resume / --policy-only: its
+    hyperparameters unless given here, its directory unless --out is given, its network variant and game) and
+    from the preset."""
     parser = build_parser()
     args = parser.parse_args(argv)
     checkpoint = args.policy_only or args.resume
-    if checkpoint:  # the run's hyperparameters come from the checkpoint unless given explicitly on this command line
+    if checkpoint:
+        probe = build_parser()  # which options are on this command line (also as --flag=value or as a prefix)
+        for action in probe._actions:
+            action.default = argparse.SUPPRESS
+        given = set(vars(probe.parse_args(argv)))
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True).get("args", {})
-        given = {a.dest for a in parser._actions if any(opt in (argv if argv is not None else sys.argv[1:]) for opt in a.option_strings)}
         for key in RESUME_INHERITED:
             if key in saved and key not in given:
                 setattr(args, key, saved[key])
+        if "policy_epochs" in given and "policy_steps" not in given:
+            args.policy_steps = None  # an explicit epoch count beats the checkpoint's step count (steps win when both are set)
+        if "out" not in given:
+            args.out = os.path.dirname(os.path.abspath(checkpoint))
     args = resolve_args(args)
     if checkpoint:  # the network variant and the game are fixed by the checkpoint
         cfg = DeepCFRTrainer.checkpoint_model_config(checkpoint)
@@ -788,6 +809,11 @@ def main(argv=None):
         args.bet_sizes, args.raise_cap = ",".join(str(s) for s in game.bet_sizes), game.raise_cap
         args.mask_redundant = "on" if game.mask_redundant else "off"
         args.game = "fhp" if game.limit and game.num_rounds == 2 else "hulh" if game.limit else "nlhe"
+    return args
+
+
+def main(argv=None):
+    args = cli_args(argv)
     trainer = DeepCFRTrainer(args)
     if args.policy_only:
         trainer.load_checkpoint(args.policy_only)
