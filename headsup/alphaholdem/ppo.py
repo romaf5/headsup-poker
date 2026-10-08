@@ -6,9 +6,15 @@ text applies delta1 "when A < 0" and cites the dual-clip PPO of Ye et al. (2020)
 below by ``delta1 * A`` when A < 0 - which for A < 0 equals eq. (3), ``clamp(r, 1 - eps, delta1) * A``.  (A ``min``
 over the three terms, as one re-implementation has it, is plain PPO: the delta1 term never is the smallest.)
 
-The value target ``clip(R, -delta2, delta3)`` (eq. 4) uses per-state bounds: delta2 / delta3 are the chips the player
-/ the opponent have put in up to the state (OpenHoldem: "the state value when the player folds / the opponent
-folds"); the other reading, the chips of the finished hand, never clips a complete hand's return.
+The value target ``clip(R, -delta2, delta3)`` (eq. 4) has two readings.  Per hand - delta2 / delta3 are the chips the
+two players have put in when the hand is over: a complete hand's return always lies inside, so with the Monte-Carlo
+returns used here the target is the return itself.  That is the default.  Per state (``value_clip``; OpenHoldem:
+"the state value when the player folds / the opponent folds") - the chips put in up to the state: the bounds are
+asymmetric whenever the player faces a bet (the opponent has more in), so the clipped target's mean lies above the
+expected return, and with lambda < 1 the optimistic value enters the advantage of every decision that the same
+seat follows with another one in the hand, by (1 - lambda) x the value's bias (the review of 2026-10-08 measured
++0.95 / +0.50 / +0.27 chips on those decisions over iterations 0-20 / 20-50 / 50-90, and 0 without the clip).
+``test_per_state_value_clip_biases_the_advantages_of_earlier_decisions`` shows the mechanism.
 
 Advantages: a rollout of the two-seat env is a grid [step, table] of decisions by alternating seats.  Each (table,
 seat) pair is one stream of decisions; the hand's reward arrives after the stream's last decision of the hand and
@@ -28,8 +34,8 @@ def trinal_clip_objective(ratio, adv, eps=0.2, delta1=3.0):
 
 
 def clipped_value_target(ret, own, opp, reward_scale, clip=True):
-    """``clip(R, -delta2, delta3)`` with delta2 = ``own`` and delta3 = ``opp`` chips put in at the state (returns
-    are in units of ``reward_scale`` chips)."""
+    """The per-state reading of ``clip(R, -delta2, delta3)``: delta2 = ``own`` and delta3 = ``opp`` chips put in at
+    the state (returns are in units of ``reward_scale`` chips)."""
     if not clip:
         return ret
     return torch.maximum(torch.minimum(ret, opp / reward_scale), -own / reward_scale)
@@ -67,11 +73,25 @@ def stream_gae(values, rewards, dones, seats, active, gamma, lam):
     return adv, ret
 
 
-def ppo_loss(net, batch, eps, delta1, value_coef, entropy_coef, reward_scale, value_clip=True):
+def value_fit(ret, value, own, opp, reward_scale, value_clip):
+    """How well the value head fits, over a rollout's samples (``value``: what it said when the decisions were made):
+    ``explained_variance`` of the returns, ``value_bias`` = mean(V - return) in chips and, with the clip on,
+    ``explained_variance_target`` of the clipped targets the head is actually fitted to."""
+    def explained(target):
+        return 1.0 - float((target - value).var() / target.var().clamp(min=1e-12))
+
+    out = {"explained_variance": explained(ret), "value_bias": float((value - ret).mean()) * reward_scale}
+    if value_clip:
+        out["explained_variance_target"] = explained(clipped_value_target(ret, own, opp, reward_scale))
+    return out
+
+
+def ppo_loss(net, batch, eps, delta1, value_coef, entropy_coef, reward_scale, value_clip=False):
     """Total loss ``-policy + value_coef * value - entropy_coef * entropy`` of a minibatch and its statistics.
 
     ``batch``: ``cards``, ``acts``, ``legal`` (the network's inputs), ``action``, ``logp`` (log-probability under
-    the policy that acted), ``adv``, ``ret``, ``own`` / ``opp`` (chips put in at the state: the value-clip bounds)."""
+    the policy that acted), ``adv``, ``ret``, ``own`` / ``opp`` (chips put in at the state: the bounds of the value
+    target with ``value_clip``)."""
     logits, value = net(batch["cards"], batch["acts"], batch["legal"])
     logp_all = torch.log_softmax(logits, dim=-1)
     logp = logp_all.gather(1, batch["action"].unsqueeze(1)).squeeze(1)

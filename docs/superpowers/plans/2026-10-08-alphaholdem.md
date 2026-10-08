@@ -111,3 +111,44 @@ rollout loop endless; the test does not return, which counts as failing.
 | C++ env: another all-in EV seed | `test_cpp_env_matches_the_python_twin` |
 | C++ env: a waiting table checks instead | `test_cpp_env_matches_the_python_twin` |
 | C++ env: the reported seat is the other one | `test_cpp_env_matches_the_python_twin` |
+
+## Review pass (2026-10-08)
+
+An independent review found no coding error and three things to change; each change was made test-first.
+
+1. The per-state value clip is off by default (it biases the GAE advantages); `--value-clip` / `--no-value-clip`.
+2. The log has `explained_variance_target` (clip on), `value_bias` and per-member results (`vs_pool`).
+3. Tests for seven surviving mutants; a warning when `--resume` meets a hyperparameter flag the checkpoint overrides.
+
+Mutants of this pass (the first nine are the review's survivors; all 18 fail their test):
+
+| mutation | test that fails |
+|---|---|
+| pool chips all credited to member 0 | `test_each_pool_member_plays_its_tables_and_gets_its_result` |
+| pool hands all credited to member 0 | `test_each_pool_member_plays_its_tables_and_gets_its_result` |
+| every pool table played by member 0's net | `test_each_pool_member_plays_its_tables_and_gets_its_result` |
+| a resumed run keeps the first run's env seed | `test_checkpoint_round_trip_and_cli` |
+| max_grad_norm ignored | `test_update_clips_the_gradient_norm` |
+| the trainer ignores the GAE lambda | `test_rollout_returns_are_each_seats_reward_of_its_hand` |
+| evaluate() without all-in EV | `test_env_and_evaluation_use_all_in_ev_as_configured` |
+| ev_samples not passed to the env | `test_env_and_evaluation_use_all_in_ev_as_configured` |
+| allin_ev not passed to the env | `test_env_and_evaluation_use_all_in_ev_as_configured` |
+| the per-state clip is the default again | `test_value_clip_is_off_by_default_and_a_flag_pair` |
+| the CLI default of the flag pair is not the settings' default | `test_value_clip_is_off_by_default_and_a_flag_pair` |
+| the logged value fit ignores the setting | `test_iteration_logs_the_value_heads_fit` |
+| no warning for flags the checkpoint overrides | `test_checkpoint_round_trip_and_cli` |
+| per-member log holds chip totals, not chips per hand | `test_each_pool_member_plays_its_tables_and_gets_its_result` |
+| symmetric clip bounds (no bias: the mechanism test must notice) | `test_per_state_value_clip_biases_the_advantages_of_earlier_decisions` |
+| GAE without lambda (no bootstrap weight) | `test_per_state_value_clip_biases_the_advantages_of_earlier_decisions` |
+| explained variance of the target measured against the return | `test_value_fit_statistics` |
+| value bias not in chips | `test_value_fit_statistics` |
+
+Deferred minors (known, not fixed):
+
+- `SelfPlayVecEnv.step` with every action < 0 before the first `reset` returns observations of undealt engines (the
+  Python twin raises).
+- Decks are validated when a table is dealt, in the middle of a step: an invalid deck raises after earlier tables
+  have been stepped (C++ and Python).
+- In the default game aliased actions stay legal (a capped raise and the all-in; a raise for the whole stack), so the
+  policy splits probability between identical actions.
+- The pending decision at a round's 7th action (raise cap 5) has no slot for its legal row.

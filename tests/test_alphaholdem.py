@@ -231,6 +231,59 @@ def test_value_target_is_clipped_to_the_chips_put_in_so_far():
     np.testing.assert_allclose(target.numpy(), [0.02, -0.02], rtol=1e-6)
 
 
+def test_per_state_value_clip_biases_the_advantages_of_earlier_decisions():
+    """Why the per-state clip is not the default.  One hand at two tables: seat 0 decides twice and then wins / loses
+    50 chips.  At its second decision it faces a bet (2 chips in against 10), so the clipped targets are +0.10 and
+    -0.02: the critic that fits them says +0.04 where the expected return is 0.  With lambda < 1 the advantage of
+    the first decision bootstraps on that value and exceeds the Monte-Carlo advantage by (1 - lambda) x 0.04 on
+    average; with the unclipped target (an unbiased critic) the two agree in expectation."""
+    from headsup.alphaholdem.ppo import clipped_value_target, stream_gae
+
+    scale, lam = 100.0, 0.95
+    seats = torch.tensor([[0, 0], [1, 1], [0, 0], [1, 1]])  # [step, table]: seat 0, seat 1, seat 0, seat 1 ends the hand
+    active = torch.ones(4, 2, dtype=torch.bool)
+    dones = torch.tensor([[0, 0], [0, 0], [0, 0], [1, 1]]).bool()
+    rewards = torch.zeros(4, 2, 2)
+    rewards[3, 0] = torch.tensor([50.0, -50.0]) / scale
+    rewards[3, 1] = torch.tensor([-50.0, 50.0]) / scale
+    returns = torch.tensor([0.5, -0.5])  # seat 0's return at the two tables (gamma 1): mean 0
+    chips = {0: (1.0, 2.0), 2: (2.0, 10.0)}  # (own, opponent's) chips in at seat 0's first / second decision
+    results = {}
+    for clip in (True, False):
+        values = torch.zeros(4, 2)
+        for t, (own, opp) in chips.items():  # the critic that minimises the value loss: the state's mean target
+            values[t] = clipped_value_target(returns, torch.full((2,), own), torch.full((2,), opp), scale, clip=clip).mean()
+        gae, _ = stream_gae(values, rewards, dones, seats, active, gamma=1.0, lam=lam)
+        monte_carlo, _ = stream_gae(values, rewards, dones, seats, active, gamma=1.0, lam=1.0)
+        results[clip] = (values[2, 0].item(), (gae[0] - monte_carlo[0]).mean().item(), (gae[2] - monte_carlo[2]).abs().max().item())
+    value, bias, last = results[True]
+    assert value == pytest.approx(0.04) and bias == pytest.approx((1 - lam) * 0.04, rel=1e-3) and last == 0.0
+    value, bias, last = results[False]
+    assert value == pytest.approx(0.0, abs=1e-7) and bias == pytest.approx(0.0, abs=1e-7) and last == 0.0
+
+
+def test_value_fit_statistics():
+    """What the log says about the value head: variance explained of the return and - with the clip on - of its own
+    target, and the mean of V - return in chips."""
+    from headsup.alphaholdem.ppo import value_fit
+
+    ret = torch.tensor([0.9, -0.9, 0.03, -0.01, 0.5, -1.0])
+    value = torch.tensor([0.1, -0.05, 0.02, 0.0, 0.3, -0.2])
+    own = torch.tensor([10.0, 10.0, 2.0, 2.0, 100.0, 100.0])
+    opp = torch.tensor([20.0, 20.0, 4.0, 4.0, 100.0, 100.0])
+    r, v = ret.double().numpy(), value.double().numpy()
+    target = np.array([0.2, -0.1, 0.03, -0.01, 0.5, -1.0])  # the returns clipped to [-own, opp] / 100
+    plain = value_fit(ret, value, own, opp, 100.0, value_clip=False)
+    assert set(plain) == {"explained_variance", "value_bias"}
+    assert plain["explained_variance"] == pytest.approx(1 - np.var(r - v, ddof=1) / np.var(r, ddof=1), rel=1e-5)
+    assert plain["value_bias"] == pytest.approx(100.0 * (v - r).mean(), rel=1e-5)  # chips
+    clipped = value_fit(ret, value, own, opp, 100.0, value_clip=True)
+    assert set(clipped) == {"explained_variance", "explained_variance_target", "value_bias"}
+    assert clipped["explained_variance_target"] == pytest.approx(1 - np.var(target - v, ddof=1) / np.var(target, ddof=1), rel=1e-5)
+    assert clipped["explained_variance"] == plain["explained_variance"] and clipped["value_bias"] == plain["value_bias"]
+    assert clipped["explained_variance_target"] > clipped["explained_variance"] + 0.1  # the head fits its target better than the return
+
+
 def _toy_trajectory():
     """Two tables, eight lock-step steps (gamma 0.9, lambda 0.5).  Table 0, the agent against itself: a four-decision
     hand, a hand that seat 0 open-folds (seat 1 gets +1 without a decision - the two-seat form of the one-seat envs'
@@ -287,7 +340,7 @@ def test_ppo_loss_puts_the_pieces_together():
                  action=torch.tensor([1, 2, 3, 0, 1, 2]), logp=torch.log(torch.tensor([0.3, 0.05, 0.9, 0.25, 0.01, 0.5])),
                  adv=torch.tensor([1.0, -2.0, 0.5, -1.0, -3.0, 2.0]), ret=torch.tensor([0.9, -0.9, 0.01, 0.5, -1.0, 0.0]),
                  own=torch.tensor([2.0, 10.0, 4.0, 1.0, 50.0, 2.0]), opp=torch.tensor([2.0, 20.0, 4.0, 2.0, 50.0, 2.0]))
-    loss, stats = ppo_loss(net, batch, eps=0.2, delta1=3.0, value_coef=0.5, entropy_coef=0.01, reward_scale=100.0)
+    loss, stats = ppo_loss(net, batch, eps=0.2, delta1=3.0, value_coef=0.5, entropy_coef=0.01, reward_scale=100.0, value_clip=True)
     with torch.no_grad():
         logits, value = net(batch["cards"], batch["acts"], batch["legal"])
         logp_all = torch.log_softmax(logits, dim=-1)
@@ -413,9 +466,14 @@ def test_rollout_returns_are_each_seats_reward_of_its_hand():
     together (the network reproduces them)."""
     from headsup.alphaholdem.train import Trainer
 
-    trainer = Trainer({**TINY, "gamma": 0.9, "allin_ev": True}, device="cpu")
+    from headsup.alphaholdem.ppo import stream_gae
+
+    trainer = Trainer({**TINY, "gamma": 0.9, "lam": 0.3, "allin_ev": True}, device="cpu")
     batch, info = trainer.collect()
     grid = info["grid"]
+    for lam, same in ((0.3, True), (0.95, False)):  # the advantages are GAE with the trainer's gamma and lambda
+        adv, _ = stream_gae(grid["value"], grid["reward"] / 100.0, grid["done"], grid["seat"], grid["active"], 0.9, lam)
+        assert torch.allclose(adv[batch["step"], batch["table"]], batch["adv"], atol=1e-6) == same
     seat, active, done, reward = (grid[k].numpy() for k in ("seat", "active", "done", "reward"))
     T, N = seat.shape
     assert len(batch["action"]) == active.sum() >= 500 and info["hands"] == (done & active).sum()
@@ -499,7 +557,7 @@ def test_update_uses_the_configured_loss():
     from headsup.alphaholdem.ppo import ppo_loss
     from headsup.alphaholdem.train import Trainer
 
-    settings = dict(eps=0.1, delta1=1.5, value_coef=0.7, entropy_coef=0.03, reward_scale=50.0, epochs=1, minibatch=10**6)
+    settings = dict(eps=0.1, delta1=1.5, value_coef=0.7, entropy_coef=0.03, reward_scale=50.0, epochs=1, minibatch=10**6, value_clip=True)
     trainer = Trainer({**TINY, **settings}, device="cpu")
     batch, _ = trainer.collect()
     batch["logp"] = batch["logp"] + torch.linspace(-1.5, 1.5, len(batch["logp"]))  # ratios from 0.2 to 4.5: every clip is active
@@ -507,13 +565,14 @@ def test_update_uses_the_configured_loss():
     before = [p.detach().clone() for p in trainer.net.parameters()]
     stats = trainer.update(batch)
     normalised = dict(batch, adv=(batch["adv"] - batch["adv"].mean()) / (batch["adv"].std() + 1e-8))
-    loss, expected = ppo_loss(reference, normalised, eps=0.1, delta1=1.5, value_coef=0.7, entropy_coef=0.03, reward_scale=50.0)
+    loss, expected = ppo_loss(reference, normalised, eps=0.1, delta1=1.5, value_coef=0.7, entropy_coef=0.03, reward_scale=50.0,
+                              value_clip=True)
     assert stats["loss"] == pytest.approx(loss.item(), rel=1e-4)
     for k in ("policy", "value", "entropy", "clipped", "delta1_clipped", "value_clipped"):
         assert stats[k] == pytest.approx(expected[k], rel=1e-4), k
     assert expected["clipped"] > 0.5 and expected["delta1_clipped"] > 0.05 and 0.2 < expected["value_clipped"] < 1.0
     assert loss.item() != pytest.approx(ppo_loss(reference, normalised, eps=0.1, delta1=1.5, value_coef=0.03, entropy_coef=0.7,
-                                                 reward_scale=50.0)[0].item(), rel=1e-3)
+                                                 reward_scale=50.0, value_clip=True)[0].item(), rel=1e-3)
     moved = [float((a - b.detach()).abs().max()) for a, b in zip(before, trainer.net.parameters())]
     assert 0 < max(moved) < 1e-3 and stats["grad_norm"] > 0  # one Adam step of lr 3e-4
     plain = Trainer({**TINY, **settings, "adv_norm": False, "value_clip": False}, device="cpu")  # the two switches
@@ -521,6 +580,115 @@ def test_update_uses_the_configured_loss():
     stats = plain.update(batch)
     loss, _ = ppo_loss(reference, batch, eps=0.1, delta1=1.5, value_coef=0.7, entropy_coef=0.03, reward_scale=50.0, value_clip=False)
     assert stats["loss"] == pytest.approx(loss.item(), rel=1e-4) and stats["value_clipped"] == 0
+
+
+def test_value_clip_is_off_by_default_and_a_flag_pair(tmp_path, monkeypatch):
+    """Rollouts hold complete hands, so under the per-hand reading of delta2 / delta3 the paper's value target never
+    clips: no clip is the default.  --value-clip turns the per-state reading on, --no-value-clip is still accepted,
+    and a resumed run keeps what its checkpoint stored."""
+    import inspect
+
+    from headsup.alphaholdem.ppo import ppo_loss
+    from headsup.alphaholdem.train import DEFAULTS, Trainer, build_parser
+
+    assert DEFAULTS["value_clip"] is False and Trainer(TINY, device="cpu").cfg["value_clip"] is False
+    assert inspect.signature(ppo_loss).parameters["value_clip"].default is False
+    parse = lambda *flags: build_parser().parse_args(["--out", "x", "--iterations", "1", *flags])
+    assert parse().value_clip is False and parse("--value-clip").value_clip is True
+    assert parse("--no-value-clip").value_clip is False and parse("--value-clip", "--no-value-clip").value_clip is False
+    Trainer({**TINY, "value_clip": True}, device="cpu").save(tmp_path)
+    assert Trainer.resume(tmp_path, device="cpu").cfg["value_clip"] is True
+    monkeypatch.setitem(DEFAULTS, "value_clip", True)  # the flags' default is the settings' default, whatever it is
+    assert parse().value_clip is True and parse("--no-value-clip").value_clip is False
+
+
+def test_iteration_logs_the_value_heads_fit():
+    from headsup.alphaholdem.ppo import value_fit
+    from headsup.alphaholdem.train import Trainer
+
+    for clip, keys in ((False, ("explained_variance", "value_bias")), (True, ("explained_variance", "explained_variance_target", "value_bias"))):
+        trainer = Trainer({**TINY, "value_clip": clip}, device="cpu")
+        rollouts, collect = [], trainer.collect
+        trainer.collect = lambda: rollouts.append(collect()) or rollouts[-1]
+        record = trainer.iterate()
+        batch = rollouts[0][0]
+        expected = value_fit(batch["ret"], batch["value"], batch["own"], batch["opp"], trainer.reward_scale, clip)
+        assert set(expected) == set(keys) and all(record[k] == expected[k] and np.isfinite(record[k]) for k in keys)
+        assert ("explained_variance_target" in record) == clip
+
+
+def test_each_pool_member_plays_its_tables_and_gets_its_result():
+    """Two pool members with different forced behaviour against a main agent that always raises: member 0 folds to
+    every bet (the main agent wins 2 as small blind and 1 as big blind), member 1 always calls (every hand reaches
+    the showdown with 10 chips each in the pot).  The stakes at a table show which member played it; results and ELO
+    games are per member."""
+    from headsup.alphaholdem.pool import elo_expected
+    from headsup.alphaholdem.train import Trainer
+
+    trainer = Trainer({**TINY, "envs": 60, "pool": 3, "snapshot_every": 100}, device="cpu")
+    for action in (0, 1):
+        trainer.pool.add(trainer.net, iteration=action)
+        _force(trainer.pool.members[action].net, action)
+    _force(trainer.net, 2)
+    batch, info = trainer.collect()
+    opponent, grid = info["opponent"], info["grid"]
+    done, reward = grid["done"].numpy(), grid["reward"].numpy()
+    assert np.bincount(opponent + 1).tolist() == [20, 20, 20]
+    stakes = [set(np.abs(reward[:, opponent == k, 0][done[:, opponent == k]]).tolist()) for k in (0, 1)]
+    assert stakes[0] == {1.0, 2.0} and stakes[1] <= {0.0, 10.0} and 10.0 in stakes[1]  # each table: its member's way to play
+    main_seat, chips, hands = info["main_seat"].copy(), np.zeros(2), np.zeros(2, dtype=np.int64)
+    for t in range(len(done)):  # the main agent's result against each member, replayed from the grid
+        for i in np.flatnonzero(done[t] & (opponent >= 0)):
+            chips[opponent[i]] += reward[t, i, main_seat[i]]
+            hands[opponent[i]] += 1
+            main_seat[i] ^= 1
+    np.testing.assert_array_equal(info["pool_hands"], hands)
+    np.testing.assert_allclose(info["pool_chips"], chips)
+    assert hands.min() >= 20 and chips[0] / hands[0] == pytest.approx(1.5, abs=0.1)
+    record = trainer.iterate()  # another rollout, the update and the two ELO games
+    (it0, mean0, hands0), (it1, mean1, hands1) = record["vs_pool"]  # per member: its iteration, chips / hand, hands
+    assert (it0, it1) == (0, 1) and min(hands0, hands1) >= 20 and mean0 == pytest.approx(1.5, abs=0.1)
+    assert record["hands_vs_pool"] == hands0 + hands1
+    assert record["chips_vs_pool"] == pytest.approx((mean0 * hands0 + mean1 * hands1) / (hands0 + hands1))
+    folder, caller = trainer.pool.members
+    assert folder.elo == pytest.approx(1192.0)  # it lost its game against the main agent (then 1208)
+    score = 1.0 if mean1 > 0 else 0.0 if mean1 < 0 else 0.5  # the caller's game: whatever the cards gave
+    delta = 16.0 * (score - elo_expected(1208.0, 1200.0))
+    assert caller.elo == pytest.approx(1200.0 - delta) and trainer.pool.main_elo == pytest.approx(1208.0 + delta)
+
+
+def test_update_clips_the_gradient_norm():
+    """Adam moves a weight by lr x g / (|g| + 1e-5) in its first step: about lr for an ordinary gradient, far less
+    when the gradient was clipped to a norm far below 1e-5."""
+    from headsup.alphaholdem.train import Trainer
+
+    moved = {}
+    for norm in (1e-9, 0.5):
+        trainer = Trainer({**TINY, "epochs": 1, "minibatch": 10**6, "max_grad_norm": norm}, device="cpu")
+        batch, _ = trainer.collect()
+        before = [p.detach().clone() for p in trainer.net.parameters()]
+        assert trainer.update(batch)["grad_norm"] > 1e-3  # the norm before clipping
+        moved[norm] = max(float((a - b.detach()).abs().max()) for a, b in zip(before, trainer.net.parameters()))
+    assert moved[1e-9] < 1e-6 and 1e-4 < moved[0.5] < 1e-3
+
+
+def test_env_and_evaluation_use_all_in_ev_as_configured(monkeypatch):
+    import headsup.env as env_module
+    from headsup.alphaholdem.train import Trainer
+
+    trainer = Trainer({**TINY, "allin_ev": True, "ev_samples": 7}, device="cpu")
+    assert trainer.env.allin_ev is True and trainer.env.ev_samples == 7  # training rewards: as the settings say
+    plain = Trainer(TINY, device="cpu")
+    assert plain.env.allin_ev is False and plain.env.ev_samples == 100
+    seen, play_hands = [], env_module.play_hands
+
+    def spy(env, agent, hands, **kwargs):
+        seen.append(kwargs.get("allin_ev"))
+        return play_hands(env, agent, hands, **kwargs)
+
+    monkeypatch.setattr(env_module, "play_hands", spy)
+    out = plain.evaluate(128, opponents=("allin", "call"), num_envs=64)  # evaluation: always all-in EV, like the tools
+    assert seen == [True, True] and set(out) == {"allin", "call"} and all(len(v) == 2 and v[1] > 0 for v in out.values())
 
 
 def test_training_moves_the_main_agent_and_not_the_pool():
@@ -547,7 +715,7 @@ def test_training_moves_the_main_agent_and_not_the_pool():
     assert second["samples"] == first["batch"] + second["batch"] == trainer.samples and trainer.log == [first, second]
 
 
-def test_checkpoint_round_trip_and_cli(tmp_path):
+def test_checkpoint_round_trip_and_cli(tmp_path, capsys):
     import json
 
     from headsup.alphaholdem.train import Trainer, main
@@ -577,9 +745,17 @@ def test_checkpoint_round_trip_and_cli(tmp_path):
     assert a.rng.bit_generator.state != np.random.default_rng(0).bit_generator.state
     ra, rb = a.iterate(), b.iterate()  # the same checkpoint continues the same way
     assert ra["batch"] == rb["batch"] and ra["policy"] == pytest.approx(rb["policy"], rel=1e-4) and a.iteration == 3
+    first_deal = Trainer(saved["config"], device="cpu").env.reset()[0]
+    assert not np.array_equal(Trainer.resume(out, device="cpu").env.reset()[0], first_deal)  # ... with new cards, not the first run's
+    capsys.readouterr()
     main(args + ["--iterations", "3", "--resume"])
+    assert "ignored" not in capsys.readouterr().out  # the flags repeat what the checkpoint stores: nothing to warn about
     log = json.loads((out / "log.json").read_text())
     assert [r["iteration"] for r in log["log"]] == [1, 2, 3]
+    resumed = main(args + ["--iterations", "3", "--resume", "--value-clip", "--lr", "0.5"])  # hyperparameters come from the checkpoint
+    warning = [line for line in capsys.readouterr().out.splitlines() if "ignored" in line]
+    assert len(warning) == 1 and "--value-clip" in warning[0] and "--lr" in warning[0] and "--envs" not in warning[0]
+    assert resumed.cfg["lr"] == 3e-4 and resumed.cfg["value_clip"] is False
     with pytest.raises(SystemExit):
         main(args + ["--iterations", "3"])  # an existing run is not overwritten without --resume
 
