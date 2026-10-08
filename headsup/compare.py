@@ -20,14 +20,28 @@ from headsup.env import make_vec_env, play_hands
 from headsup.players import make_player
 
 
-def head_to_head(spec_a, spec_b, hands, num_envs=1024, seed=0, device=None):
+BOTS = ("random", "call", "allin", "raise")
+
+
+def table_game(specs, device=None):
+    """The game of the first player that brings one (network players); None when all are simple bots."""
+    for spec in specs:
+        if spec.split(":")[0] not in BOTS:
+            game = getattr(make_player(spec, device=device), "game", None)
+            if game is not None:
+                return game
+    return None
+
+
+def head_to_head(spec_a, spec_b, hands, num_envs=1024, seed=0, device=None, game=None):
     """Mean and standard error of A's chips/hand against B (both seats, alternating).  The game is the
-    one the network players were trained in (simple bots adopt it); two different trees are an error."""
-    a = make_player(spec_a, device=device, seed=seed)
+    one the network players were trained in (simple bots adopt it; two bots play ``game``, default: the
+    default no-limit game); two different trees are an error."""
+    a = make_player(spec_a, device=device, seed=seed, game=game)
     b = make_player(spec_b, device=device, seed=seed + 1, game=getattr(a, "game", None))
     game_a, game_b = getattr(a, "game", None), getattr(b, "game", None)
     if game_b is not None and game_a is not None and game_a.tree_dict() != game_b.tree_dict():
-        if spec_a.split(":")[0] in ("random", "call", "allin", "raise"):  # a bot row player adopts the network's game
+        if spec_a.split(":")[0] in BOTS:  # a bot row player adopts the network's game
             a = make_player(spec_a, device=device, seed=seed, game=game_b)
             game_a = game_b
         else:
@@ -39,6 +53,7 @@ def head_to_head(spec_a, spec_b, hands, num_envs=1024, seed=0, device=None):
 
 def compare(specs, hands, num_envs=1024, seed=0, device=None, bots=False, progress=print):
     opponents = list(specs) + (["random", "call", "allin"] if bots else [])
+    game = table_game(specs, device)  # bot-vs-bot cells are played in the table's game, not the default one
     results = {}
     for i, j in itertools.product(range(len(specs)), range(len(opponents))):
         a, b = specs[i], opponents[j]
@@ -49,7 +64,7 @@ def compare(specs, hands, num_envs=1024, seed=0, device=None, bots=False, progre
             results[(a, b)] = (-m, se)
             continue
         t0 = time.perf_counter()
-        results[(a, b)] = head_to_head(a, b, hands, num_envs, seed, device)
+        results[(a, b)] = head_to_head(a, b, hands, num_envs, seed, device, game=game)
         m, se = results[(a, b)]
         progress(f"{a} vs {b}: {m:+.3f} ± {se:.3f} chips/hand  ({time.perf_counter() - t0:.0f}s)")
     return results, opponents

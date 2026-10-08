@@ -128,3 +128,65 @@ def pytest_approx(x):
     import pytest
 
     return pytest.approx(x, rel=1e-9)
+
+
+def test_envs_take_and_check_the_network_opponents_game(tmp_path):
+    """A network opponent brings its tree (also as numpy weights, where it was ignored: a 3-output FHP net ran in
+    the 4-action default game on an unwritten logit); an explicit game of another tree is an error, also for
+    trees with the same number of actions."""
+    import pytest
+
+    from headsup import native
+    from headsup.env import make_vec_env
+    from headsup.game import DEFAULT_GAME, FHP, GameConfig
+    from headsup.model import BaseModel
+    from headsup.players import TorchPolicyPlayer
+
+    fhp_net = BaseModel(features="history", arch="paper", game=FHP)
+    pot = GameConfig(bet_sizes=(1.0,))
+    pot_net = BaseModel(game=pot)
+    if native.available():
+        env = make_vec_env(4, fhp_net.numpy_weights(), seed=0)
+        assert env.game.tree_dict() == FHP.tree_dict() and env.reset().shape == (4, OBS_DIM)
+        assert make_vec_env(4, fhp_net, seed=0).game.tree_dict() == FHP.tree_dict()
+        for opponent in (fhp_net, fhp_net.numpy_weights(), pot_net.numpy_weights()):
+            with pytest.raises(ValueError, match="different game"):
+                make_vec_env(4, opponent, seed=0, game=DEFAULT_GAME)
+    player = TorchPolicyPlayer(pot_net, device="cpu", seed=0)
+    assert PokerVecEnv(4, player, seed=0).game.tree_dict() == pot.tree_dict()
+    with pytest.raises(ValueError, match="different game"):
+        PokerVecEnv(4, player, seed=0, game=DEFAULT_GAME)
+    with pytest.raises(ValueError, match="different game"):
+        PokerVecEnv(4, player, seed=0, raise_cap=4)  # engine overrides must not silently change a network's tree
+
+
+def test_compare_plays_bot_cells_in_the_tables_game(tmp_path):
+    from headsup.compare import head_to_head, table_game
+    from headsup.game import FHP
+    from headsup.model import BaseModel
+
+    path = tmp_path / "fhp.pth"
+    BaseModel(features="history", arch="paper", game=FHP).save(path)
+    game = table_game([f"cfr:{path}", "call"], device="cpu")
+    assert game.tree_dict() == FHP.tree_dict() and table_game(["call", "random"], device="cpu") is None
+    mean, se = head_to_head("raise", "call", 64, num_envs=8, seed=0, device="cpu", game=game)
+    assert se > 30  # FHP pots (hundreds of chips), not the 100-chip default game (se <= 12.5 here)
+
+
+def test_exploit_makes_specs_with_options_absolute(tmp_path, monkeypatch):
+    import os
+
+    from headsup.exploit import _absolute_spec
+
+    (tmp_path / "x").mkdir()
+    (tmp_path / "x" / "iterates.pt").write_bytes(b"")
+    (tmp_path / "x" / "policy.pth").write_bytes(b"")
+    monkeypatch.chdir(tmp_path)
+    root = str(tmp_path / "x")
+    assert _absolute_spec("sdcfr:x/iterates.pt") == f"sdcfr:{root}/iterates.pt"
+    assert _absolute_spec("sdcfr:x/iterates.pt@exact@k4") == f"sdcfr:{root}/iterates.pt@exact@k4"
+    assert _absolute_spec("iterate:x/iterates.pt@t3") == f"iterate:{root}/iterates.pt@t3"
+    assert _absolute_spec("search:cfr:x/policy.pth@it100") == f"search:cfr:{root}/policy.pth@it100"
+    for spec in ("call", "cfr", "cfr:missing/policy.pth@x", f"cfr:{root}/policy.pth"):
+        assert _absolute_spec(spec) == spec
+    assert os.getcwd() == str(tmp_path)

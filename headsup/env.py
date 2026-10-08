@@ -41,15 +41,31 @@ def _make_spaces(game=DEFAULT_GAME):
     )
 
 
+def player_game(player):
+    """The action tree a player was trained for (``player.game``; numpy weights: their config's game), or None."""
+    game = getattr(player, "game", None)
+    if game is None and isinstance(player, dict):
+        game = (player.get("config") or {}).get("game")
+    return GameConfig.from_dict(game) if isinstance(game, dict) else game
+
+
 def resolve_game(game=None, *players, **engine_kwargs):
-    """The :class:`GameConfig` for an env: ``game`` if given, else the first player's ``game``
+    """The :class:`GameConfig` for an env: ``game`` if given, else the first player's game
     (network players carry the tree they were trained for), else the default; ``engine_kwargs``
     (stack_size, small_blind, ...) override individual fields."""
     if game is None:
-        game = next((getattr(p, "game", None) for p in players if getattr(p, "game", None) is not None), DEFAULT_GAME)
+        game = next((g for g in map(player_game, players) if g is not None), DEFAULT_GAME)
     if isinstance(game, dict):
         game = GameConfig.from_dict(game)
     return game.with_(**engine_kwargs)
+
+
+def check_same_tree(player, game, who="opponent"):
+    """A player that knows its tree must not be seated in another one (also not one with the same number of
+    actions: other raise sizes, caps, stacks or blinds are another game)."""
+    own = player_game(player)
+    if own is not None and own.tree_dict() != game.tree_dict():
+        raise ValueError(f"the {who} plays a different game than the env: {own.tree_dict()} vs {game.tree_dict()}")
 
 
 class PokerVecEnv:
@@ -67,6 +83,7 @@ class PokerVecEnv:
         self.opponent = opponent
         self.seat_mode = seat_mode
         self.game = resolve_game(game, opponent, **engine_kwargs)
+        check_same_tree(opponent, self.game)
         self.rng = np.random.default_rng(seed)
         self.engines = [
             HeadsUpPoker(rng=np.random.default_rng(self.rng.integers(2**63)), game=self.game)
@@ -211,9 +228,8 @@ def play_hands(vec_env, agent, num_hands, progress=False):
     """Run ``num_hands`` complete hands of ``agent`` in ``vec_env``; returns per-hand rewards.  Every table
     plays the same number of hands (ceil(num_hands / num_envs)): the first hands to finish across the tables are
     the short ones, so taking those would bias the mean."""
-    agent_game, env_game = getattr(agent, "game", None), getattr(vec_env, "game", None)
-    if agent_game is not None and env_game is not None and agent_game.tree_dict() != env_game.tree_dict():
-        raise ValueError(f"the agent plays a different game than the env: {agent_game.tree_dict()} vs {env_game.tree_dict()}")
+    if getattr(vec_env, "game", None) is not None:
+        check_same_tree(agent, vec_env.game, "agent")
     obs = vec_env.reset()
     bar = None
     if progress:
@@ -258,6 +274,7 @@ class NativeVecEnv:
     def set_opponent(self, opponent, deterministic=False):
         from headsup import native
 
+        check_same_tree(opponent, self.game)
         if isinstance(opponent, str):
             self.env.set_opponent_simple(opponent)
         elif isinstance(opponent, dict):  # numpy weights
@@ -339,8 +356,6 @@ def make_vec_env(num_envs, opponent, seat_mode="alternate", seed=None, backend="
     if not native_opponent and hasattr(opponent, "numpy_weights"):
         native_opponent = True
     if native_ok and native_opponent:
-        if hasattr(opponent, "game"):
-            game = resolve_game(game, opponent, **engine_kwargs)
         return NativeVecEnv(num_envs, opponent, seat_mode=seat_mode, seed=seed, deterministic=deterministic, game=game, **engine_kwargs)
     if backend == "cpp":
         raise ValueError("cpp backend requested but the opponent cannot run natively (or extension missing)")
