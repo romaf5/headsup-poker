@@ -29,6 +29,7 @@ the hold'em pipeline in headsup.deepcfr keeps its C++ kernels.
 """
 
 import argparse
+import copy
 import json
 import os
 import time
@@ -68,6 +69,18 @@ def _adam(model, lr):
     """Adam (lr 1e-3 in all the papers); fused and CUDA-graph capturable on the GPU."""
     cuda = next(model.parameters()).is_cuda
     return torch.optim.Adam(model.parameters(), lr=lr, **({"fused": True, "capturable": True} if cuda else {}))
+
+
+def _load_optimiser(opt, saved):
+    """Load an optimiser's state without sharing tensors with ``saved`` (two solvers must never step one Adam)
+    and without taking over the checkpoint's device-dependent switches: fused / capturable are what ``_adam``
+    chose for THIS solver's device (a CPU-written checkpoint would leave a CUDA solver's persistent optimiser
+    non-capturable inside the CUDA graph)."""
+    saved = copy.deepcopy(saved)
+    for group, mine in zip(saved["param_groups"], opt.param_groups):
+        for key in ("fused", "capturable", "foreach"):
+            group[key] = mine.get(key)
+    opt.load_state_dict(saved)
 
 
 _SIDE_STREAMS = {}
@@ -208,8 +221,9 @@ def regret_matching_np(adv, legal, argmax_fallback=False):
 class NetPolicy:
     """policy(state) = regret matching (or softmax) on a network's output; caches per infoset."""
 
-    def __init__(self, game, nets, mode="rm", device="cpu"):
+    def __init__(self, game, nets, mode="rm", device="cpu", argmax=False):
         self.game, self.nets, self.mode, self.device = game, nets, mode, device
+        self.argmax = argmax  # regret matching's fallback where no advantage is positive: the best action / uniform
         self.cache = {}
 
     def __call__(self, state):
@@ -222,7 +236,7 @@ class NetPolicy:
                 out = net(torch.as_tensor(state.info_state(p), device=self.device)[None])[0].cpu().numpy().astype(np.float64)
             legal = state.legal_mask()
             if self.mode == "rm":
-                probs = regret_matching_np(out, legal)
+                probs = regret_matching_np(out, legal, self.argmax)
             else:
                 out = np.where(legal, out, -np.inf)
                 e = np.exp(out - out.max())
@@ -460,6 +474,7 @@ class DeepSolver:
             a = int(self.rng.choice(len(xi), p=xi / xi.sum()))
             rows.append((self._history(state), a, sigma[a] / xi[a]))
             state = state.child(a)
+        self.nodes_touched += 1  # the terminal state (counted by the other samplers as well)
         ret = state.returns()[0]
         for hist, a, ratio in reversed(rows):
             tgt = np.zeros(self.game.num_actions, np.float32)
@@ -488,6 +503,7 @@ class DeepSolver:
                 strat.append((state.info_state(cur), t, sigma))  # on-policy: visited in proportion to its own reach
                 a = int(self.rng.choice(len(sigma), p=sigma))
             state = state.child(a)
+        self.nodes_touched += 1  # the terminal state
 
     # -- one iteration --------------------------------------------------------------------------
     def iterate(self, n=1):
@@ -547,7 +563,8 @@ class DeepSolver:
 
     # -- policies for evaluation ---------------------------------------------------------------
     def current_policy(self):
-        return NetPolicy(self.game, self.nets, "rm", self.device)
+        """The strategy the next iteration plays (regret matching with the solver's own fallback)."""
+        return NetPolicy(self.game, self.nets, "rm", self.device, argmax=self.rm_argmax)
 
     def policy_net(self):
         """DeepCFR / ESCHER average-strategy net fitted on the strategy memory."""
@@ -606,14 +623,14 @@ class DeepSolver:
     # -- checkpoints ------------------------------------------------------------------------------
     def state_dict(self):
         state = {"iteration": self.iteration, "nodes_touched": self.nodes_touched, "nets": [self._cpu_state(n) for n in self.nets],
-                 "iterates": self.iterates, "adv_memory": [m.state_dict() for m in self.adv_memory],
+                 "iterates": [list(it) for it in self.iterates], "adv_memory": [m.state_dict() for m in self.adv_memory],
                  "adv_rng": [m.rng.bit_generator.state for m in self.adv_memory], "rng": self.rng.bit_generator.state,
                  "torch_rng": torch.get_rng_state()}
         if self.algo in ("deepcfr", "escher"):
             state["strat_memory"], state["strat_rng"] = self.strat_memory.state_dict(), self.strat_memory.rng.bit_generator.state
         if self.algo == "dream":
             state["q_nets"] = [self._cpu_state(n) for n in self.q_nets]
-            state["q_opts"] = [o.state_dict() for o in self.q_opts]
+            state["q_opts"] = [copy.deepcopy(o.state_dict()) for o in self.q_opts]  # an optimiser hands out its live tensors
             state["q_memory"] = [(m.x[: m.size].copy(), m.target[: m.size].copy(), m.mask[: m.size].copy(), m.pos, m.size) for m in self.q_memory]
         return state
 
@@ -621,7 +638,7 @@ class DeepSolver:
         self.iteration, self.nodes_touched = int(state["iteration"]), int(state["nodes_touched"])
         for net, sd in zip(self.nets, state["nets"]):
             net.load_state_dict(sd)
-        self.iterates = state["iterates"]
+        self.iterates = [list(it) for it in state["iterates"]]
         for m, sd, rs in zip(self.adv_memory, state["adv_memory"], state["adv_rng"]):
             m.load_state_dict(sd)
             m.rng.bit_generator.state = rs
@@ -636,20 +653,30 @@ class DeepSolver:
                                  "resume with the same --shared-baseline setting")
             for net, opt, sd, osd in zip(self.q_nets, self.q_opts, state["q_nets"], state["q_opts"]):
                 net.load_state_dict(sd)
-                opt.load_state_dict(osd)
+                _load_optimiser(opt, osd)
             for m, (x, tg, mk, pos, size) in zip(self.q_memory, state["q_memory"]):
                 m.x[:size], m.target[:size], m.mask[:size], m.pos, m.size = x, tg, mk, pos, size
         self._sigma_tab, self._q_tab, self._v_tab = [None, None], [None, None], None
         return self
 
     def evaluate(self):
-        cur = exploitability(self.game, self.current_policy())[0]
-        avg = exploitability(self.game, self.average_policy())[0]
+        """Exploitability of the current and the average strategy.  Evaluating draws from torch's generators (a
+        fresh net's initialisation, the policy fit's minibatches): they are put back, so a run does not depend on
+        how often it is evaluated."""
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if self.device.type == "cuda" else None
+        try:
+            cur = exploitability(self.game, self.current_policy())[0]
+            avg = exploitability(self.game, self.average_policy())[0]
+        finally:
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
         return {"current": cur, "average": avg}
 
 
 def main(argv=None):
-    from headsup.games import make_game
+    from headsup.games import make_small_game
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--game", default="leduc")
@@ -686,7 +713,7 @@ def main(argv=None):
     p.add_argument("--json", default=None)
     p.add_argument("--checkpoint", default=None, help="saved at every evaluation; an existing file is resumed from")
     args = p.parse_args(argv)
-    game = make_game(args.game)
+    game = make_small_game(args.game)
     solver = DeepSolver(game, args.algo, traversals=args.traversals, adv_steps=args.adv_steps, adv_batch=args.adv_batch,
                         policy_steps=args.policy_steps, policy_batch=args.policy_batch, q_steps=args.q_steps, q_batch=args.q_batch,
                         value_traversals=args.value_traversals, epsilon=args.epsilon, value_epsilon=args.value_epsilon,

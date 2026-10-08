@@ -92,7 +92,9 @@ class OracleSampler:
         legal = state.legal_mask()
         sig = self.sigma(state)
         if state.current_player != p:
-            self._sampled_average(state, sig)
+            # the update player explores from its CURRENT strategy: how often this infoset is reached changes over
+            # the iterations, so the visit is weighted by 1 / its sampling reach (ESCHER's sampling policy is fixed)
+            self._sampled_average(state, sig, 1.0 / own_reach)
         xi = self.epsilon * legal / legal.sum() + (1 - self.epsilon) * sig if state.current_player == p else sig
         a = int(self.rng.choice(len(xi), p=xi / xi.sum()))
         b = np.where(legal, q_tab[state.history_key()] * (1.0 if p == 0 else -1.0), 0.0)
@@ -104,14 +106,14 @@ class OracleSampler:
             acc.setdefault(state.info_key(p), []).append(np.where(legal, va - v, 0.0) / own_reach)
         return v
 
-    def _sampled_average(self, state, sig):
+    def _sampled_average(self, state, sig, weight=1.0):
         if self.average != "sampled":
             return
         key = state.info_key(state.current_player)
         s = self.strategy_sum.get(key)
         if s is None:
             s = self.strategy_sum[key] = np.zeros(self.game.num_actions)
-        s += sig
+        s += weight * sig
 
     # -- iterations -------------------------------------------------------------------------------
     def _accumulate_average(self, state, p, reach):
@@ -167,7 +169,7 @@ class OracleSampler:
 
 
 def main(argv=None):
-    from headsup.games import make_game
+    from headsup.games import make_small_game
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--game", default="leduc")
@@ -180,8 +182,8 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", default=None)
     args = p.parse_args(argv)
-    game = make_game(args.game)
-    points = sorted(int(x) for x in args.eval.split(",") if int(x) <= args.iterations)
+    game = make_small_game(args.game)
+    points = sorted({int(x) for x in args.eval.split(",") if int(x) <= args.iterations} | {args.iterations})  # all of them are run
     if args.algo == "os":
         solver = MCCFR(game, "outcome", seed=args.seed, linear=False, epsilon=args.epsilon)
         step = lambda n: solver.iterate(n * args.trajectories)  # MCCFR: one trajectory per player per call

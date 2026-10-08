@@ -131,3 +131,49 @@ def test_pdcfr_plus_predicts_with_the_discount_of_the_next_update():
     s.last_update["x"] = 2  # not yet updated in iteration 3
     d3 = 2**2.3 / (2**2.3 + 1)
     np.testing.assert_allclose(s._sigma("x", legal), np.array([2 * d3 - 1, 1.0, 0.0]) / (2 * d3))
+
+
+def test_oracle_cli_runs_all_requested_iterations(tmp_path):
+    """Iterations beyond the last --eval point were never run (--iterations 300 with the default list ran 200)."""
+    import json
+
+    from headsup.algos.oracle import main
+
+    main(["--game", "kuhn", "--algo", "escher", "--iterations", "30", "--eval", "1,10,20", "--trajectories", "5", "--json", str(tmp_path / "o.json")])
+    curve = json.load(open(tmp_path / "o.json"))["curve"]
+    assert [row["iteration"] for row in curve] == [1, 10, 20, 30]
+
+
+def test_oracle_sampled_average_does_not_depend_on_the_update_players_exploration():
+    """DREAM's update player samples epsilon-greedily from its CURRENT strategy, so how often a trajectory reaches an
+    opponent infoset changes with that strategy; the sampled average must correct for it (1 / sampling reach). At
+    player 1's infosets after a bet its own reach is 1: each trajectory must contribute mass 1 on average, whether
+    player 0 always bets (0.75 uncorrected) or always checks (0.25)."""
+    from headsup.algos.oracle import OracleSampler
+
+    g = make_game("kuhn")
+    for p0_bets in (True, False):
+        s = OracleSampler(g, "dream", trajectories=1, epsilon=0.5, seed=0, average="sampled")
+        root = g.new_initial_state()
+        for c0 in range(3):
+            for c1 in range(3):
+                if c1 != c0:  # player 0's regrets: always bet (action 2) or always check (action 1)
+                    r = np.zeros(3)
+                    r[2 if p0_bets else 1] = 1.0
+                    s.regret[root.child(c0).child(c1).info_key(0)] = r
+        q_tab = {}
+        s._values(g.new_initial_state(), q_tab)
+        n = 20000
+        for _ in range(n):
+            s._dream(g.new_initial_state(), 0, 1.0, q_tab, {})
+        mass = sum(v.sum() for k, v in s.strategy_sum.items() if k[0] == 1 and k[4][0] == (2,)) / n
+        assert mass == pytest.approx(1.0, abs=0.06), (p0_bets, mass)
+
+
+def test_small_game_solvers_refuse_holdem_presets():
+    """`--game fhp` reached the solver with a GameConfig (AttributeError), or would enumerate the whole game."""
+    from headsup.algos import deep, oracle
+
+    for main in (deep.main, oracle.main):
+        with pytest.raises(ValueError, match="small game"):
+            main(["--game", "fhp", "--iterations", "1"])

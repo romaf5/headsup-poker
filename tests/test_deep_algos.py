@@ -1,6 +1,8 @@
 """Deep CFR / SD-CFR / DREAM / ESCHER on the game protocol (Kuhn), against exact exploitability."""
 
+import numpy as np
 import pytest
+import torch
 
 from headsup.algos.best_response import exploitability
 from headsup.algos.deep import DeepSolver
@@ -251,3 +253,83 @@ def test_leduc_report_tabulates_pdcfr_runs_by_episodes(tmp_path):
     assert lines[2] == "| **VR-DeepPDCFR+, paper** | **158** | **115** | **90** |"
     assert lines[3].startswith("| ours (1) | 190 | 160 | 105 |")  # means within +-10 % (the last column: 9-10 M) of x
     assert PDCFR_PAPER[("pdcfrk", "dcfr+")][9.5e6] == pytest.approx(5.3)
+
+
+def test_current_policy_is_the_strategy_the_solver_plays():
+    """current_policy() used the uniform fallback while the traversals use the solver's (argmax by default): the
+    'current' exploitability column described a strategy that was never played."""
+    g = make_game("leduc")
+    for argmax in (True, False):
+        s = DeepSolver(g, "sdcfr", traversals=100, adv_steps=30, adv_batch=128, seed=0, rm_argmax=argmax)
+        s.iterate(2)
+        pol = s.current_policy()
+        differ, fallback = 0, 0
+        stack = [g.new_initial_state()]
+        while stack:
+            st = stack.pop()
+            if st.is_terminal():
+                continue
+            if st.is_chance():
+                stack.extend(st.child(a) for a, _ in st.chance_outcomes())
+                continue
+            played = s._sigma(st.current_player, st)
+            differ += not np.allclose(pol(st), played, atol=1e-6)  # float32 noise of batched vs single forwards: < 1e-7
+            fallback += played.max() == 1.0
+            stack.extend(st.child(a) for a in st.legal_actions())
+        assert differ == 0 and (fallback > 0 or not argmax)  # with argmax, some infosets do use the fallback
+
+
+def test_escher_counts_terminal_nodes_like_the_other_samplers():
+    """nodes_touched omitted ESCHER's terminal states (external sampling and DREAM count them)."""
+    s = DeepSolver(make_game("kuhn"), "escher", traversals=50, adv_steps=2, policy_steps=2, q_steps=2, seed=0)
+    visited = [0]
+
+    class Counting:  # a state that counts every state a trajectory visits, the terminal one included
+        def __init__(self, state):
+            self._s = state
+            visited[0] += 1
+
+        def child(self, a):
+            return Counting(self._s.child(a))
+
+        def __getattr__(self, name):
+            return getattr(self._s, name)
+
+    class CountingGame:
+        def __init__(self, game):
+            self._g = game
+
+        def new_initial_state(self):
+            return Counting(self._g.new_initial_state())
+
+        def __getattr__(self, name):
+            return getattr(self._g, name)
+
+    s.game = CountingGame(s.game)
+    s.iterate(1)
+    assert s.nodes_touched == visited[0]
+
+
+@pytest.mark.parametrize("algo", ["sdcfr", "deepcfr"])
+def test_evaluation_does_not_change_the_training_trajectory(algo):
+    """evaluate() consumed the training generator (a fresh net's initialisation, the policy fit's minibatches): the
+    run depended on --eval-every."""
+    def run(evaluate):
+        s = DeepSolver(make_game("kuhn"), algo, traversals=50, adv_steps=20, adv_batch=64, policy_steps=20, policy_batch=64, seed=0)
+        s.iterate(2)
+        if evaluate:
+            s.evaluate()
+        s.iterate(1)
+        return torch.cat([p.detach().flatten() for n in s.nets for p in n.parameters()])
+
+    torch.testing.assert_close(run(True), run(False))
+
+
+def test_solver_state_dict_is_a_snapshot():
+    """state_dict() handed out the baseline optimisers' live tensors (and the live list of iterates)."""
+    s = DeepSolver(make_game("kuhn"), "dream", traversals=30, adv_steps=5, q_steps=5, seed=0).iterate(1)
+    snap = s.state_dict()
+    step = int(snap["q_opts"][0]["state"][0]["step"])
+    n_iterates = len(snap["iterates"][0])
+    s.iterate(1)
+    assert int(snap["q_opts"][0]["state"][0]["step"]) == step and len(snap["iterates"][0]) == n_iterates
