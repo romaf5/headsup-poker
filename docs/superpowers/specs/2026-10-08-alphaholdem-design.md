@@ -1,7 +1,9 @@
 # AlphaHoldem on the default no-limit game - design
 
-Status: written and implemented by one agent under a blanket approval (2026-10-08). Implemented and tested on CPU;
-the GPU path has not been executed (both GPUs were busy), and the long run and the review are still to come.
+Status: written and implemented by one agent under a blanket approval (2026-10-08), on CPU only. An independent
+review the same day found no coding error and three things to change (the per-state value clip as default, the
+explained-variance statistic, seven untested lines); they are done ("After the review" below). Two GPU runs are in
+progress.
 Sources: Zhao, Yan, Li, Li, Xing, "AlphaHoldem: High-Performance Artificial Intelligence for Heads-Up No-Limit Poker
 via End-to-End Reinforcement Learning" (AAAI-22); the same lab's OpenHoldem (arXiv 2012.06168v4), which re-describes
 the agent; Ye et al. 2020 (arXiv 1912.09729) for the dual-clip PPO loss. There is no official code; the public
@@ -81,13 +83,20 @@ With `r = pi(a|s) / pi_old(a|s)` and advantage `A`:
 ```
 surr   = min(r * A, clamp(r, 1 - eps, 1 + eps) * A)          # PPO
 surr   = where(A < 0, max(surr, delta1 * A), surr)           # the third clip: bounded when A < 0 and r is large
-target = clamp(R, -delta2(s), delta3(s))                     # R: the discounted return of the hand
+target = R                                                   # the discounted return of the hand
+target = clamp(R, -delta2(s), delta3(s))                     # with --value-clip
 loss   = -mean(surr) + c_v * mean((target - V(s))^2) - c_e * mean(entropy)
 ```
 
 For `A < 0` this is `clamp(r, 1 - eps, delta1) * A`, which is what the paper's eq. (3) evaluates to; for `A >= 0` it
-is PPO. `delta2(s)` / `delta3(s)` are the chips the player / the opponent have put in *up to the state s*
-(per-state reading), divided by the reward scale.
+is PPO.
+
+The value target `clip(R, -delta2, delta3)` has two readings. Per hand - the chips the two players have put in when
+the hand is over: a complete hand's return always lies inside these bounds, so with the Monte-Carlo returns used
+here the target is the return itself. This is the default. Per state (`--value-clip`) - `delta2(s)` / `delta3(s)`
+are the chips put in *up to the state s*: these bounds are asymmetric whenever the player faces a bet, the clipped
+target's mean lies above the expected return, and through lambda < 1 the optimistic value enters the advantage of
+every decision that the same seat follows with another one in the hand, by (1 - lambda) x the value's bias.
 
 ### Rollouts and advantages
 
@@ -131,7 +140,7 @@ One iteration:
 | 1 | tower / FC layers | "ConvNets", "like ResNet", 8.6 M parameters (1.8 M conv, 6.8 M FC) | 3 plain 3x3 conv layers x 64 per tower, 256-unit layers, 1.4 M parameters | the game is 4 actions x 50 bb instead of 9 x 200 bb; the brief's sizing; all widths are flags |
 | 2 | eps | "typical value 0.2" | 0.2 | |
 | 3 | form of eq. (3) | no min, no sign condition; text: delta1 applies "when A < 0" | dual-clip of Ye et al. (above) | it is what eq. (3) gives for A < 0, and the ablation ladder (PPO < dual-clip < trinal) puts the value clip on top of dual-clip |
-| 4 | delta2 / delta3 | "the total number of chips the player has placed and the opponent has placed", "dynamically calculated" | per state: chips put in up to s | OpenHoldem: "-delta2 represent the state value when the player folds, delta3 ... when the opponent folds"; the per-hand reading (final chips) never clips a complete hand's return |
+| 4 | delta2 / delta3 | "the total number of chips the player has placed and the opponent has placed", "dynamically calculated" | per hand, which with complete-hand Monte-Carlo returns never clips: the target is the return (default); `--value-clip` = per state, the chips put in up to s | the per-state reading (OpenHoldem: "-delta2 represent the state value when the player folds, delta3 ... when the opponent folds") biases the advantages: the review measured GAE minus Monte-Carlo advantage +0.95 ± 0.03 / +0.50 ± 0.02 / +0.27 ± 0.01 chips over iterations 0-20 / 20-50 / 50-90 on decisions followed by another one of the same seat, and 0 within SE without the clip |
 | 5 | which return is clipped | "the traditional gamma-return" | the discounted Monte-Carlo return of the hand | literal; rollouts hold complete hands, so it is available |
 | 6 | total loss, coefficients | not given | value 0.5, entropy 0.01 | PPO defaults; the brief's values |
 | 7 | epochs, minibatch | minibatch 16 384, epochs not given | 3 epochs, 16 384 | |
@@ -160,10 +169,9 @@ One iteration:
 4. Tensors are rebuilt from the observation instead of being written by the engine (the same content; tested against
    the engine's history).
 5. The network is about one sixth of the paper's size.
-6. Optional all-in EV rewards (`--allin-ev`, off by default) and an optional unclipped value target
-   (`--no-value-clip`, the ablation).
+6. Optional all-in EV rewards (`--allin-ev`, off by default).
 
-## Tests (`tests/test_twoseat.py`, `tests/test_alphaholdem.py`; 36 tests, about 10 s together on CPU)
+## Tests (`tests/test_twoseat.py`, `tests/test_alphaholdem.py`; 43 tests, about 15 s together on CPU)
 
 - Two-seat env: C++ against the Python twin on the same decks with random actions including waits (observations,
   seats, rewards, dones identical; also with all-in EV); the twin against `PokerVecEnv` with the same seed and
@@ -172,7 +180,9 @@ One iteration:
   each decision) on random hands in three trees; the card tensor; the legal mask against `legal_mask_from_obs`; the
   bounds against the engine's chips; terminal observations do not break the encoder.
 - Loss: the three clips on hand-computed cases, gradients included; the delta1 clip differs from PPO where it should
-  (and a `min` of three terms does not); the value target with per-state bounds.
+  (and a `min` of three terms does not); the value target with per-state bounds; on a hand-built two-decision
+  hand the per-state clip raises the first decision's GAE advantage above the Monte-Carlo one by (1 - lambda) x
+  the value's bias, and the unclipped target does not.
 - GAE on a hand-built two-table trajectory: interleaved seats, a hand without a decision of the learner, waiting
   cells; against values computed by hand.
 - ELO update, K-best selection, opponent assignment.
@@ -190,6 +200,7 @@ One iteration:
   trainer and the player; each makes the test named for it in the plan fail. The first run found two that no test
   noticed (the main agent's seat tensor aliased its numpy array on CPU, so a missing refresh would only have shown
   on a GPU; a generator that is not restored from a checkpoint); the code / the test were changed and both fail now.
+  The review found seven more survivors; with their tests and the mutants of the second pass it is 77 of 77.
 
 ## Compute and measurements (CPU, a machine busy with other jobs)
 
@@ -220,16 +231,35 @@ evaluated against `cfr` inside the C++ env (50 k hands for the first row, 30 k f
 
 | iteration (x 9 k samples) | 25 | 50 | 75 | 100 | 125 |
 |---|---|---|---|---|---|
-| default (per-state value clip, dealt rewards) | -2.50 ± 0.10 | -1.86 ± 0.11 | -1.77 ± 0.11 | -1.81 ± 0.11 | -2.01 ± 0.12 |
-| `--allin-ev` | -1.98 ± 0.13 | -1.68 ± 0.16 | -1.56 ± 0.15 | -1.81 ± 0.16 | -1.23 ± 0.15 |
-| `--no-value-clip` | -2.01 ± 0.13 | -1.91 ± 0.13 | -0.93 ± 0.12 | -0.68 ± 0.11 | (stopped) |
+| `--value-clip` (per-state clip, the default at the time) | -2.50 ± 0.10 | -1.86 ± 0.11 | -1.77 ± 0.11 | -1.81 ± 0.11 | -2.01 ± 0.12 |
+| `--value-clip --allin-ev` | -1.98 ± 0.13 | -1.68 ± 0.16 | -1.56 ± 0.15 | -1.81 ± 0.16 | -1.23 ± 0.15 |
+| no clip (the default now) | -2.01 ± 0.13 | -1.91 ± 0.13 | -0.93 ± 0.12 | -0.68 ± 0.11 | (stopped) |
 
-What this does and does not show: the agent beats the bots within minutes and is far from the DeepCFR net after
-1 M samples (the long run has 600 times as many). With the per-state clip more than 40 % of the value targets are
-clipped and the value head explains none of the variance of the returns (explained variance about 0), so the
-advantages are close to raw returns. The run without the clip was ahead by about one chip per hand from 0.7 M
-samples on, but its explained variance was about 0 as well and it is one seed: the difference is not established.
-It is the first thing to check on a GPU (`--no-value-clip` is the paper's "dual-clip PPO" ablation).
+What this does and does not show: the agent beats the bots within minutes and is behind the DeepCFR net after 1 M
+samples (the long run has 600 times as many). The run without the clip was ahead by about one chip per hand from
+0.7 M samples on; it is one seed.
+
+## After the review (2026-10-08)
+
+1. **The per-state value clip biases the advantages** (the mechanism is in the section on the loss; the numbers in
+   row 4 of the table). With it more than 40 % of the value targets are clipped, and at near-uniform play the mean
+   clipped target is 7.7 - 9 chips where the mean return is about 0 (review). The default is now no clip - the
+   paper's loss under the per-hand reading - and `--value-clip` selects the per-state reading. Checkpoints keep the
+   setting they were started with.
+2. **Explained variance.** The log's `explained_variance` is measured against the unclipped return; with the clip on
+   it read about 0 although the head explains 0.30 - 0.42 of the variance of its own, clipped target (review). So
+   the earlier statement here that the head "explains none of the variance" was about the wrong quantity. Without
+   the clip the head explains 0.02 - 0.04 of the return variance (review): returns are dominated by all-in luck.
+   The log now has `explained_variance`, with the clip on also `explained_variance_target`, and `value_bias` =
+   mean(V - return) in chips; and the main agent's chips / hand against each pool member (`vs_pool`).
+3. **Tests for lines that no test covered**: results and networks per pool member (two members with different
+   forced behaviour), a resumed run draws new cards, `--max-grad-norm`, the GAE lambda, all-in EV in the periodic
+   evaluation, `--allin-ev` / `--ev-samples` reaching the env. `--resume` with a hyperparameter flag that differs
+   from the checkpoint now prints a warning that names it; option names can no longer be abbreviated.
+
+The two GPU runs were started from the first version, one with the per-state clip (the default then) and one with
+`--no-value-clip`. At iteration 200 (26 M samples) their in-run evaluations against `cfr` were +0.51 ± 0.13 and
++0.71 ± 0.11 chips/hand (reported by the session that runs them; not measured here).
 
 ## Success criteria (long run; 400k hands head-to-head, >= 20k LBR pairs, ± SE)
 
@@ -241,7 +271,7 @@ The paper reports no exploitability, and self-play PPO has no convergence guaran
 (AlphaExploitem reports that a K-best PPO baseline approaches but does not reach Nash on Leduc), so criteria 2 and 3
 are open; nothing measured so far says whether the long run meets them.
 
-Long run and its evaluation:
+Long run (no value clip; add `--value-clip` for the per-state reading) and its evaluation:
 
 ```bash
 CUDA_VISIBLE_DEVICES=<free gpu> python -m headsup.alphaholdem.train --out runs/alphaholdem --iterations 5000 --device cuda:0 --eval-cfr
@@ -255,7 +285,9 @@ python -m headsup.lbr --policy alpha:runs/alphaholdem/policy.pth --hands 20000 -
   spots: the action-sampling generator lives on the training device (saving its state is guarded), the encoder
   uses float32 products on MPS (run on CPU with float32: no mismatch in 7 trees).
 - The throughput on an RTX 3090 and with it the duration of the long run.
-- Whether the per-state value clip helps or hurts (above), the entropy coefficient (0.01; the brief suggests a
-  sweep over 0.005 - 0.02), the number of epochs, K and the snapshot interval: none was tuned.
+- What the per-state value clip costs or gains in playing strength (its advantage bias is measured, the two GPU
+  runs compare the variants), the entropy coefficient (0.01; the brief suggests a sweep over 0.005 - 0.02), the
+  number of epochs, K and the snapshot interval: none was tuned.
+- The review's measurements quoted above were not repeated in this pass.
 - Larger trees: the encoder is tested in an 8-action tree and with 200 / 1000-chip stacks, the trainer only in the
   default game (the shipped baselines exist only there).
