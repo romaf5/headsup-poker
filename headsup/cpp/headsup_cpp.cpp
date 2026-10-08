@@ -130,6 +130,21 @@ struct EngineConfig {
   int showdown_cards() const { return BOARD_CARDS_BY_STAGE[num_rounds - 1]; }
 };
 
+inline void validate(const EngineConfig& c) {
+  if (c.bet_sizes.empty()) throw std::invalid_argument("at least one bet size is needed");
+  if (c.num_actions() > MAX_ACTIONS)
+    throw std::invalid_argument("the game has " + std::to_string(c.num_actions()) + " actions, at most " + std::to_string(MAX_ACTIONS) +
+                                " are supported");
+  for (double s : c.bet_sizes)
+    if (!(s == -1.0 || s == -2.0 || (s > 0.0 && s <= 100.0))) throw std::invalid_argument("bet sizes must be pot fractions in (0, 100]");
+  if (c.num_rounds < 2 || c.num_rounds > 4) throw std::invalid_argument("num_rounds must be 2, 3 or 4");
+  if (!c.limit.empty() && int(c.limit.size()) != c.num_rounds) throw std::invalid_argument("limit needs one raise increment per round");
+  if (!c.raise_caps.empty() && int(c.raise_caps.size()) != c.num_rounds)
+    throw std::invalid_argument("raise_caps needs one entry per round");
+  if (!(0 < c.small_blind && c.small_blind < c.big_blind && c.big_blind < c.stack_size))
+    throw std::invalid_argument("blinds and stack need 0 < small blind < big blind < stack");
+}
+
 struct Engine {
   EngineConfig cfg;
   int hands[2][2] = {{0, 1}, {2, 3}};
@@ -143,7 +158,7 @@ struct Engine {
   int hist_n[HISTORY_ROUNDS] = {0, 0, 0, 0};
   static constexpr int dealer = 0;
 
-  explicit Engine(EngineConfig c = EngineConfig()) : cfg(c) {}
+  explicit Engine(EngineConfig c = EngineConfig()) : cfg(c) { validate(cfg); }
 
   void reset(const int* deck9) {
     hands[0][0] = deck9[0];
@@ -630,16 +645,25 @@ inline void softmax(const float* logits, float* p, int n) {
   for (int a = 0; a < n; ++a) p[a] /= s;
 }
 
+// The action whose cumulative-probability interval contains u - never one with probability 0: float32 partial
+// sums can stop short of 1 (0.99999994), and the remainder belongs to the last action WITH probability (returning
+// the last index gave the illegal raise at the cap of a limit game ~1e-8 of the time).
+inline int sample_index(const float* p, int n, float u) {
+  float acc = 0.0f;
+  int last = n - 1;
+  for (int a = 0; a < n; ++a) {
+    if (!(p[a] > 0.0f)) continue;
+    acc += p[a];
+    last = a;
+    if (u < acc) return a;
+  }
+  return last;
+}
+
 template <class RNG>
 inline int sample(const float* p, int n, RNG& rng) {
   std::uniform_real_distribution<float> u01(0.0f, 1.0f);
-  const float u = u01(rng);
-  float acc = 0.0f;
-  for (int a = 0; a < n - 1; ++a) {
-    acc += p[a];
-    if (u < acc) return a;
-  }
-  return n - 1;
+  return sample_index(p, n, u01(rng));
 }
 
 // ------------------------------------------------------------------ MCCFR traversal
@@ -1040,9 +1064,13 @@ struct VecEnv {
       case CALL:
         return CHECK_CALL;
       case ALLIN:
-        return e.cfg.has_all_in ? e.cfg.all_in() : e.cfg.num_actions() - 1;
-      case RAISE_:
-        return RAISE;
+      case RAISE_: {  // as the Python bots: where the game masks the action, its twin is played
+        const int a = opp_kind == RAISE_ ? int(RAISE) : (e.cfg.has_all_in ? e.cfg.all_in() : e.cfg.num_actions() - 1);
+        bool legal[MAX_ACTIONS];
+        int twin[MAX_ACTIONS];
+        e.legal_mask(legal, twin);
+        return legal[a] ? a : twin[a];
+      }
       case MODEL: {
         float logits[MAX_ACTIONS];
         bool legal[MAX_ACTIONS];
@@ -1101,6 +1129,9 @@ struct VecEnv {
     auto r = rewards.mutable_unchecked<1>();
     auto d = dones.mutable_unchecked<1>();
     auto a = actions.unchecked<1>();
+    for (ssize_t i = 0; i < n; ++i)  // before anything is stepped (a table that is done ignores its action)
+      if (!engines[i].done && (a(i) < 0 || a(i) >= num_actions))
+        throw py::value_error("Invalid action " + std::to_string(a(i)) + " at table " + std::to_string(i));
     for (ssize_t i = 0; i < n; ++i) {
       Engine& e = engines[i];
       r(i) = 0.0f;
@@ -2237,7 +2268,9 @@ struct VectorSolver {
 
   int child(int node, int action) const {
     if (node < 0 || node >= int(nodes.size()) || action < 0 || action >= n_actions) return -1;
-    return nodes[node].child[action];
+    const SubgameNode& nd = nodes[node];
+    if (nd.kind != 0) return -1;
+    return nd.child[nd.legal[action] ? action : nd.twin[action]];  // a masked action is executed as its twin
   }
 };
 
@@ -2729,7 +2762,9 @@ struct TabularBlueprint {
   // -- queries --------------------------------------------------------------------------------
   int child(int node, int a) const {
     if (node < 0 || node >= int(tree.nodes.size()) || a < 0 || a >= n_actions) return -1;
-    return tree.nodes[node].child[a];
+    const SubgameNode& nd = tree.nodes[node];
+    if (nd.kind != 0) return -1;
+    return nd.child[nd.legal[a] ? a : nd.twin[a]];  // a masked action is executed as its twin
   }
 
   // strategy at a node for one hand: normalised average counters (phi), regret matching where empty
@@ -2784,6 +2819,10 @@ double bench_forward(const Model& m, int n) {
 PYBIND11_MODULE(headsup_cpp, m) {
   using namespace hp;
   m.doc() = "C++ kernels for headsup-poker";
+
+  m.def("sample_index", [](py::array_t<float, py::array::c_style | py::array::forcecast> p, float u) {
+    return sample_index(p.data(), int(p.size()), u);
+  }, "the action a draw u in [0, 1) selects from the probabilities p (the samplers' rule)");
 
   m.def(
       "set_tables",
@@ -2998,7 +3037,8 @@ PYBIND11_MODULE(headsup_cpp, m) {
   py::class_<VectorSolver>(m, "VectorSolver")
       .def(py::init<>())
       .def("build", [](VectorSolver& sv, const Engine& root, int buckets) {
-        if (buckets < 1 || buckets > 65535) throw std::runtime_error("buckets must be in 1..65535");
+        // more buckets than hands is meaningless, and the per-level scratch holds NUM_COMBOS strategy rows
+        if (buckets < 1 || buckets > NUM_COMBOS) throw std::invalid_argument("buckets must be in 1.." + std::to_string(NUM_COMBOS));
         sv.buckets = buckets;
         py::gil_scoped_release release;
         sv.build(root);
