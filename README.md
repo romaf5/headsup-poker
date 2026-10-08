@@ -149,6 +149,22 @@ throughout; Kuhn matches. Where the paper and the authors' code differ, the defa
 constant 1.5 for DCFR+, 1 000 baseline steps, the prediction network is never re-initialised, first-legal-action
 fallback); `--discount-offset`, `--q-steps`, `--reinit-prediction` and `--fallback` give the paper's values.
 
+**NFSP** (Heinrich & Silver 2016; `headsup.algos.nfsp`, numpy networks, one CPU core). Exploitability of the average
+policy network, mA/g, mean ± sd over 3 seeds:
+
+| iteration (128 steps, 2 SGD steps per network) | 1e4 | 1e5 | 5e5 | 1e6 | 2e6 | 3e6 |
+|---|---|---|---|---|---|---|
+| **Heinrich & Silver, Fig. 1a (64 units)** | **1040** | **430** | **158** | **128** | **77** | **75** |
+| ours, `--preset paper` | 1249 ± 82 | 310 ± 50 | 130 ± 54 | 106 ± 39 | 107 ± 27 | 118 ± 29 |
+
+It follows the paper's curve to 1e6 iterations and then stays near 110 where the paper continues to 75: two of the
+three seeds sit at about 80-90, one at 115-145, and single evaluations swing by ±25 % (the average network, not the
+data it is fitted to). The preset divides the rewards by 2.6 (the unit of the DREAM authors' NFSP code): with rewards
+in antes the same settings rose again after 6e5 iterations (220-300 mA/g); the paper does not give its unit. With the
+DREAM paper's NFSP settings (`--preset dream`, one seed so far) the curve flattens at about 150 mA/g from 3e7 nodes
+on, where that paper's baseline goes on to 61 at 2e8 - not reproduced. Open points and the 17 places where the paper,
+the DREAM code and OpenSpiel differ: `docs/superpowers/specs/2026-10-08-nfsp-design.md`.
+
 ESCHER's paper has no deep Leduc results. Its Leduc experiment is tabular with oracle history
 values (`python -m headsup.algos.oracle`, 500 trajectories per iteration, 1000 iterations):
 
