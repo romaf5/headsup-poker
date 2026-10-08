@@ -2768,11 +2768,33 @@ struct Abstraction {
     const std::vector<float>& ed = edges[round];
     return int(std::upper_bound(ed.begin(), ed.end(), e) - ed.begin());
   }
+  // The buckets of all 1326 hands on a board (hands blocked by it: 0), cached per board: a query for every hand of
+  // a public state (LBR, search) pays for the 1326 estimates once.  The same buckets as bucket() hand by hand.
   template <class RNG>
+  const std::vector<uint16_t>& all_buckets(int round, const int* board, RNG& rng) const {
+    if (table_mode) return table_buckets(round, board, rng);
+    const int n = BOARD_CARDS_BY_STAGE[round], code = board_code(board, n);
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex[round]);
+      auto it = cache[round].find(code);
+      if (it != cache[round].end()) return it->second;
+    }
+    std::vector<uint16_t> b(NUM_COMBOS, 0);
+    for (int lo = 0; lo < NUM_CARDS; ++lo)
+      for (int hi = lo + 1; hi < NUM_CARDS; ++hi) {
+        bool blocked = false;
+        for (int i = 0; i < n; ++i) blocked |= board[i] == lo || board[i] == hi;
+        if (!blocked) b[combo_index(lo, hi)] = uint16_t(bucket(round, lo, hi, board, rng));
+      }
+    std::lock_guard<std::mutex> lock(cache_mutex[round]);
+    return cache[round].emplace(code, std::move(b)).first->second;
+  }
+
   // The bucket is a function of the cards alone ("each information situation is put into one of 200 buckets"):
   // the Monte-Carlo hand strength draws from a generator seeded by the hand and the board, so training, a single
   // query and a query for all 1326 hands of a public state agree (a fresh estimate per lookup moved the same
   // situation over ~20 neighbouring buckets).
+  template <class RNG>
   int bucket(int round, int c0, int c1, const int* board, RNG& rng) const {
     if (round == 0) return preflop_index(c0, c1);
     const int lo = std::min(c0, c1), hi = std::max(c0, c1), n = BOARD_CARDS_BY_STAGE[round];
@@ -3516,12 +3538,10 @@ PYBIND11_MODULE(headsup_cpp, m) {
         auto o = out.mutable_unchecked<2>();
         py::gil_scoped_release release;
         std::mt19937_64 rng(seed);
-        std::vector<float> row(b.n_actions), all;
+        std::vector<float> row(b.n_actions);
         const int nb = BOARD_CARDS_BY_STAGE[round];
-        // many hands on a complete board: the exact equities of all combos at once (before the last card every hand
-        // has its own seeded estimate, see Abstraction::bucket - a query must find the buckets training used)
-        const bool vector_path = round > 0 && n >= 64 && !b.abs.table_mode && nb == b.abs.showdown;
-        if (vector_path) b.abs.ehs_all(bd, nb, 1, rng, all);
+        // many hands of one public state: the board's buckets for all combos, computed once and cached
+        const std::vector<uint16_t>* all = round > 0 && n >= 64 ? &b.abs.all_buckets(round, bd, rng) : nullptr;
         for (int i = 0; i < n; ++i) {
           bool blocked = h(i, 0) == h(i, 1);
           for (int k = 0; k < nb; ++k) blocked |= (bd[k] == h(i, 0) || bd[k] == h(i, 1));
@@ -3529,13 +3549,8 @@ PYBIND11_MODULE(headsup_cpp, m) {
             for (int a = 0; a < b.n_actions; ++a) o(i, a) = 0.0f;
             continue;
           }
-          int key;
-          if (vector_path) {
-            const int lo = std::min(h(i, 0), h(i, 1)), hi = std::max(h(i, 0), h(i, 1));
-            key = b.abs.bucket_of(round, all[combo_index(lo, hi)]);
-          } else {
-            key = b.abs.bucket(round, h(i, 0), h(i, 1), bd, rng);
-          }
+          const int key = all ? (*all)[combo_index(std::min(h(i, 0), h(i, 1)), std::max(h(i, 0), h(i, 1)))]
+                              : b.abs.bucket(round, h(i, 0), h(i, 1), bd, rng);
           b.strategy_at(node, key, current, row.data());
           for (int a = 0; a < b.n_actions; ++a) o(i, a) = row[a];
         }
