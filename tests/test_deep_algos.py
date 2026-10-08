@@ -254,6 +254,45 @@ def test_leduc_report_tabulates_pdcfr_runs_by_episodes(tmp_path):
     assert PDCFR_PAPER[("pdcfrk", "dcfr+")][9.5e6] == pytest.approx(5.3)
 
 
+def test_leduc_report_tabulates_rebel_runs_and_labels_its_references(tmp_path):
+    import json
+
+    from headsup.algos.leduc_report import REBEL_EXACT_LEAVES, REBEL_FULL_LCFR, rebel_references, rebel_table
+
+    for seed, shift in ((0, 0.0), (1, 0.002)):
+        curve = [{"epoch": e, "examples": 7000 * e, "sgd_steps": 50 * e, "games": 2048 * e, "exploitability": 0.5 / e + shift,
+                  "exploitability_sampled": 0.6 / e + shift, "samples": 1024, "exploitability_unsafe": 0.7 / e, "root_value": -0.08,
+                  "value_error": 1.0 / e, "value_error_search": None, "loss": 0.1, "seconds": 3.0 * e} for e in (1, 25, 50, 75, 100)]
+        (tmp_path / f"leduc_s{seed}.json").write_text(json.dumps({"game": "leduc", "algo": "rebel", "curve": curve[: 5 - seed]}))
+    lines = rebel_table(str(tmp_path / "leduc_s*.json"), epochs=(1, 50, 100)).splitlines()
+    assert lines[0] == "| epoch (2 runs) | 1 | 50 | 100 | last 3 evaluations |"
+    # mA/g; the last column: each run's mean over its last three evaluations (seed 0: epochs 50-100, seed 1: 25-75)
+    tail = [1000 * np.mean([0.5 / e + shift for e in epochs]) for epochs, shift in (((50, 75, 100), 0.0), ((25, 50, 75), 0.002))]
+    assert lines[2] == ("| policy played in expectation (exact mixture over the stopping steps) | 501.0 ± 1.4 | 11.0 ± 1.4 | 5.0 | "
+                        f"{np.mean(tail):.1f} ± {np.std(tail, ddof=1):.1f} |")
+    assert lines[3].startswith("| average of K = 1024 sampled playthrough policies (the paper's protocol) | 601.0 ± 1.4 |")
+    assert "| 700.0 ± 0.0 | 14.0 ± 0.0 | 7.0 |" in lines[4] and "unsafe" in lines[4]
+    assert lines[6].endswith("| – | – | – | – |")  # a quantity the runs do not have
+    assert lines[8].startswith("| training examples generated, thousands | 7.0 ± 0.0 | 350.0 ± 0.0 | 700.0 |")
+    head = rebel_table(str(tmp_path / "leduc_s*.json")).splitlines()[0]
+    assert head.startswith("| epoch (2 runs) | 1 | 25 | 50 | 75 | last 3")  # the epochs every run has
+    assert rebel_table(str(tmp_path / "none_s*.json")).startswith("(no runs match")
+    oracle = {"curve": [{"iters": 1024, "exploitability": 0.0221, "exploitability_unsafe": 0.0545}]}
+    (tmp_path / "oracle_T1024.json").write_text(json.dumps(oracle))
+    ref = rebel_references(str(tmp_path / "oracle_T*.json")).splitlines()
+    assert ref[0] == "| search steps T (T / 2 updates per player) | 64 | 128 | 256 | 512 | 1024 | 2048 |"
+    assert ref[2] == "| full-game tabular Linear CFR, average strategy (ours) | 139.5 | 55.6 | 41.0 | 16.2 | 10.6 | 5.2 |"
+    assert ref[3] == ("| search with exact leaf values, random-iterate mixture (the brief's prototype) "
+                      "| 134.9 | 80.1 | 49.9 | 32.7 | 21.8 | 14.0 |")
+    assert ref[5] == "| search with exact leaf values, random-iterate mixture (ours, `--oracle`) | – | – | – | – | 22.1 | – |"
+    assert ref[6].endswith("| – | – | – | – | 54.5 | – |")
+    pinouche = [line for line in ref if line.startswith("| pinouche/poker_self_play")]
+    assert "third party" in pinouche[0] and pinouche[0].endswith("| 58.5 | 46.6 | 26.9 | 16.4 |")
+    assert pinouche[1].endswith("| 57.1 | 49.7 | 39.2 | 29.3 |")
+    assert ref[-1].startswith("| Student of Games, Fig. 3A") and ref[-1].endswith("| ~200 | ~105 | ~55 | ~22 |")
+    assert REBEL_EXACT_LEAVES[1024] == (21.8, 53.5) and REBEL_FULL_LCFR[1024] == 10.6
+
+
 def test_current_policy_is_the_strategy_the_solver_plays():
     """current_policy() used the uniform fallback while the traversals use the solver's (argmax by default): the
     'current' exploitability column described a strategy that was never played."""

@@ -98,6 +98,23 @@ Written against the authors' code; the deviations from the paper's text and from
 rule, both fits and the average-policy fit with the authors' code (120k Leduc episodes, 20,000 random strategy cases,
 losses equal to 15 digits) and found no difference.
 
+## ReBeL (`headsup.algos.rebel`, Leduc and Kuhn)
+
+Written against the official Liar's Dice code (facebookresearch/rebel) where the paper leaves a choice open, and
+against the paper's poker appendix and the authors' answers (issue #20) for the board card, which Liar's Dice does not
+have. `docs/superpowers/specs/2026-10-08-rebel-design.md` has the table of paper-vs-code differences and the list of
+deviations. In short:
+
+| item | status |
+|---|---|
+| Stopping step: uniform over all steps in self-play, the average's weights (even steps, weight j + 1) at test time; "1024 iterations" = 512 updates per player; regrets and ranges smoothed with 1e-80; the loss is twice the textbook Huber. | **by choice** - the official code, where the paper's text and its two algorithm listings disagree; `--train-stop`, `--regret-floor` |
+| Card removal, which the Liar's Dice code does not need: the self-play walk draws the action from the actor's hand given both ranges, the board card comes from the PBS, values before the card average the values after it with the surviving opponent mass. | **by choice** - exact against enumeration (`test_ranges_after_actions_and_the_board_card_match_brute_force`, `test_profile_values_match_the_game`) |
+| One root solve per network version instead of one per playthrough (the root PBS is fixed, CFR is deterministic); every reached end-of-round PBS becomes an example (the paper: one in three). | **by choice** - the same distribution, less compute |
+| Minibatches per epoch and learning rate (200, 1e-3 halved every 100 epochs; official Liar's Dice: 50, 3e-4 halved every 400). | **by choice** - measured on Leduc; the official values are flags |
+| Evaluation: exact exploitability of the policy played in expectation, next to the paper's average of 1 024 sampled playthroughs. | checked - the sampled number is an upper bound in expectation (measured: K = 16 / 64 / 256 / 1024 = 244 / 158 / 136 / 129 against 127 exact) |
+| No Leduc result is published. Search with exact leaf values reaches 22.1 mA/g at 1024 steps (unsafe search: 54.5). | checked (`python -m headsup.algos.rebel --game leduc --oracle`) |
+| CFR-AVG, the policy network and warm start, subgames cut after a number of actions, hold'em. | **open** - not implemented |
+
 ## Pluribus-style blueprint, search and LBR
 
 Consistent with the paper: the MCCFR-P update rule, regret matching, the shape of the pruning rule and the floor ratio,
