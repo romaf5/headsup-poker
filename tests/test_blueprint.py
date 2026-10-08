@@ -163,3 +163,18 @@ def test_public_states_are_grouped_exactly():
         rows[i, 6:18] = CARD_FEATURES[board].reshape(12)
     first, inverse = public_groups(rows)
     assert len(first) == 2 and inverse[0] == inverse[2] != inverse[1]
+
+
+def test_average_strategy_mode_is_selectable_and_recorded(tmp_path):
+    """--strategy-every only matters for Pluribus's sampled action counters, which were not selectable from the
+    command line (the default accumulates sigma at every sampled opponent infoset, where the option is inert)."""
+    from headsup.blueprint import TabularBlueprint, main
+
+    common = ["--game", "fhp", "--iterations", "2000", "--threads", "2", "--buckets", "8", "--samples", "20", "--situations", "400",
+              "--chunks", "1", "--eval-hands", "0"]
+    main(common + ["--out", str(tmp_path / "dense.pt")])
+    main(common + ["--average", "counters", "--strategy-every", "7", "--out", str(tmp_path / "counters.pt")])
+    dense, counters = TabularBlueprint.load(tmp_path / "dense.pt"), TabularBlueprint.load(tmp_path / "counters.pt")
+    assert dense.params["dense_average"] is True
+    assert counters.params["dense_average"] is False and counters.params["strategy_interval"] == 7
+    assert np.asarray(counters.cpp.phi).sum() > 0 and np.asarray(dense.cpp.phi).sum() > 0

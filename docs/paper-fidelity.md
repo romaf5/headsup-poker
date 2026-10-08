@@ -81,7 +81,7 @@ Open, about the paper's own figures:
 |---|---|
 | Vanilla CFR, CFR+, Linear CFR, DCFR: equal to OpenSpiel's solvers to 1e-11. MCCFR external / outcome sampling: unbiased against enumeration. | checked |
 | DCFR+ / PDCFR+ (Xu et al. 2024): PDCFR+ predicted with the discount of the current iteration for a player already updated in it. | **fixed** - equal to an independent implementation of the paper's equations to 2.5e-13 |
-| PCFR+: the prediction is the last instantaneous regret (as Xu et al.), not Farina et al.'s construction (Leduc at 1000 iterations: 7.1e-4 against 3.3e-4). | **open** |
+| PCFR+: the prediction is the last instantaneous regret, as in Xu et al.'s PDCFR+ code that our DCFR+ / PDCFR+ follow, not Farina et al.'s bottom-up construction (Leduc at 1000 iterations: 7.1e-4 against 3.3e-4). | **by choice** - one prediction rule for the whole predictive family |
 | Small-game MCCFR pruning: the 95 % draw was per node, without Pluribus's exemptions for the last round and terminal-leading actions, and without a regret floor. | **fixed** - `test_mccfr_pruning_follows_the_pluribus_rule` |
 
 ## Deep (Predictive) Discounted CFR (`headsup.algos.pdcfr`)
@@ -114,10 +114,10 @@ Open (the next batch of work; these change how the `pluribus` bot plays and need
    negative regret is -1.39e6. The shipped blueprint is Linear MCCFR without pruning.
 7. **Average strategy**: reach-weighted at every sampled opponent infoset on every round (better in our measurement:
    508 / 541 against 629 / 663 mbb/g with Pluribus's counters every 10,000 iterations), not Algorithm 1's round-1
-   counters plus later-round snapshots; `--strategy-every` has no effect under this default.
+   counters plus later-round snapshots. By choice; `--average counters --strategy-every N` selects the counters.
 8. **Depth-limited mode** (`search:<net>` without `@pluribus`): one sampled continuation by default, where both papers
    warn about fixed leaf values and use four; it plays the average rather than the final iterate; `@leaf4` cannot be used
    with a tabular blueprint.
-9. Linear-CFR / pruning schedule: 40 % / 20 % of the run against Pluribus's 3.5 % / 1.7 %, and the help text misstates
-   Pluribus's.
+9. Linear-CFR / pruning schedule: 40 % / 20 % of the run against Pluribus's 3.5 % / 1.7 % (the help text now gives
+   Pluribus's proportions; the defaults are unchanged until a blueprint trained with them has been measured).
 10. LBR: flop equities from 200 Monte-Carlo runouts (paper: exhaustive), no round-restricted variants.

@@ -7,10 +7,16 @@ runouts on the flop / turn, exact on the river) on the later rounds - equal-widt
 of situations rather than Pluribus's k-means over equity distributions.  Training: external-
 sampling MCCFR with unweighted regret updates and periodic linear discounting (Linear MCCFR),
 negative-regret pruning of the traverser's actions in 95 % of iterations after a warm-up (never
-on the last round or into terminals), a regret floor, the average strategy from sampled action
-counters (UPDATE-STRATEGY every 10 000 iterations - on every round here, Pluribus only tracks
-the first round and averages later-round snapshots).  Iterations play the role of Pluribus's
-minutes.  Threads share the tables (benign races).
+on the last round or into terminals), a regret floor.  The average strategy is accumulated at every
+sampled opponent infoset on every round (``--average dense``, the default: a reach-weighted
+average, and the better one in our measurements); ``--average counters`` = Algorithm 1's sampled
+action counters (UPDATE-STRATEGY every ``--strategy-every`` iterations - on every round here, where
+Pluribus tracks the first round only and averages snapshots of the later ones).  Iterations play
+the role of Pluribus's minutes.  Threads share the tables (benign races).
+
+Not as in the paper (see docs/paper-fidelity.md): the default schedule discounts over 40 % of the
+run and prunes from 20 % (Pluribus: about 3.5 % and 1.7 % of its 8 days), and the pruning threshold
+is scaled by the stack only, so it is not reached at budgets of tens of millions of iterations.
 
     python -m headsup.blueprint --game nlhe --iterations 10000000 --threads 32 --out runs/bp/blueprint.pt
     python -m headsup.compare tab:runs/bp/blueprint.pt cfr:runs/x/policy.pth --hands 200000
@@ -237,13 +243,19 @@ def main(argv=None):
                         "k-means buckets, cached per board (potential-aware, no noise)")
     p.add_argument("--completions", type=int, default=300, help="table: sampled completions per flop board (turn: all rivers)")
     p.add_argument("--situations", type=int, default=200_000, help="random situations per round to fit the buckets (table: / 1326 boards)")
-    p.add_argument("--lcfr", type=float, default=0.4, help="fraction of the iterations with linear discounting (Pluribus: 400 of 800+ minutes)")
-    p.add_argument("--discount-every", type=float, default=0.01, help="discount interval as a fraction of the iterations (Pluribus: 10 of 400 minutes)")
-    p.add_argument("--prune-after", type=float, default=0.2, help="start pruning after this fraction of the iterations (Pluribus: 200 minutes)")
+    p.add_argument("--lcfr", type=float, default=0.4,
+                   help="fraction of the iterations with linear discounting (Pluribus: the first 400 minutes of ~11,500, i.e. 0.035)")
+    p.add_argument("--discount-every", type=float, default=0.01,
+                   help="discount interval as a fraction of the iterations (Pluribus: every 10 minutes, i.e. 0.00087; 40 discounts either way)")
+    p.add_argument("--prune-after", type=float, default=0.2,
+                   help="start pruning after this fraction of the iterations (Pluribus: after 200 minutes, i.e. 0.017)")
     p.add_argument("--no-prune", action="store_true")
+    p.add_argument("--average", default="dense", choices=["dense", "counters"],
+                   help="average strategy: dense = sigma added at every sampled opponent infoset (reach-weighted; default) | counters = "
+                        "Pluribus's sampled action counters, updated every --strategy-every iterations")
     p.add_argument("--strategy-every", type=int, default=None,
-                   help="UPDATE-STRATEGY interval in iterations (Pluribus: 10 000 of ~1e9+; default: iterations / 1 000 000, at least 1 - "
-                        "the sampled counters need many visits per infoset to be a precise average)")
+                   help="--average counters: UPDATE-STRATEGY interval in iterations (Pluribus: 10 000 of ~1e9+; default: iterations / "
+                        "1 000 000, at least 1 - the sampled counters need many visits per infoset to be a precise average)")
     p.add_argument("--chunks", type=int, default=20, help="training chunks (checkpoint + evaluation after each)")
     p.add_argument("--eval-hands", type=int, default=50_000)
     p.add_argument("--seed", type=int, default=0)
@@ -263,7 +275,8 @@ def main(argv=None):
     bp = TabularBlueprint(game, args.buckets, args.samples, args.abstraction, args.completions)
     bp.configure(lcfr_iterations=int(args.lcfr * args.iterations), discount_interval=max(1, int(args.discount_every * args.iterations)),
                  prune_after=0 if args.no_prune else int(args.prune_after * args.iterations),
-                 strategy_interval=args.strategy_every or max(1, args.iterations // 1_000_000))
+                 strategy_interval=args.strategy_every or max(1, args.iterations // 1_000_000),
+                 dense_average=args.average == "dense")
     print(f"{args.game}: {bp.cpp.num_nodes} public nodes, {bp.cpp.num_infosets:,} infosets; params {bp.params}", flush=True)
     t0 = time.perf_counter()
     bp.fit_abstraction(args.situations, args.seed, args.threads)
