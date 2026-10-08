@@ -43,8 +43,15 @@ Open, about the paper's own figures:
 - Its FHP figures are not mutually consistent with "K = 10,000 traversals, 4,000 SGD steps": Fig. 2 is the K = 10k line of
   Fig. 3-left (154 / 70 / 51 / 40 / 40 mbb/g at t = 50 / 100 / 200 / 300 / 450), while the SGD-step sweep and Fig. 4 start
   much lower (231-415 at t = 10 against 770), i.e. were run at 1e5-1e6 traversals. All K from 3k to 1M end at 34-46.
-- It touches 0.94-1.23e6 nodes per iteration at K = 10k; we measured 2-5e5 on the old three-bet flop. To be re-measured on
-  the four-bet game.
+- It touches 0.94-1.23e6 nodes per iteration at K = 10k (Fig. 2 against Fig. 3-left, from the first iteration on). On the
+  four-bet game an external-sampling traversal under uniform play visits 24.6 histories as the small blind and 16.0 as
+  the big blind (decision, terminal and flop chance nodes; 5.0 / 3.4 of them are the traverser's infosets), i.e. 4.1e5 per
+  iteration at K = 10k per player, and 4.6-5.5e5 during training: the paper's "10,000 traversals" touch 2.2-2.5 times
+  more nodes than ours. The tree is the same (its infoset counts are reproduced), so either the count or K means
+  something else there.
+- Its SGD-step sweep (Fig. 3-middle) ends at about 65 mbb/g for 4,000 steps (110 / 80 / 65 / 43 / 37 / 35 for 1k ... 32k),
+  the traversal sweep (Fig. 3-left, nominally 4,000 steps) at 34-46 for every K: the headline 37-40 is the level of the
+  sweep's 8,000-32,000-step runs.
 - **The FHP reproduction itself is open.** The earlier 80 mbb/g (total, 450 iterations) was measured on the three-bet
   flop with the narrow network and raw weights; it has to be re-run.
 
