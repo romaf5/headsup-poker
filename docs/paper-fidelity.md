@@ -126,6 +126,7 @@ Open, about the paper's own figures:
     | 4,000 steps (the run itself) | 74.8 | 30.1 | 47.7 |
     | 4,000 steps, `--weight-average 0.998` | 72.7 | 20.3 | 52.3 |
     | 8,000 steps | 60.8 | 22.6 | 42.4 |
+    | 16,000 steps | 58.1 | 22.6 | 39.1 |
 
     The pre-flop part stays at 26-31 from iteration 200 on in every 4,000-step run, with 10,000 or 25,000 traversals;
     weight averaging (less refit noise) lowers it by a third and more steps lower both parts.
@@ -138,8 +139,25 @@ Open, about the paper's own figures:
   - *Ruled out.* Suit symmetry: single iterates are not symmetric (isomorphic infosets differ by 0.12-0.15 in L1), but
     a network fed suit-canonical cards fits no better (held-out loss 39,746 against 39,398;
     `docs/analysis/fhp_canonical_suits_fit.py`).
-  - *Open.* A from-scratch run with 16,000 steps per fit (`runs/fhp4_k25_steps16k`), the configuration whose curve in
-    the paper's sweep ends at 37.
+  - *16,000 steps from scratch do not reach the paper.* `runs/fhp4_k25_steps16k`: 136 / 87 / 68 at t = 100 / 200 / 300
+    (4,000 steps: 117 / 91 / 69; the paper's 16,000-step curve: 55 / 42 / 42). More steps pay late - the 4,000-step run
+    rises again from 69 to 75 between t = 300 and 450, the branches fall to 58-61 - but not to 37.
+  - *An independent re-implementation is in the same place.* Liu et al. (Neural ReCFR-B, arXiv 2012.01870) implement
+    Deep CFR on OpenSpiel "with the hyper-parameters given in" the paper (10,000 traversals, 4,000 steps of 10,000,
+    40 M memories) and report 47.0 mbb/g after 6.0e8 nodes touched, rising to 73.0 at 1.3e9. The paper's curve is at 37-40
+    after 3.3-4.3e8 nodes. By nodes our 10,000-traversal run is at 78 after 1.9e8 nodes and falling like t^-0.5
+    (113 / 95 / 78 at t = 200 / 300 / 450), which extrapolates to their value; `runs/fhp4_paper_long` continues it to
+    1,500 iterations (6e8 nodes) with 40 M advantage memories.
+  - *What the remaining error is not.* Memory size: 6 M instead of 24 M memories give 128 / 97 instead of 117 / 91 at
+    t = 100 / 200 (`runs/fhp4_k25_mem6m`). Independent noise of a run: the mixture of the t = 300 policies of two
+    independent runs (69.2 and 67.9) has 63.7 (`docs/analysis/fhp_ensemble_br.py`) - the weaknesses are shared. The
+    card embeddings: without the per-card table, or with twice the width, the fit changes by < 0.5 % in held-out loss.
+    Rare situations: with deviations at one kind of decision node only (`holdem_br`'s `br_filter`,
+    `docs/analysis/fhp_br_by_node.py`), the 75 of the 25,000-traversal run come from the most frequent decisions -
+    the small blind's first action 15.1, the big blind facing a raise 11.1, the first flop action 12.9, facing a flop
+    bet 10.5 / 9.5, after a flop check 7.6 - and next to nothing from re-raised pots (0-3 each).
+  - *Open.* The precision of the regret network at the best-sampled decisions: 8,000 steps with weight averaging from
+    scratch (`runs/fhp4_k25_8k_ema`), and the long run above.
 
 ## DREAM and ESCHER
 
