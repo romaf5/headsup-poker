@@ -243,6 +243,7 @@ average on 2,000 sampled flops, which overstates by ~8 %):
 | ours, 10,000 traversals: policy net | | 202 | 113 | 95 | **78** |
 | ours, 10,000 traversals: SD-CFR average | 367 | 199 | | | |
 | ours, 25,000 traversals: SD-CFR average | 178 | 121 | | | |
+| ours, 25,000 traversals: policy net | | 117 | 91 | 69 | **75** |
 | ours, 25,000 traversals, tighter fit (below): SD-CFR average | 234 | 134 | | | |
 
 Two things were measured about the gap. The paper's "10,000 traversals" touch 2.4 times the nodes of ours per
@@ -254,8 +255,12 @@ ends near 65, not 40. `--batch-size 40000 --lr 3e-3 --lr-schedule cosine` gets t
 the paper's cost on that memory (iteration 125) - but it does not help early: with it the 25,000-traversal run is at
 234 / 134 after 50 / 100 iterations instead of 178 / 121, because a tighter fit also follows the noise of the small
 early memories (our earlier 16,000-step runs were likewise worse before iteration 100 and better from about 200).
-Whether it lowers the floor at 300-450 iterations has not been run. The 450-iteration result with the paper's settings,
-78, is where the three-bet runs ended too (80-86): the game and network corrections did not move the floor. `--weight-average` and `--policy-lr` are the related options. Details,
+The 450-iteration result with the paper's settings, 78, is where the three-bet runs ended too (80-86), and 25,000
+traversals end at 75: as in the paper, the final level does not depend on the traversal count - but ours is the level of
+the paper's 4,000-step sweep curve (65), not of its headline (40), whose "default" replicates (Fig. 4) coincide with
+the sweep's 16,000-32,000-step curves. The fit budget moves our floor the same way: continuing the 25,000-traversal
+run from iteration 325 to 450 with 1,000 / 4,000 / 8,000 SGD steps per fit ends at 90 / 75 / 61. A from-scratch run
+with 16,000 steps is the open reproduction (`runs/fhp4_k25_steps16k`). `--weight-average` and `--policy-lr` are the related options. Details,
 the street split of the error and the fit benchmark: [docs/paper-fidelity.md](docs/paper-fidelity.md).
 
 Every known difference between this code and the papers (fixed, chosen, or still open) is listed in

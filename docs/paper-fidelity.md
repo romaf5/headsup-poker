@@ -64,6 +64,7 @@ Open, about the paper's own figures:
   | ours, 10,000 traversals: SD-CFR average | 367 | 199 | | | |
   | ours, 10,000 traversals, `--masked-loss`: policy net (stopped at 300) | | 206 | 129 | 101 | |
   | ours, 25,000 traversals: SD-CFR average | 178 | 121 | | | |
+  | ours, 25,000 traversals: policy net | | 117 | 91 | 69 | 75 |
   | ours, 25,000 traversals, batch 40,000 + cosine from 3e-3: SD-CFR average | 234 | 134 | | | |
 
   The 450-iteration policy net (77.7, exact) is where the runs on the three-bet flop with the earlier network ended
@@ -105,8 +106,40 @@ Open, about the paper's own figures:
     iteration 1 the memory holds ~125,000 samples and 4,000 batches of 40,000 pass over it 1,280 times; the fit then
     reproduces the sampled regrets, noise included. The runs of September with 16,000 steps (three-bet game) showed
     the same shape - 276 / 145 / 87 at t = 50 / 100 / 200 against 179 / 116 / 96 - i.e. a tighter fit pays only once
-    the memories are large. A fit whose budget grows with the memory, and the floor at 300-450 iterations with the
-    tighter fit, are the open experiments (`runs/scripts/fhp_long.sh` is the prepared full-length run).
+    the memories are large.
+  - *The traversal count, cross-checked.* The DREAM paper (Steinberger, Lerer, Brown) runs this setup with public code:
+    10,000 external-sampling traversals, 4,000 batches of 10,000 (`FHP_ES.py`, `HYPERS.py`). Its FHP figure advances
+    by 0.245e8 nodes per 60 iterations, i.e. 4.1e5 nodes per iteration - ours (4.1e5 under uniform play). So our
+    traversals are the usual ones, and the Deep CFR paper's run saw 2.5 times more per iteration.
+  - *The floor does not depend on the traversals.* 25,000 traversals end at 75 after 450 iterations (69 at 300),
+    10,000 at 78: "the same final exploitability" as in the paper - but at the level of its 4,000-step sweep curve.
+  - *The paper's default is not its 4,000-step curve.* In Fig. 3-middle 4,000 steps end at 65 (1,000: 110, 8,000: 43,
+    16,000: 37, 32,000: 35, all started with many traversals: 230-420 at t = 10). The "Deep CFR (5 replicates)" of
+    Fig. 4 and the large-K curves of Fig. 3-left, nominally the same configuration, end at 34-40: they coincide with
+    the sweep's 16,000-32,000-step curves. The text speaks of "reducing the number of SGD steps" from the default.
+  - *The fit budget moves our floor the same way.* The 25,000-traversal run, continued from its checkpoint at
+    t = 325 to 450 with another fit (exact total; street splits on 2,000 flops):
+
+    | fit of the last 125 iterations | total at t = 450 | pre-flop deviations only | flop deviations only |
+    |---|---|---|---|
+    | 1,000 steps | 90.3 | 29.8 | 64.3 |
+    | 4,000 steps (the run itself) | 74.8 | 30.1 | 47.7 |
+    | 4,000 steps, `--weight-average 0.998` | 72.7 | 20.3 | 52.3 |
+    | 8,000 steps | 60.8 | 22.6 | 42.4 |
+
+    The pre-flop part stays at 26-31 from iteration 200 on in every 4,000-step run, with 10,000 or 25,000 traversals;
+    weight averaging (less refit noise) lowers it by a third and more steps lower both parts.
+  - *Pre-flop is limited by the fit, not by the data.* The memories hold thousands of samples per pre-flop infoset, so
+    the mean regret can be tabulated (`docs/analysis/fhp_preflop_tabulation.py`). At t = 450 its standard error is
+    2.2-3.1 chips; the last network is 5.9-8.9 chips away from it and two consecutive networks 6.4-8.9 chips from
+    each other, while the two best actions are less than 10 chips apart in 52-79 % of the infosets: regret matching
+    on the network picks another most-likely action than the tabulated regrets in 15-17 % of them. The policy network
+    reproduces the tabulated average strategy to 0.03 in L1.
+  - *Ruled out.* Suit symmetry: single iterates are not symmetric (isomorphic infosets differ by 0.12-0.15 in L1), but
+    a network fed suit-canonical cards fits no better (held-out loss 39,746 against 39,398;
+    `docs/analysis/fhp_canonical_suits_fit.py`).
+  - *Open.* A from-scratch run with 16,000 steps per fit (`runs/fhp4_k25_steps16k`), the configuration whose curve in
+    the paper's sweep ends at 37.
 
 ## DREAM and ESCHER
 
