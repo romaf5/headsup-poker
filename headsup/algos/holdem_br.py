@@ -317,16 +317,19 @@ def parse_cards(text):
 
 
 class VectorBestResponse:
-    def __init__(self, policy, game, cards="all", chunk=32, seed=0, allin_boards=2000, br_stages=None):
+    def __init__(self, policy, game, cards="all", chunk=32, seed=0, allin_boards=2000, br_stages=None, br_filter=None):
         """``cards``: "all" to enumerate every street's cards, k = cards sampled per public state and
         street (the flop: k flops; turn / river: k cards each, nested), or a tuple per street;
         ``chunk``: boards per batch; ``allin_boards``: sampled boards for pre-flop all-in equities;
         ``br_stages``: the streets (0 = pre-flop, ...) on which the responder deviates - elsewhere it plays the
         policy, so the result splits the exploitability by street (None = all streets, the best response).  Off the
         policy's own path (after a deviation to an action it never takes) the responder plays the policy's strategy
-        there - for a mixture the weight-averaged component strategies (its realisation weights are 0 there)."""
+        there - for a mixture the weight-averaged component strategies (its realisation weights are 0 there).
+        ``br_filter(node) -> bool``: the same for any choice of decision nodes (``node.engine`` is the public state
+        there, ``node.stage`` its street): which situations a strategy loses in."""
         self.policy, self.game = policy, game
         self.br_stages = None if br_stages is None else set(br_stages)
+        self.br_filter = br_filter
         self.dev = policy.device
         self.cards = cards
         self.chunk = chunk
@@ -416,7 +419,7 @@ class VectorBestResponse:
                 sig = self.policy.strategies(seat, self._obs(nd.engine, seat, boards), legal)
                 self.queries += 1
                 sig = sig.reshape(self.policy.T, B, NUM_COMBOS, -1)
-                if self.br_stages is not None:
+                if self.br_stages is not None or self.br_filter is not None:
                     behaviour[i] = torch.einsum("t,tbha->bha", w, sig) / W
                 for a, c in nd.children.items():
                     child = [r[0], r[1]]
@@ -447,7 +450,7 @@ class VectorBestResponse:
                     if nd.player == p:
                         rp = real[p][i]
                         onp[i] = sum(torch.where(rp > 0, real[p][c] / rp.clamp(min=1e-30), 0.0) * onp[c] for c in kids)
-                        if self.br_stages is None or nd.stage in self.br_stages:
+                        if (self.br_stages is None or nd.stage in self.br_stages) and (self.br_filter is None or self.br_filter(nd)):
                             br[i] = torch.stack([br[c] for c in kids]).amax(0)
                         else:  # the responder follows the policy here (its behaviour strategy where its own reach is 0)
                             br[i] = sum(torch.where(rp > 0, real[p][c] / rp.clamp(min=1e-30), behaviour[i][..., a]) * br[c]

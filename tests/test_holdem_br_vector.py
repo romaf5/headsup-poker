@@ -160,3 +160,30 @@ def test_fhp_cfr_rejects_other_games():
 
     with pytest.raises(ValueError, match="FHP"):
         FHPCFR("cpu", game=make_holdem("hulh"))
+
+
+def test_br_filter_restricts_the_responder_to_chosen_decision_nodes():
+    """Where does a strategy lose?  ``br_filter(node) -> bool`` lets the responder deviate at the chosen decision nodes
+    only (it plays the policy elsewhere): no node = the policy's own value, every node = the best response, and the
+    street filter is the special case ``node.stage in br_stages``."""
+    import torch
+
+    from headsup.algos.holdem_br import VectorBestResponse, mixture_policy
+    from headsup.game import FHP
+    from headsup.players import make_player
+
+    flops = torch.tensor([[0, 14, 27], [5, 18, 44], [12, 25, 38]])
+    pol = mixture_policy(make_player("random", game=FHP, seed=0), torch.device("cpu"), FHP)
+
+    def run(**kw):
+        vbr = VectorBestResponse(pol, FHP, cards=3, chunk=8, **kw)
+        vbr._next_cards = lambda boards, k: (flops.repeat(len(boards), 1), torch.arange(len(boards)).repeat_interleave(len(flops)))
+        return vbr.run()
+
+    full, nowhere = run(), run(br_filter=lambda node: False)
+    assert nowhere["br_values"] == pytest.approx(nowhere["values"], abs=1e-2) and abs(nowhere["exploitability_chips"]) < 1e-2  # float32 sums
+    assert run(br_filter=lambda node: True)["br_values"] == pytest.approx(full["br_values"], rel=1e-6)
+    assert run(br_filter=lambda node: node.stage == 0)["br_values"] == pytest.approx(run(br_stages=[0])["br_values"], rel=1e-6)
+    facing = run(br_filter=lambda node: node.engine.fold_allowed)  # deviations only when facing a bet
+    assert all(nowhere["br_values"][p] - 1e-6 <= facing["br_values"][p] <= full["br_values"][p] + 1e-6 for p in (0, 1))
+    assert facing["exploitability_chips"] > 1.0  # the random player is exploitable there
