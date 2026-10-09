@@ -805,3 +805,18 @@ def test_policy_fit_has_its_own_learning_rate(tmp_path, monkeypatch):
     seen.clear()
     train.main(["--algo", "both", "--iterations", "1", "--lr", "0.003", "--out", str(tmp_path / "run2")] + _TINY)
     assert seen == {"adv": 0.003, "policy": 0.003}  # default: the same rate
+
+
+def test_strategy_memory_can_live_on_another_device_than_the_advantage_memories(tmp_path):
+    """The paper's 40 M-sample memories: two advantage memories fill a 24 GB card; the strategy memory, read only for the
+    policy fits, can stay in host RAM (--strat-memory-device)."""
+    import headsup.deepcfr.train as train
+
+    assert train.cli_args(_TINY).strat_memory_device is None
+    args = train.cli_args(["--algo", "both", "--iterations", "1", "--strat-memory-device", "cpu", "--out", str(tmp_path / "run")] + _TINY)
+    trainer = train.DeepCFRTrainer(args)
+    assert trainer.strat_memory.device == torch.device("cpu") and trainer.strat_memory.sample_device == trainer.device
+    assert all(m.device == trainer.device for m in trainer.adv_memory)
+    args = train.cli_args(["--algo", "both", "--iterations", "1", "--memory-device", "cpu", "--out", str(tmp_path / "run2")] + _TINY)
+    trainer = train.DeepCFRTrainer(args)  # without the option the strategy memory follows --memory-device
+    assert trainer.strat_memory.device == torch.device("cpu") and all(m.device == torch.device("cpu") for m in trainer.adv_memory)

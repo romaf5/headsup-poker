@@ -293,8 +293,9 @@ class DeepCFRTrainer:
                             legal_dim=num_actions if self.masked_loss else 0)
             for i in range(2)
         ]
+        strat_dev = torch.device(args.strat_memory_device) if getattr(args, "strat_memory_device", None) else mem_dev
         self.strat_memory = (
-            ReservoirBuffer(args.strat_capacity, mem_dev, obs_dim=obs_dim, target_dim=num_actions, seed=args.seed + 2, sample_device=self.device,
+            ReservoirBuffer(args.strat_capacity, strat_dev, obs_dim=obs_dim, target_dim=num_actions, seed=args.seed + 2, sample_device=self.device,
                             legal_dim=num_actions if self.masked_loss else 0)
             if self.use_deepcfr else None
         )
@@ -793,6 +794,8 @@ def build_parser():
     p.add_argument("--memory-device", default=None,
                    help="where the reservoir memories live (default: the training device); 'cpu' for memories that do not "
                         "fit on the GPU (e.g. --preset paper with history features): batches are gathered in a background thread")
+    p.add_argument("--strat-memory-device", default=None,
+                   help="where the strategy memory lives (default: --memory-device); 'cpu' leaves the GPU to the advantage memories")
     p.add_argument("--adv-capacity", type=int, default=None, help="advantage memory size per seat (default 10M)")
     p.add_argument("--strat-capacity", type=int, default=None, help="strategy memory size (default 10M)")
     p.add_argument("--value-steps", type=int, default=None, help="SGD steps per advantage-net fit (default 4000)")
