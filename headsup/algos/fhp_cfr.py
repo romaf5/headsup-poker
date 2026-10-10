@@ -5,9 +5,11 @@ history, flop, hand) on the flop.  Flops are reduced to the 1 755 suit-isomorphi
 uniform strategy stays suit-symmetric, so a class representative carries its whole orbit; pre-flop values sum
 each representative's hand values over the 24 suit permutations (weighted by orbit size / 24).  Hands are
 1326-vectors on the GPU; showdowns use the sign matrices of ``headsup.algos.holdem_br``.  Alternating updates,
-regrets and average strategy weighted by t (Linear CFR), regret matching with the uniform fallback.  The
-exploitability of the average strategy is computed exactly (pre-flop best responses see no flop) and reported like
-``headsup.algos.holdem_br``: mean over seats and total, in mbb/g.
+regrets and average strategy weighted by t (Linear CFR), regret matching with the uniform fallback - or, with
+``--rm-fallback argmax``, the highest-regret action where no regret is positive: Deep CFR's rule, i.e. what Deep CFR
+computes with exact regrets instead of sampled ones fitted by a network.  The exploitability of the average strategy
+is computed exactly (pre-flop best responses see no flop) and reported like ``headsup.algos.holdem_br``: mean over
+seats and total, in mbb/g.
 
     python -m headsup.algos.fhp_cfr --iterations 50 --eval-at 5,10,20,30,50 --device cuda:0
 """
@@ -29,6 +31,7 @@ from headsup.game import FHP
 from headsup.lbr import COMBOS, NUM_COMBOS
 
 RANKS, SUITS = 13, 4
+RM_FALLBACKS = ("uniform", "argmax")
 
 
 def canonical_flops():
@@ -53,9 +56,12 @@ def hand_permutations():
 
 
 class FHPCFR:
-    def __init__(self, device=None, chunk=64, game=FHP):
+    def __init__(self, device=None, chunk=64, game=FHP, rm_fallback="uniform"):
         if not (game.limit and game.num_rounds == 2 and not game.all_in):
             raise ValueError("FHPCFR solves two-round limit games without all-ins (FHP): pre-flop + flop only")
+        if rm_fallback not in RM_FALLBACKS:
+            raise ValueError(f"rm_fallback must be one of {RM_FALLBACKS}, got {rm_fallback!r}")
+        self.rm_fallback = rm_fallback
         self.dev = get_device(device) if device is None or isinstance(device, str) else device
         self.chunk = chunk
         e = HeadsUpPoker(game=game)
@@ -88,11 +94,16 @@ class FHPCFR:
 
     # -- strategies --------------------------------------------------------------------------------
     @staticmethod
-    def _rm(R, legal):
+    def _rm(R, legal, fallback="uniform"):
         pos = R.clamp(min=0) * legal
         tot = pos.sum(-1, keepdim=True)
-        uni = legal / legal.sum()
-        return torch.where(tot > 0, pos / tot.clamp(min=1e-30), uni.expand_as(pos))
+        if fallback == "argmax":  # the highest-regret legal action; exact ties share (all-zero regrets: uniform)
+            best = R.masked_fill(legal == 0, float("-inf"))
+            top = (best == best.amax(-1, keepdim=True)).to(R.dtype)
+            other = top / top.sum(-1, keepdim=True)
+        else:
+            other = (legal / legal.sum()).expand_as(pos)
+        return torch.where(tot > 0, pos / tot.clamp(min=1e-30), other)
 
     @staticmethod
     def _avg(S, legal):
@@ -105,12 +116,13 @@ class FHPCFR:
 
     def _sigma_pre(self, i, average):
         nd = self.pre[i]
-        return (self._avg(self.S_pre[i], self._legal(nd)) if average else self._rm(self.R_pre[i], self._legal(nd)))
+        return (self._avg(self.S_pre[i], self._legal(nd)) if average else self._rm(self.R_pre[i], self._legal(nd), self.rm_fallback))
 
     def _sigma_flop(self, l, j, sl, average):
         nd = self.flop_trees[l][j]
-        T = self.S_flop if average else self.R_flop
-        return (self._avg if average else self._rm)(T[(l, j)][sl], self._legal(nd))
+        if average:
+            return self._avg(self.S_flop[(l, j)][sl], self._legal(nd))
+        return self._rm(self.R_flop[(l, j)][sl], self._legal(nd), self.rm_fallback)
 
     # -- one street pass ---------------------------------------------------------------------------
     def _flop_values(self, l, sl, reach, p, mode, t, sign):
@@ -222,10 +234,12 @@ def main(argv=None):
     p.add_argument("--eval-at", default="1,2,5,10,20,30,50")
     p.add_argument("--chunk", type=int, default=64, help="flops per batch")
     p.add_argument("--device", default=None)
+    p.add_argument("--rm-fallback", default="uniform", choices=RM_FALLBACKS,
+                   help="regret matching without a positive regret: uniform (Linear CFR) | argmax (Deep CFR's rule)")
     p.add_argument("--json", default=None)
     args = p.parse_args(argv)
     t0 = time.perf_counter()
-    cfr = FHPCFR(args.device, args.chunk)
+    cfr = FHPCFR(args.device, args.chunk, rm_fallback=args.rm_fallback)
     print(f"{len(cfr.pre)} pre-flop nodes, {len(cfr.leaves)} flop trees, {len(cfr.R_flop)} flop decision nodes, {cfr.F} flop classes "
           f"({time.perf_counter() - t0:.0f}s)", flush=True)
     evals = sorted(int(x) for x in args.eval_at.split(","))

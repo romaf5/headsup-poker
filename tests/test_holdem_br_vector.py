@@ -162,6 +162,24 @@ def test_fhp_cfr_rejects_other_games():
         FHPCFR("cpu", game=make_holdem("hulh"))
 
 
+def test_fhp_cfr_regret_matching_fallbacks():
+    """Without a positive regret the tabular solver plays uniformly (Linear CFR, the paper's dashed line) or, with
+    ``rm_fallback="argmax"``, the highest-regret legal action as Deep CFR does - exact ties share, so the first iteration
+    (all regrets zero) is uniform either way."""
+    import torch
+
+    from headsup.algos.fhp_cfr import FHPCFR
+
+    R = torch.tensor([[-1.0, -2.0, -3.0], [0.0, 0.0, 0.0], [1.0, -1.0, 3.0], [-5.0, -2.0, -2.0]])
+    third = [1 / 3] * 3
+    every, no_fold = torch.tensor([1.0, 1.0, 1.0]), torch.tensor([0.0, 1.0, 1.0])
+    torch.testing.assert_close(FHPCFR._rm(R, every), torch.tensor([third, third, [0.25, 0, 0.75], third]))
+    torch.testing.assert_close(FHPCFR._rm(R, every, "argmax"), torch.tensor([[1.0, 0, 0], third, [0.25, 0, 0.75], [0, 0.5, 0.5]]))
+    torch.testing.assert_close(FHPCFR._rm(R, no_fold, "argmax"), torch.tensor([[0, 1.0, 0], [0, 0.5, 0.5], [0, 0, 1.0], [0, 0.5, 0.5]]))
+    with pytest.raises(ValueError, match="rm_fallback"):
+        FHPCFR("cpu", rm_fallback="greedy")
+
+
 def test_br_filter_restricts_the_responder_to_chosen_decision_nodes():
     """Where does a strategy lose?  ``br_filter(node) -> bool`` lets the responder deviate at the chosen decision nodes
     only (it plays the policy elsewhere): no node = the policy's own value, every node = the best response, and the
