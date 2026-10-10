@@ -27,6 +27,17 @@ OBS_INT_DIM = 23  # 7 x (rank+1, suit+1, card+1), stage, first_to_act: all < 256
 OBS_INT_MAX = torch.tensor([13, 4, 52] * 7 + [3, 1], dtype=torch.uint8)  # valid upper bounds per column
 
 
+LOAD_CHUNK = 1 << 20  # rows moved to the storage device at a time when a saved memory is restored
+
+
+def _load_rows(dst, src, size):
+    """Copy the first ``size`` saved rows into the storage piece by piece.  ``src.to(device)`` as a whole needs the saved
+    rows a second time on the device: resuming into memories that nearly fill a GPU failed on it."""
+    for i in range(0, size, LOAD_CHUNK):
+        j = min(i + LOAD_CHUNK, size)
+        dst[i:j] = src[i:j].to(dst.device)
+
+
 def _rows(x, n):
     """The first n rows on the CPU as their own tensor: a slice of host storage is a view, and saving a view
     writes the whole underlying storage (the full capacity instead of the stored rows)."""
@@ -201,12 +212,15 @@ class ReservoirBuffer:
         if bad.any():  # corrupted rows (seen once: a flipped bit on a non-ECC GPU) - clamp so they cannot crash a fit
             print(f"warning: {int(bad.sum())} of {size:,} saved observations have out-of-range card/stage features; clamped")
             obs_int = torch.minimum(obs_int, OBS_INT_MAX)
-        self.obs_int[:size] = obs_int.to(self.device)
-        self.obs_float[:size] = state["obs_float"].to(self.device)
-        self.t[:size] = state["t"].to(self.device)
-        self.target[:size] = state["target"].to(self.device)
+        _load_rows(self.obs_int, obs_int, size)
+        _load_rows(self.obs_float, state["obs_float"], size)
+        _load_rows(self.t, state["t"], size)
+        _load_rows(self.target, state["target"], size)
         if self.legal is not None:  # memories saved without masks count as all-legal
-            self.legal[:size] = state["legal"].to(self.device) if "legal" in state else 1
+            if "legal" in state:
+                _load_rows(self.legal, state["legal"], size)
+            else:
+                self.legal[:size] = 1
         self.size = size
         self.seen = int(state["seen"])
 

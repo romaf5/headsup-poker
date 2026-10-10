@@ -245,6 +245,7 @@ average on 2,000 sampled flops, which overstates by ~8 %):
 | ours, 25,000 traversals: SD-CFR average | 178 | 121 | | | |
 | ours, 25,000 traversals: policy net | | 117 | 91 | 69 | **75** |
 | ours, 25,000 traversals, tighter fit (below): SD-CFR average | 234 | 134 | | | |
+| ours, 25,000 traversals, 16,000 SGD steps (a setting of the paper's sweep; its curve: 55 / 42 / 42 / 37): policy net | | 136 | 87 | 68 | **55.5** |
 
 Two things were measured about the gap. The paper's "10,000 traversals" touch 2.4 times the nodes of ours per
 iteration, and with 25,000 traversals the first 50 iterations are close to its curve. And the 4,000-step regret fit is
@@ -260,7 +261,11 @@ traversals end at 75: as in the paper, the final level does not depend on the tr
 the paper's 4,000-step sweep curve (65), not of its headline (40), whose "default" replicates (Fig. 4) coincide with
 the sweep's 16,000-32,000-step curves. The fit budget moves our floor the same way: continuing the 25,000-traversal
 run from iteration 325 to 450 with 1,000 / 4,000 / 8,000 SGD steps per fit ends at 90 / 75 / 61. A from-scratch run
-with 16,000 steps is the open reproduction (`runs/fhp4_k25_steps16k`). `--weight-average` and `--policy-lr` are the related options. Details,
+with 16,000 steps ends at 55.5. Units and game are the paper's (a uniform-random strategy: 3,045 mbb/g total here, about
+2,700 at the start of the paper's tabular curves), and stating the regret targets in big blinds instead of our RMS
+rescaling changes nothing (370 against 367 after 50 iterations). Plotted against nodes touched, the axis of the paper's
+Fig. 2, the 10,000-traversal run is on the paper's curve up to ~3e7 nodes and 1.5 times above it from 1e8 on;
+`runs/fhp4_paper_long` continues it past the paper's node budget. `--weight-average` and `--policy-lr` are the related options. Details,
 the street split of the error and the fit benchmark: [docs/paper-fidelity.md](docs/paper-fidelity.md).
 
 Every known difference between this code and the papers (fixed, chosen, or still open) is listed in

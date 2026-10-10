@@ -36,7 +36,7 @@ checked against independent implementations or enumeration.
 | Strategy memory: one memory and one policy network for both players (the paper's Algorithm 1); SD-CFR's code has one per player. | **by choice** - the paper |
 | Regret scale: the Deep-CFR repository divides external-sampling regrets by the number of legal actions; the paper and the DREAM repository do not. | **by choice** - the paper (the small-game solver has `--mean-regret`) |
 | Reservoir: Algorithm R (the authors' acceptance test is off by one). | **by choice** |
-| Regret targets are fitted in units of their RMS and the output layer is scaled back (`--target-scale auto`). Not in the paper; without it Adam cannot reach FHP's regrets of hundreds of chips from a small head. | **by choice** |
+| Regret targets are fitted in units of their RMS and the output layer is scaled back (`--target-scale auto`). Not in the paper; without it Adam cannot reach FHP's regrets of hundreds of chips from a small head. | **by choice** - equivalent to stating the values in big blinds. Paper preset, 10,000 traversals, SD-CFR average on 2,000 flops at t = 5 / 10 / 20 / 50: `auto` 1,135 / 921 / 826 / 367, big blinds (`--target-scale 100`) - / - / 852 / 370, raw chips (`none`) 1,138 / 931 / 858 / 563 (2026-10-09). The paper does not state its unit; only the 100-chip unit is worse |
 
 Open, about the paper's own figures:
 
@@ -139,9 +139,9 @@ Open, about the paper's own figures:
   - *Ruled out.* Suit symmetry: single iterates are not symmetric (isomorphic infosets differ by 0.12-0.15 in L1), but
     a network fed suit-canonical cards fits no better (held-out loss 39,746 against 39,398;
     `docs/analysis/fhp_canonical_suits_fit.py`).
-  - *16,000 steps from scratch do not reach the paper.* `runs/fhp4_k25_steps16k`: 136 / 87 / 68 at t = 100 / 200 / 300
-    (4,000 steps: 117 / 91 / 69; the paper's 16,000-step curve: 55 / 42 / 42). More steps pay late - the 4,000-step run
-    rises again from 69 to 75 between t = 300 and 450, the branches fall to 58-61 - but not to 37.
+  - *16,000 steps from scratch do not reach the paper.* `runs/fhp4_k25_steps16k`: 136 / 87 / 68 / 55.5 at t = 100 / 200 /
+    300 / 450 (4,000 steps: 117 / 91 / 69 / 75; the paper's 16,000-step curve: 55 / 42 / 42 / 37). More steps pay late - the
+    4,000-step run rises again from 69 to 75 between t = 300 and 450, the branches fall to 58-61 - but not to 37.
   - *An independent re-implementation is in the same place.* Liu et al. (Neural ReCFR-B, arXiv 2012.01870) implement
     Deep CFR on OpenSpiel "with the hyper-parameters given in" the paper (10,000 traversals, 4,000 steps of 10,000,
     40 M memories) and report 47.0 mbb/g after 6.0e8 nodes touched, rising to 73.0 at 1.3e9. The paper's curve is at 37-40
@@ -156,8 +156,28 @@ Open, about the paper's own figures:
     `docs/analysis/fhp_br_by_node.py`), the 75 of the 25,000-traversal run come from the most frequent decisions -
     the small blind's first action 15.1, the big blind facing a raise 11.1, the first flop action 12.9, facing a flop
     bet 10.5 / 9.5, after a flop check 7.6 - and next to nothing from re-raised pots (0-3 each).
-  - *Open.* The precision of the regret network at the best-sampled decisions: 8,000 steps with weight averaging from
-    scratch (`runs/fhp4_k25_8k_ema`), and the long run above.
+  - *The comparison's reference points (2026-10-09).* A uniform-random strategy has a total exploitability of 3,045 mbb/g
+    here (1,522 as the mean over seats; `holdem_br --policy random`, 2,000 flops); the paper's tabular curves in Fig. 2
+    start at about 2,700 after 1e6 nodes. With the Linear CFR line above, game and unit are the paper's: its numbers are
+    totals, and the factor of two is not a convention.
+  - *The first 50 iterations* (total, SD-CFR average `@tN` on 2,000 flops; the paper's lines digitised from Fig. 3-left):
+
+    | t | 5 | 10 | 20 | 50 |
+    |---|---|---|---|---|
+    | paper, 3,000 traversals | 1,000 | 720 | 540 | 185 |
+    | paper, 10,000 traversals | 920 | 770 | 460 | 154 |
+    | ours, 10,000 traversals | 1,135 | 921 | 826 | 367 |
+    | ours, 25,000 traversals | 1,011 | 768 | 371 | 178 |
+
+    By iteration our 25,000-traversal run is the paper's 10,000 line, and our 10,000-traversal run is above its 3,000
+    line. By nodes touched - the axis of the paper's Fig. 2 - our 10,000-traversal run is on the paper's curve up to
+    about 3e7 nodes (826 at ~1.0e7 and 367 at ~2.6e7 against 770 and 350) and 1.5 times above it from 1e8 on (113 at
+    ~0.95e8, 95 at ~1.4e8, 78 at ~2.1e8 against about 75 / 62 / 51). Cumulative nodes of ours: the logged decision nodes
+    (`samples/nodes_per_traversal`) times the 1.9 histories per decision node of the count above.
+  - *Open.* Only configurations the paper describes are run until its number is reproduced (the run with 8,000 steps and
+    weight averaging, `runs/fhp4_k25_8k_ema`, was stopped at t = 116 with 97 at t = 100). `runs/fhp4_paper_long` continues
+    the 10,000-traversal run to 1,500 iterations, i.e. past the node budget of the paper's Fig. 2 (3-4e8 nodes at
+    t = 650-950), with exact evaluations at t = 600 / 750 / 900 / 1,050 / 1,250 / 1,500.
 
 ## DREAM and ESCHER
 

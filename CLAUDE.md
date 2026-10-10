@@ -72,7 +72,9 @@ python -m pytest tests -q                                    # ~440 tests, ~13 m
   held-out loss as much as 16,000 steps do - but in training that fit is WORSE early (234 / 134 vs 178 / 121 at t = 50 / 100: it follows
   the noise of small memories). The floor (75-78 at t = 450 for 10,000 and 25,000 traversals) is set by the fit: from
   a t = 325 checkpoint 1,000 / 4,000 / 8,000 steps end at 90 / 75 / 61, and the paper's own figures put 4,000 steps at
-  65 and its headline 37-40 at 16,000-32,000 steps. See docs/paper-fidelity.md.
+  65 and its headline 37-40 at 16,000-32,000 steps; 16,000 steps from scratch (25,000 traversals) end at 55.5. Units, game and
+  target scaling are checked (uniform random = 3,045 total; big-blind targets = `--target-scale auto`). Until the paper's number is
+  reproduced, run only configurations the paper describes - no recipes of our own. See docs/paper-fidelity.md.
 - Search: pre-river subgames use *sampled* MCCFR where LCFR beats DCFR / CFR+ / PCFR+ (measured); the
   river uses full-width vector CFR where DCFR / CFR+ / PCFR+ win. Do not add regret flooring to the
   sampled solver. `search:` players are slow (~1-2 s/decision): evaluate on 1-2k hands.

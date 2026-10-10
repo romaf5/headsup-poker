@@ -820,3 +820,30 @@ def test_strategy_memory_can_live_on_another_device_than_the_advantage_memories(
     args = train.cli_args(["--algo", "both", "--iterations", "1", "--memory-device", "cpu", "--out", str(tmp_path / "run2")] + _TINY)
     trainer = train.DeepCFRTrainer(args)  # without the option the strategy memory follows --memory-device
     assert trainer.strat_memory.device == torch.device("cpu") and all(m.device == torch.device("cpu") for m in trainer.adv_memory)
+
+
+def test_restoring_a_memory_moves_the_saved_rows_in_pieces(monkeypatch):
+    """A checkpoint's rows go to the buffer's device piece by piece: moving a whole saved tensor needs its rows a second
+    time on the device, which a nearly full GPU does not have (resuming 20 M rows into 40 M-row memories on a 24 GB card
+    failed with "CUDA driver error: device not ready")."""
+    from headsup.deepcfr import memory
+
+    rng = np.random.default_rng(0)
+    obs = rng.random((50, memory.OBS_DIM)).astype(np.float32)
+    obs[:, : memory.OBS_INT_DIM] = 1.0
+    small = ReservoirBuffer(64, "cpu", seed=0, legal_dim=memory.NUM_ACTIONS)
+    small.add(obs, np.arange(50, dtype=np.float32), rng.random((50, memory.NUM_ACTIONS)).astype(np.float32), rng.random((50, memory.NUM_ACTIONS)) < 0.5)
+    state = small.state_dict()
+
+    moved = []
+    to = torch.Tensor.to
+    monkeypatch.setattr(memory, "LOAD_CHUNK", 16, raising=False)
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **k: (moved.append(len(self)), to(self, *a, **k))[1])
+    big = ReservoirBuffer(128, "cpu", seed=0, legal_dim=memory.NUM_ACTIONS)
+    big.load_state_dict(state)
+    monkeypatch.undo()
+
+    assert moved and max(moved) <= 16
+    assert big.size == 50 and big.seen == small.seen
+    assert torch.equal(big.obs, small.obs) and torch.equal(big.t[:50], small.t[:50])
+    assert torch.equal(big.target[:50], small.target[:50]) and torch.equal(big.legal[:50], small.legal[:50])
