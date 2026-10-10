@@ -265,7 +265,8 @@ with 16,000 steps ends at 55.5. Units and game are the paper's (a uniform-random
 2,700 at the start of the paper's tabular curves), and stating the regret targets in big blinds instead of our RMS
 rescaling changes nothing (370 against 367 after 50 iterations). Plotted against nodes touched, the axis of the paper's
 Fig. 2, the 10,000-traversal run is on the paper's curve up to ~3e7 nodes and 1.5 times above it from 1e8 on;
-`runs/fhp4_paper_long` continues it past the paper's node budget. `--weight-average` and `--policy-lr` are the related options. Details,
+continued to 600 iterations it stays on its plateau (82.8 after 77.7 at 450), which is the level of the paper's own
+4,000-step line (65-85). The paper's 16,000-step line (300,000 traversals, 16,000 steps: `runs/fhp4_sweep_k300k_s16k`) is running. `--weight-average` and `--policy-lr` are the related options. Details,
 the street split of the error and the fit benchmark: [docs/paper-fidelity.md](docs/paper-fidelity.md).
 
 Every known difference between this code and the papers (fixed, chosen, or still open) is listed in

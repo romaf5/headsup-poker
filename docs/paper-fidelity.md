@@ -174,10 +174,17 @@ Open, about the paper's own figures:
     about 3e7 nodes (826 at ~1.0e7 and 367 at ~2.6e7 against 770 and 350) and 1.5 times above it from 1e8 on (113 at
     ~0.95e8, 95 at ~1.4e8, 78 at ~2.1e8 against about 75 / 62 / 51). Cumulative nodes of ours: the logged decision nodes
     (`samples/nodes_per_traversal`) times the 1.9 histories per decision node of the count above.
+  - *The printed configuration has a plateau where the paper's 4,000-step line has one.* `runs/fhp4_paper_long` continued the
+    10,000-traversal run (40 M advantage memories from t = 450; the strategy memory stays at 20 M): 82.8 at t = 600 after
+    77.7 at 450, stopped at its t = 650 checkpoint. The 25,000-traversal run did the same (69.2 at 300, 74.8 at 450).
+    The paper's Fig. 3-middle line for 4,000 steps moves between 65 and 85 from t = 50 to 450 and ends near 65; its lines
+    for 8,000 / 16,000 / 32,000 steps end at 43 / 37 / 36. So with the settings of its text we reproduce its 4,000-step
+    line and not its headline, which lies on its 16,000-step line.
   - *Open.* Only configurations the paper describes are run until its number is reproduced (the run with 8,000 steps and
-    weight averaging, `runs/fhp4_k25_8k_ema`, was stopped at t = 116 with 97 at t = 100). `runs/fhp4_paper_long` continues
-    the 10,000-traversal run to 1,500 iterations, i.e. past the node budget of the paper's Fig. 2 (3-4e8 nodes at
-    t = 650-950), with exact evaluations at t = 600 / 750 / 900 / 1,050 / 1,250 / 1,500.
+    weight averaging, `runs/fhp4_k25_8k_ema`, was stopped at t = 116 with 97 at t = 100). `runs/fhp4_sweep_k300k_s16k` is the
+    paper's 16,000-step line: 16,000 SGD steps, 300,000 traversals per iteration (the paper does not state the traversal
+    count of Fig. 3-middle; its lines start like the 300,000 / 1,000,000 lines of Fig. 3-left), 40 M memories, 300
+    iterations; the paper's line reads about 60 / 55 / 43 / 43 / 40 at t = 50 / 100 / 150 / 200 / 300.
 
 ## DREAM and ESCHER
 
