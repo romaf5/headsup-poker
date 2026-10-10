@@ -847,3 +847,22 @@ def test_restoring_a_memory_moves_the_saved_rows_in_pieces(monkeypatch):
     assert big.size == 50 and big.seen == small.seen
     assert torch.equal(big.obs, small.obs) and torch.equal(big.t[:50], small.t[:50])
     assert torch.equal(big.target[:50], small.target[:50]) and torch.equal(big.legal[:50], small.legal[:50])
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_policy_only_fit_reads_the_strategy_memory_alone(tmp_path, monkeypatch):
+    """--policy-only fits the average-strategy net from a checkpoint's strategy memory.  The advantage memories - two
+    thirds of a checkpoint, 21 GB at the paper's 40 M samples - are neither allocated nor loaded."""
+    import headsup.deepcfr.train as train
+
+    out = tmp_path / "run"
+    train.main(["--algo", "both", "--iterations", "2", "--checkpoint-every", "1", "--out", str(out)] + _TINY)
+    made, loaded = [], []
+    init, load = ReservoirBuffer.__init__, ReservoirBuffer.load_state_dict
+    monkeypatch.setattr(ReservoirBuffer, "__init__", lambda self, capacity, *a, **kw: (made.append(int(capacity)), init(self, capacity, *a, **kw))[1])
+    monkeypatch.setattr(ReservoirBuffer, "load_state_dict", lambda self, state: (loaded.append(self.capacity), load(self, state))[1])
+    train.main(["--policy-only", str(out / "checkpoint.pt"), "--out", str(tmp_path / "policy"), "--device", "cpu", "--no-compile",
+                "--no-tensorboard", "--eval-hands", "0"])
+    assert (tmp_path / "policy" / "policy.pth").exists()
+    assert sorted(made) == [1, 1, 20000]  # the two advantage memories are placeholders
+    assert loaded == [20000]  # only the strategy memory was restored

@@ -391,15 +391,19 @@ class DeepCFRTrainer:
         state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
         return normalize_config(state["model_config"])
 
-    def load_checkpoint(self, path):
-        state = torch.load(path, map_location="cpu", weights_only=True)
+    def load_checkpoint(self, path, policy_only=False):
+        """Restore a run.  ``policy_only``: for the average-strategy fit alone - the advantage memories (two thirds of a
+        checkpoint) stay on disk, and the file is memory-mapped instead of read into RAM (it must not be rewritten
+        meanwhile, which a resumed run does to its own checkpoint)."""
+        state = torch.load(path, map_location="cpu", weights_only=True, mmap=policy_only)
         if normalize_config(state["model_config"]) != self.model_config:
             raise ValueError(f"checkpoint was trained with {state['model_config']}, this run uses {self.model_config}")
         self.iteration = int(state["iteration"])
         for n, sd in zip(self.nets, state["nets"]):
             n.load_state_dict(sd)
-        for m, sd in zip(self.adv_memory, state["adv_memory"]):
-            m.load_state_dict(sd)
+        if not policy_only:
+            for m, sd in zip(self.adv_memory, state["adv_memory"]):
+                m.load_state_dict(sd)
         if self.strat_memory is not None:
             if state.get("strat_memory") is not None:
                 self.strat_memory.load_state_dict(state["strat_memory"])
@@ -935,9 +939,11 @@ def cli_args(argv=None):
 
 def main(argv=None):
     args = cli_args(argv)
+    if args.policy_only:
+        args.adv_capacity = 1  # the policy fit reads the strategy memory alone
     trainer = DeepCFRTrainer(args)
     if args.policy_only:
-        trainer.load_checkpoint(args.policy_only)
+        trainer.load_checkpoint(args.policy_only, policy_only=True)
         trainer.runner.close()
         trainer.finish()
         return
