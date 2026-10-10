@@ -39,6 +39,17 @@ OBS_DIM_HISTORY = HISTORY_OFFSET + HISTORY_DIM  # 79: what history-feature netwo
 RAISES_INDEX = OBS_DIM_HISTORY  # [79] consecutive raises on this street (the raise-cap counter)
 OBS_DIM = OBS_DIM_HISTORY + 1  # 80
 BOARD_CARDS_BY_STAGE = (0, 3, 4, 5, 5)  # PREFLOP, FLOP, TURN, RIVER, END
+_MASK64 = (1 << 64) - 1
+
+
+def splitmix64(state):
+    """(next state, 64-bit output) of the splitmix64 generator - the stream of :meth:`HeadsUpPoker.redeal`, the same in
+    the C++ engine."""
+    state = (state + 0x9E3779B97F4A7C15) & _MASK64
+    z = state
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return state, z ^ (z >> 31)
 
 
 def history_slot(round_index, k):
@@ -154,6 +165,23 @@ class HeadsUpPoker:
         self.history_size = [[0.0] * HISTORY_SLOTS for _ in range(HISTORY_ROUNDS)]
         self.history_n = [0] * HISTORY_ROUNDS
         return self.observation()
+
+    def redeal(self, state):
+        """Draw the board cards that are not visible yet again, uniformly from the cards outside both hands and the
+        visible board; returns the advanced ``state`` of the splitmix64 stream the draw used (the C++ engine draws the
+        same cards from the same state).  External sampling with chance sampled at every chance node calls it for the
+        traverser's branches, which then see independent futures."""
+        n_visible = BOARD_CARDS_BY_STAGE[self.stage]
+        used = {*self.hands[0], *self.hands[1], *self.board[:n_visible]}
+        pool = [c for c in range(NUM_CARDS) if c not in used]
+        board = list(self.board)
+        for i in range(len(board) - n_visible):
+            state, z = splitmix64(state)
+            j = i + z % (len(pool) - i)
+            pool[i], pool[j] = pool[j], pool[i]
+            board[n_visible + i] = pool[i]
+        self.board = tuple(board)
+        return state
 
     def clone(self):
         """Cheap copy for tree search (cards are shared, chip state is copied)."""

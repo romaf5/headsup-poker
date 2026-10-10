@@ -866,3 +866,112 @@ def test_policy_only_fit_reads_the_strategy_memory_alone(tmp_path, monkeypatch):
     assert (tmp_path / "policy" / "policy.pth").exists()
     assert sorted(made) == [1, 1, 20000]  # the two advantage memories are placeholders
     assert loaded == [20000]  # only the strategy memory was restored
+
+
+def _fhp_net(bias, **config):
+    """An FHP net of the paper's kind with a constant output: the same deterministic strategy at every infoset."""
+    from headsup.game import FHP
+
+    m = BaseModel(arch="deepcfr", game=FHP, **config)
+    with torch.no_grad():
+        m.action_head.bias.copy_(torch.tensor(bias, dtype=torch.float32))
+    return m.numpy_weights()
+
+
+def _flops(samples):
+    """Flop of each sample taken on the flop (observation: stage at 21, card id + 1 of the flop cards at 8, 11, 14)."""
+    return [tuple(int(c) - 1 for c in row[[8, 11, 14]]) for row in samples.obs if row[21] == 1]
+
+
+def test_redeal_draws_the_hidden_board_cards_again():
+    """``redeal``: the board cards nobody has seen yet are drawn again, uniformly from the cards outside both hands and
+    the visible board; hands and visible cards stay, and the draw is a function of the stream state alone."""
+    from headsup.engine import HeadsUpPoker
+    from headsup.game import FHP
+
+    e = HeadsUpPoker(game=FHP)
+    e.reset(list(range(9)))
+    state, flops = 1, []
+    for _ in range(4000):
+        state = e.redeal(state)
+        assert e.hands == ((0, 1), (2, 3)) and len(set(e.board)) == 5 and not set(e.board) & {0, 1, 2, 3}
+        flops.append(e.board[:3])
+    counts = np.bincount(np.asarray(flops).ravel(), minlength=52)
+    assert counts[:4].sum() == 0 and counts[4:].min() > 180 and counts[4:].max() < 330  # 12,000 cards over 48: 250 each
+    a, b = e.clone(), e.clone()
+    assert a.redeal(7) == b.redeal(7) and a.board == b.board and a.board != e.board and a.redeal(7) != 7
+    e.step(1)
+    e.step(1)  # limp, check: the flop is out
+    flop = e.board[:3]
+    e.redeal(3)
+    assert e.stage == 1 and e.board[:3] == flop
+
+
+def test_branch_chance_gives_each_branch_of_the_traverser_its_own_flop():
+    """Deep CFR's Algorithm 2 samples chance at every chance node, so the flops after two pre-flop actions of the traverser
+    are independent draws (the authors' code reshuffles the remaining deck for every branch but the first).  With one
+    deal per traversal - the default - both branches see the dealt flop."""
+    call = _fhp_net([0.0, 5.0, 0.0])  # the big blind checks / calls: a limp and a raise both reach the flop
+    decks = np.stack([np.random.default_rng(i).permutation(52)[:9] for i in range(30)]).astype(np.int32)
+    different = 0
+    for i, deck in enumerate(decks):
+        shared, _, n_shared = run_traversals_python([call, call], 0, 1, 1.0, seed=i, decks=decks[i : i + 1])
+        own, _, n_own = run_traversals_python([call, call], 0, 1, 1.0, seed=i, decks=decks[i : i + 1], branch_chance=True)
+        assert n_own == n_shared and len(own) == len(shared) == 3  # the root and one flop decision per branch
+        assert _flops(shared) == [tuple(sorted(int(c) for c in deck[4:7]))] * 2
+        flops = _flops(own)
+        different += flops[0] != flops[1]
+        assert not {c for f in flops for c in f} & {int(c) for c in deck[:4]}  # never a card of either hand
+        np.testing.assert_array_equal(own.obs[:, :6], shared.obs[:, :6])  # the hands are dealt once
+    assert different >= 29
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+@pytest.mark.parametrize("game_name", ["fhp", "nlhe"])
+def test_cpp_branch_chance_matches_python_reference(game_name):
+    """Same deals and seed: the C++ sampler redraws the same cards as the Python reference (one splitmix64 stream per
+    traversal), so the samples agree row by row."""
+    from headsup.game import FHP
+
+    cpp = native.module()
+    n = 60
+    decks = np.stack([np.random.default_rng(i).permutation(52)[:9] for i in range(n)]).astype(np.int32)
+    if game_name == "fhp":  # seat 0 calls; seat 1 raises while it may (no positive advantage: the argmax fallback)
+        w0, w1 = _fhp_net([-3.0, -1.0, -2.0], rm_fallback="argmax"), _fhp_net([-3.0, -2.0, -1.0], rm_fallback="argmax")
+        cfg = native.engine_config(game=FHP)
+    else:
+        w0, w1, cfg = _peaked([0, 5, 0, 0], features="history"), _peaked([0, 0, 5, 0], features="history"), native.engine_config()
+    for traverser in (0, 1):
+        pa, ps, pn = run_traversals_python([w0, w1], traverser, n, 3.0, 5, None, decks, branch_chance=True)
+        out = cpp.run_traversals(native.make_model(w0), native.make_model(w1), traverser, n, 3.0, 5, cfg, decks, True)
+        plain = cpp.run_traversals(native.make_model(w0), native.make_model(w1), traverser, n, 3.0, 5, cfg, decks)
+        assert pn == out[6] == plain[6] and len(pa) == len(out[1]) and len(ps) == len(out[4])
+        np.testing.assert_array_equal(pa.obs, out[0])
+        np.testing.assert_allclose(pa.target, out[2], atol=1e-4)
+        np.testing.assert_array_equal(ps.obs, out[3])
+        np.testing.assert_allclose(ps.target, out[5], atol=1e-5)
+        assert not np.array_equal(out[0], plain[0])  # other boards than with the one deal
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_paper_preset_samples_chance_per_branch_and_a_resumed_run_keeps_its_own(tmp_path):
+    """--chance-sampling: ``branch`` with the paper preset (its Algorithm 2), ``deal`` otherwise; a resumed run continues
+    as it began - with one deal per traversal if its checkpoint is older than the option."""
+    import headsup.deepcfr.train as train
+
+    assert train.cli_args(["--preset", "paper", "--game", "fhp"]).chance_sampling == "branch"
+    assert train.cli_args([]).chance_sampling == "deal"
+    assert train.cli_args(["--preset", "paper", "--chance-sampling", "deal"]).chance_sampling == "deal"
+    out = tmp_path / "run"
+    argv = ["--algo", "sdcfr", "--game", "fhp", "--preset", "paper", "--iterations", "1", "--checkpoint-every", "1", "--out", str(out)] + _TINY
+    trainer = train.DeepCFRTrainer(train.cli_args(argv))
+    assert trainer.runner.branch_chance is True
+    trainer.run()
+    ck = out / "checkpoint.pt"
+    assert train.cli_args(["--resume", str(ck)]).chance_sampling == "branch"
+    assert len(set(_flops(Samples(trainer.adv_memory[0].obs.numpy(), None, None)))) > 30  # more flops than the 30 traversals dealt
+    state = torch.load(ck, map_location="cpu", weights_only=True)
+    del state["args"]["chance_sampling"]  # a checkpoint written before the option existed
+    torch.save(state, ck)
+    assert train.cli_args(["--resume", str(ck), "--preset", "paper"]).chance_sampling == "deal"
+    assert train.DeepCFRTrainer(train.cli_args(["--game", "fhp", "--out", str(tmp_path / "other")] + _TINY)).runner.branch_chance is False

@@ -60,7 +60,11 @@ python -m pytest tests -q                                    # ~440 tests, ~13 m
 - DeepCFR fits weight a sample of iteration t by 2t/T (`--loss-weights paper`, the paper's 5.3; the loss is O(1)).
   With `--loss-weights raw` (all runs before 2026-10-08; inherited when such a checkpoint is resumed) the loss grows
   ~linearly with t and the clip at 1 rescales every step: watch `eval_*` and `advantage/*/mse_unweighted` there.
-  `--preset paper` = paper hyperparameters + `--net deepcfr` + argmax fallback.
+  `--preset paper` = paper hyperparameters + `--net deepcfr` + argmax fallback + `--chance-sampling branch`.
+- External sampling draws chance per branch of the traverser with `--chance-sampling branch` (Deep CFR's Algorithm 2, the
+  authors' code; `Engine.redeal`, one splitmix64 stream per traversal, identical in Python and C++). `deal` (default outside
+  the paper preset, and every run before 2026-10-10) shares one deal among all branches: unbiased too, but on FHP it costs a
+  factor of ~2 in traversals (826 vs 443 mbb/g at t = 20 with 10,000 traversals). The small-game solver always sampled per node.
 - The paper's "98 948 parameters" = 23 d² + 74 d + 4 at d = 64: Appendix C with the card branch 3 d wide (as in the
   authors' code bases). `--net deepcfr` is that network (plus Appendix C's card tables, minus an unused 4th output);
   `--net paper` is Appendix C as printed (d-wide card branch, extra inputs) and is kept for the models trained with it.

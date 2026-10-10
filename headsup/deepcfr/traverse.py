@@ -107,8 +107,16 @@ def sample_action(probs, u):
     return a if a < len(probs) else int(np.flatnonzero(np.asarray(probs) > 0)[-1])
 
 
-def traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats=None):
-    """Recursive external-sampling traversal; returns the traverser's expected value."""
+def chance_stream(seed, traversal):
+    """Start of the splitmix64 stream that redraws the cards of one traversal's branches (``branch_chance``); the C++
+    sampler uses the same one."""
+    return (int(seed) ^ (0x9E3779B97F4A7C15 * (traversal + 1))) & 0xFFFFFFFFFFFFFFFF
+
+
+def traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats=None, chance=None):
+    """Recursive external-sampling traversal; returns the traverser's expected value.  ``chance``: ``[state]`` of the
+    stream that gives every branch of the traverser but the first its own future cards (chance sampled at each chance
+    node, as Deep CFR's Algorithm 2 states it); None: one deal per traversal, shared by all branches."""
     if engine.done:
         return float(engine.rewards[traverser])
     p = engine.current
@@ -120,12 +128,16 @@ def traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats=None):
         stats["nodes"] += 1
     if p == traverser:
         values = np.empty(n, dtype=np.float32)
+        redraw, first = chance is not None and engine.stage + 1 < engine.num_rounds, True  # cards still to come
         for a in range(n):
             if not legal[a]:
                 continue  # duplicates another action; filled in below
             child = engine.clone() if a + 1 < n else engine
+            if redraw and not first:
+                chance[0] = child.redeal(chance[0])
+            first = False
             child.step(a)
-            values[a] = traverse(child, traverser, nets, t, rng, adv_mem, strat_mem, stats)
+            values[a] = traverse(child, traverser, nets, t, rng, adv_mem, strat_mem, stats, chance)
         for a in range(n):
             if not legal[a]:
                 values[a] = values[twin[a]]
@@ -134,7 +146,7 @@ def traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats=None):
         return mean
     strat_mem.add(obs, t, sigma, legal)
     engine.step(sample_action(sigma, rng.random()))
-    return traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats)
+    return traverse(engine, traverser, nets, t, rng, adv_mem, strat_mem, stats, chance)
 
 
 def history_rows(engine):
@@ -199,7 +211,7 @@ def run_dream_python(weights, baseline_weights, traverser, n_traversals, t, epsi
     return adv.to_samples(), val.to_samples(), stats["nodes"]
 
 
-def run_traversals_python(weights, traverser, n_traversals, t, seed, engine_kwargs=None, decks=None):
+def run_traversals_python(weights, traverser, n_traversals, t, seed, engine_kwargs=None, decks=None, branch_chance=False):
     """Worker entry point (picklable): returns (adv Samples, strat Samples, nodes)."""
     rng = np.random.default_rng(seed)
     nets = [NumpyModel(weights[0]), NumpyModel(weights[1])]
@@ -211,15 +223,16 @@ def run_traversals_python(weights, traverser, n_traversals, t, seed, engine_kwar
     adv, strat, stats = _Memory(nets[0].obs_dim, engine.num_actions), _Memory(nets[0].obs_dim, engine.num_actions), {"nodes": 0}
     for i in range(n_traversals):
         engine.reset(None if decks is None else decks[i])
-        traverse(engine, traverser, nets, t, rng, adv, strat, stats)
+        traverse(engine, traverser, nets, t, rng, adv, strat, stats, [chance_stream(seed, i)] if branch_chance else None)
     return adv.to_samples(), strat.to_samples(), stats["nodes"]
 
 
 class TraversalRunner:
     """Collects samples for one CFR iteration using all CPU cores."""
 
-    def __init__(self, num_workers=None, backend="auto", engine_kwargs=None, game=None):
+    def __init__(self, num_workers=None, backend="auto", engine_kwargs=None, game=None, branch_chance=False):
         self.num_workers = num_workers or max(1, (os.cpu_count() or 2) - 1)
+        self.branch_chance = bool(branch_chance)  # external sampling: chance per chance node instead of one deal per traversal
         self.game = (game or DEFAULT_GAME).with_(**(engine_kwargs or {}))
         self.engine_kwargs = self.game.to_dict()
         if backend == "auto":
@@ -267,7 +280,8 @@ class TraversalRunner:
 
             nets = [native.make_model(weights[0]), native.make_model(weights[1])]
             futs = [
-                self._pool.submit(self._cpp.run_traversals, nets[0], nets[1], traverser, k, float(t), int(s), self._cfg)
+                self._pool.submit(self._cpp.run_traversals, nets[0], nets[1], traverser, k, float(t), int(s), self._cfg, None,
+                                  self.branch_chance)
                 for k, s in zip(chunks, seeds)
             ]
             outs = [f.result() for f in futs]
@@ -277,7 +291,7 @@ class TraversalRunner:
         else:
             futs = [
                 self._pool.submit(
-                    run_traversals_python, weights, traverser, k, float(t), int(s), self.engine_kwargs
+                    run_traversals_python, weights, traverser, k, float(t), int(s), self.engine_kwargs, None, self.branch_chance
                 )
                 for k, s in zip(chunks, seeds)
             ]

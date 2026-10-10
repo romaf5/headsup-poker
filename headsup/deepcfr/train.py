@@ -32,6 +32,7 @@ from headsup.model import ARCHS, CARDS, FEATURES, RM_FALLBACKS, BaseModel, count
 # Hyperparameter presets (--preset); explicit flags always win.  "paper" = Brown et al. (2019)
 # for FHP/HULH and the SD-CFR paper's average-strategy fit (20,000 updates x batch 20,480); "escher" = Table 3
 # of McAleer et al. (2023): 1,000 regret and value trajectories, batch 2,048, 5,000 / 5,000 / 10,000 steps.
+CHANCE_SAMPLING = ("deal", "branch")  # external sampling: one deal per traversal | chance drawn per branch of the traverser
 PRESETS = {
     "default": dict(traversals=10_000, batch_size=16384, value_steps=4000, adv_capacity=10_000_000,
                     strat_capacity=10_000_000, policy_epochs=50, policy_steps=None, policy_batch_size=None,
@@ -303,7 +304,8 @@ class DeepCFRTrainer:
         # iteration 1 and has weight 0 in the average); ``iterate_first`` = the iteration of the bank's first net
         self.iterates = [[n.state_dict_cpu()] for n in self.nets] if self.use_sdcfr else None
         self.iterate_first = 0
-        self.runner = TraversalRunner(args.workers, backend=args.backend, game=self.game)
+        self.runner = TraversalRunner(args.workers, backend=args.backend, game=self.game,
+                                      branch_chance=getattr(args, "chance_sampling", "deal") == "branch")
         # history value networks (both players' cards): DREAM baselines Q_p(h, a) per player, the
         # ESCHER value net q(h, a) (player 0's return; re-fitted every iteration on fresh trajectories)
         self.value_config = normalize_config(dict(self.model_config, opp_cards=True))
@@ -319,7 +321,8 @@ class DeepCFRTrainer:
         self.value_scales = [None] * len(self.value_nets)
         cfg = self.model_config
         print(
-            f"device={self.device}  algo={self.algo}  traversal backend={self.runner.backend} x{self.runner.num_workers} workers  "
+            f"device={self.device}  algo={self.algo}  traversal backend={self.runner.backend} x{self.runner.num_workers} workers"
+            f"{' (chance per branch)' if self.runner.branch_chance else ''}  "
             f"memories: adv {args.adv_capacity:,} x2" + (f", strat {args.strat_capacity:,}" if self.use_deepcfr else "")
             + f" on {mem_dev}"
         )
@@ -841,6 +844,10 @@ def build_parser():
     p.add_argument("--rm-fallback", default=None, choices=RM_FALLBACKS,
                    help="regret matching when no advantage is positive: uniform | argmax (DeepCFR / DREAM papers; the default with "
                         "--preset paper and for --algo dream / escher)")
+    p.add_argument("--chance-sampling", default=None, choices=CHANCE_SAMPLING,
+                   help="external sampling: deal = one deal per traversal, the same cards in every branch of the traverser | "
+                        "branch = every branch draws its own future cards, i.e. chance is sampled at each chance node (Deep "
+                        "CFR's Algorithm 2 and the authors' code; the default with --preset paper)")
     # game (action tree; stored in the model config)
     p.add_argument("--game", default="nlhe", choices=["nlhe", "fhp", "hulh"],
                    help="nlhe: the no-limit abstraction below; fhp / hulh: the DeepCFR paper's limit games (blinds 50/100)")
@@ -890,6 +897,8 @@ def resolve_args(args):
         args.net = "deepcfr" if args.preset == "paper" else "current"
     if getattr(args, "loss_weights", None) is None:
         args.loss_weights = "paper"
+    if getattr(args, "chance_sampling", None) is None:
+        args.chance_sampling = "branch" if args.preset == "paper" else "deal"
     return args
 
 
@@ -897,9 +906,10 @@ RESUME_INHERITED = ("algo", "traversals", "adv_capacity", "strat_capacity", "val
                     "policy_steps", "policy_batch_size", "regret_power", "strategy_power", "epsilon", "q_steps", "q_batch",
                     "q_capacity", "value_trajectories", "eval_hands", "eval_every", "policy_eval_every", "lbr_every", "lbr_hands",
                     "lbr_final_hands", "lbr_tables", "lbr_model_iterates", "seed", "lr", "target_scale", "value_epsilon", "masked_loss",
-                    "checkpoint_every", "loss_weights", "policy_lr_decay", "lr_schedule", "weight_average", "policy_lr")
+                    "checkpoint_every", "loss_weights", "policy_lr_decay", "lr_schedule", "weight_average", "policy_lr",
+                    "chance_sampling")
 # what a checkpoint written before a hyperparameter existed was trained with (a resumed run continues as it began)
-RESUME_LEGACY = {"loss_weights": "raw", "policy_lr_decay": 0.9}
+RESUME_LEGACY = {"loss_weights": "raw", "policy_lr_decay": 0.9, "chance_sampling": "deal"}
 
 
 def cli_args(argv=None):

@@ -46,6 +46,14 @@ constexpr int NUM_CARDS = 52;
 enum Action { FOLD = 0, CHECK_CALL = 1, RAISE = 2 };  // raise sizes are 2 .. num_actions-2, all-in = num_actions-1
 enum Stage { PREFLOP = 0, FLOP = 1, TURN = 2, RIVER = 3, END = 4 };
 constexpr int BOARD_CARDS_BY_STAGE[5] = {0, 3, 4, 5, 5};
+
+// splitmix64: the stream of Engine::redeal (headsup.engine.splitmix64 is the same generator).
+inline uint64_t splitmix64(uint64_t& state) {
+  uint64_t z = (state += 0x9E3779B97F4A7C15ULL);
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return z ^ (z >> 31);
+}
 constexpr int STACK_FEATURE_CAP = 1000;  // the stack features of the observation saturate here (see engine.py)
 inline int stack_feature_cap() {  // HEADSUP_STACK_FEATURE_CAP overrides it (encoding ablation only)
   static const int cap = [] { const char* v = std::getenv("HEADSUP_STACK_FEATURE_CAP"); return v ? std::atoi(v) : STACK_FEATURE_CAP; }();
@@ -317,6 +325,23 @@ struct Engine {
     showdown_stage = -1;
     std::memset(hist_size, 0, sizeof(hist_size));
     hist_n[0] = hist_n[1] = hist_n[2] = hist_n[3] = 0;
+  }
+
+  // Draws the board cards that are not visible yet again, uniformly from the cards outside both hands and the visible
+  // board, and advances the splitmix64 stream `state` (the Python engine draws the same cards from the same state).
+  void redeal(uint64_t& state) {
+    const int n_visible = BOARD_CARDS_BY_STAGE[stage];
+    bool used[NUM_CARDS] = {};
+    used[hands[0][0]] = used[hands[0][1]] = used[hands[1][0]] = used[hands[1][1]] = true;
+    for (int i = 0; i < n_visible; ++i) used[board[i]] = true;
+    int pool[NUM_CARDS], n = 0;
+    for (int c = 0; c < NUM_CARDS; ++c)
+      if (!used[c]) pool[n++] = c;
+    for (int i = 0; n_visible + i < 5; ++i) {
+      const int j = i + int(splitmix64(state) % uint64_t(n - i));
+      std::swap(pool[i], pool[j]);
+      board[n_visible + i] = pool[i];
+    }
   }
 
   template <class RNG>
@@ -862,6 +887,10 @@ struct Traverser {
   std::mt19937_64 rng;
   Memory adv, strat;
   long nodes = 0;
+  // Chance sampled at every chance node (Deep CFR, Algorithm 2): every branch of the traverser but the first draws its
+  // own future cards from the stream `chance`.  Off: one deal per traversal, shared by all branches.
+  bool branch_chance = false;
+  uint64_t chance = 0;
 
   float traverse(Engine& e) {
     if (e.done) return float(e.rewards[traverser]);
@@ -876,16 +905,21 @@ struct Traverser {
     ++nodes;
     if (p == traverser) {
       float va[MAX_ACTIONS];
+      const bool redraw = branch_chance && e.stage + 1 < e.cfg.num_rounds;  // cards still to come
+      bool first = true;
       for (int a = 0; a < n; ++a) {
         if (!legal[a]) continue;  // duplicates another action: filled in below
         if (a + 1 < n) {
           Engine child = e;
+          if (redraw && !first) child.redeal(chance);
           child.step(a);
           va[a] = traverse(child);
         } else {
+          if (redraw && !first) e.redeal(chance);
           e.step(a);
           va[a] = traverse(e);
         }
+        first = false;
       }
       for (int a = 0; a < n; ++a)
         if (!legal[a]) va[a] = va[twin[a]];
@@ -931,8 +965,10 @@ inline void check_net(const Model& m, const EngineConfig& cfg, bool value_net, c
 }
 
 py::tuple run_traversals(std::shared_ptr<Model> net0, std::shared_ptr<Model> net1, int traverser, int n_traversals,
-                         float t, uint64_t seed, EngineConfig cfg, py::object decks_obj) {
+                         float t, uint64_t seed, EngineConfig cfg, py::object decks_obj, bool branch_chance) {
   Traverser tr;
+  tr.branch_chance = branch_chance;
+  const auto chance_stream = [seed](int i) { return seed ^ (0x9E3779B97F4A7C15ULL * uint64_t(i + 1)); };
   tr.nets[0] = net0.get();
   tr.nets[1] = net1.get();
   check_net(*net0, cfg, false, "advantage net (seat 0)");
@@ -954,6 +990,7 @@ py::tuple run_traversals(std::shared_ptr<Model> net0, std::shared_ptr<Model> net
     Engine e(cfg);
     for (int i = 0; i < n_traversals; ++i) {
       e.reset(decks.data() + size_t(i) * stride);
+      tr.chance = chance_stream(i);
       tr.traverse(e);
     }
   } else {
@@ -961,6 +998,7 @@ py::tuple run_traversals(std::shared_ptr<Model> net0, std::shared_ptr<Model> net
     Engine e(cfg);
     for (int i = 0; i < n_traversals; ++i) {
       e.reset_random(tr.rng);
+      tr.chance = chance_stream(i);
       tr.traverse(e);
     }
   }
@@ -3706,7 +3744,9 @@ PYBIND11_MODULE(headsup_cpp, m) {
         "ESCHER regret trajectories: (adv obs, t, target, strat obs, t, sigma, history obs, -1, value, nodes)");
   m.def("run_traversals", &run_traversals, py::arg("net0"), py::arg("net1"), py::arg("traverser"), py::arg("n_traversals"),
         py::arg("t"), py::arg("seed"), py::arg("cfg") = EngineConfig(), py::arg("decks") = py::none(),
-        "External-sampling MCCFR traversals; returns (adv_obs, adv_t, adv_target, strat_obs, strat_t, strat_target, nodes)");
+        py::arg("branch_chance") = false,
+        "External-sampling MCCFR traversals; returns (adv_obs, adv_t, adv_target, strat_obs, strat_t, strat_target, nodes, "
+        "adv_legal, strat_legal).  branch_chance: every branch of the traverser but the first draws its own future cards.");
 
   py::class_<VecEnv>(m, "VecEnv")
       .def(py::init<int, uint64_t, EngineConfig, bool>(), py::arg("num_envs"), py::arg("seed"),
