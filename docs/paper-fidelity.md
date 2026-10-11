@@ -67,6 +67,7 @@ Open, about the paper's own figures:
   | ours, one deal per traversal (`runs/fhp4_paper`): SD-CFR average | 1,135 | 921 | 826 | 367 | 199 |
   | ours, chance per branch (`runs/fhp4_chance_k10k`): SD-CFR average | 1,130 | 851 | 443 | 214 | |
   | ours, chance per branch (`runs/fhp4_paper_branch`): policy net, exact | | | | 203 | 132 |
+  | **ours, chance per branch, no card tables (`runs/fhp4_paper_v3`)**: SD-CFR average; policy net, exact at 50 | | **637** | **327** | **166** | |
   | ours, chance per branch, 20,000 traversals (`runs/fhp4_chance_k20k`): SD-CFR average | | 512 | 264 | 152 | |
   | the authors' public code, 10,000 traversals (`runs/ref_fhp_es`, see below): SD-CFR average | 1,016 | 779 | 414 | | |
 
