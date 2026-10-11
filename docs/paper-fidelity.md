@@ -93,7 +93,27 @@ Open, about the paper's own figures:
   repository, `FHP_ES.py`: 10,000 traversals, 4,000 batches of 10,000) run here as a reference and scored with our exact
   best response. Its FHP class doubles the bet on the flop (`ROUND_WHERE_BIG_BET_STARTS = FLOP`), unlike both papers'
   rules; the reference run sets the flop bet to 100, and the evaluation checks at start-up that the two engines agree on
-  the player to act, the legal actions and the pot at all 78 decision nodes.
+  the player to act, the legal actions and the pot at all 78 decision nodes (`docs/analysis/fhp_reference_run.py`,
+  `fhp_reference_br.py`).
+
+  The authors' network is not the difference (`docs/analysis/fhp_fit_authors_network.py`): seat 0's memory of
+  `runs/fhp4_paper_branch` at t = 300, 6 M of its 15 M rows, the paper's fit, two seeds each; chips on the legal actions
+  (the tabulated pre-flop means have a standard error of 6.0 on these rows):
+
+  | network, steps | parameters | noise between seeds, pre-flop | on held-out flop rows | distance to the tabulated pre-flop mean | held-out loss |
+  |---|---|---|---|---|---|
+  | ours (`--net deepcfr`), 4,000 | 105,923 | 5.6 | 19.8 | 7.6 | 1 |
+  | ours, loss on the legal actions only, 4,000 | 105,923 | 6.8 | 20.7 | 8.2 | 0.999 |
+  | authors' (PokerRL inputs, dueling head, masked outputs), 4,000 | 112,836 | 8.2 | 20.4 | 8.8 | 1.000 |
+  | ours, 16,000 | 105,923 | 5.4 | 36.2 | 8.0 | 1.007 |
+  | authors', 16,000 | 112,836 | 5.7 | 30.6 | 7.5 | 1.004 |
+
+  Two more things follow from this table. Two fits of the same data differ by 20 chips on flop rows: the flop is where
+  the fit is uncertain. And on 5.7 M rows 16,000 steps (28 passes) overfit - the held-out loss rises and the flop noise
+  nearly doubles. With 10,000 traversals a fit makes 16 passes over the memory at t = 50, 8 at t = 100 and 2.7 at
+  t = 300; a run with the paper's nodes per iteration makes half as many. (The earlier finding that 16,000 steps lower
+  the held-out loss by 5 % was made on one-deal data, where held-out rows share their deal - hand, flop and opponent
+  hand - with training rows, so memorising deals lowered it.)
 - **The runs before 2026-10-10 (one deal per traversal).** Runs of 2026-10-08 on the four-bet game with `--preset paper`
   as it was then (total exploitability in mbb/g; policy net by exact best response over all flops, SD-CFR average on
   2,000 sampled flops, which overstates by ~8 %):
