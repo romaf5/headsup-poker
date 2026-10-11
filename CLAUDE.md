@@ -69,6 +69,9 @@ python -m pytest tests -q                                    # ~440 tests, ~13 m
   authors' code bases). `--net deepcfr` is that network (plus Appendix C's card tables, minus an unused 4th output);
   `--net paper` is Appendix C as printed (d-wide card branch, extra inputs) and is kept for the models trained with it.
 - First iteration: untrained nets output zeros and the argmax fallback shares exact ties, i.e. plays uniformly.
+- FHP: one cause of the gap was the single deal per traversal (found 2026-10-10; with `--chance-sampling branch` the paper preset
+  is at 443 / 203 / 132 mbb/g total at t = 20 / 50 / 100 against 826 / 367 / 202 before and the paper's 457 / 155 / 71). The rest of
+  this note describes the runs before that date (one deal); compare new runs only with new-sampler runs.
 - FHP is not reproduced (2026-10-08, four-bet game, paper preset: 202 / 113 / 95 / 78 mbb/g total at t = 100 / 200 /
   300 / 450 against the paper's 70 / 51 / 40 / 40; the three-bet runs ended at 80-86 too). Two measured causes: (1) the paper's "10,000 traversals" touch ~2.4x the nodes of
   ours - `--traversals 25000` gives 178 / 121 at t = 50 / 100 against 367 / 199; (2) at t = 125 the 4,000-step fit is

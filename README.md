@@ -232,9 +232,23 @@ headsup.algos.fhp_cfr`) follows the paper's dashed reference line:
 | ours, four-bet flop | 115 | 65 | 32 |
 | ours, earlier three-bet flop | 116 | 60 | 28 |
 
-(total exploitability, mbb/g). **Deep CFR on FHP is not reproduced yet.** On the four-bet game with the paper's
-network and hyperparameters (`--game fhp --preset paper`; policy net by exact best response over all flops, SD-CFR
-average on 2,000 sampled flops, which overstates by ~8 %):
+(total exploitability, mbb/g). **Deep CFR on FHP is not reproduced yet**, but one cause was found on 2026-10-10. Our
+external sampling dealt the cards once per traversal, so every branch of the traverser's tree saw the same flop; the
+paper's Algorithm 2 samples chance at each chance node, and the authors' code reshuffles the remaining deck for every
+branch. With `--chance-sampling branch` (now part of `--preset paper`) the paper's configuration gives:
+
+| 10,000 traversals, 4,000 SGD steps | t = 5 | 10 | 20 | 50 | 100 |
+|---|---|---|---|---|---|
+| paper (Fig. 3-left, read off by pixel) | 922 | 766 | 457 | 155 | 71 |
+| ours, one deal per traversal: SD-CFR average | 1,135 | 921 | 826 | 367 | 199 |
+| ours, chance per branch: SD-CFR average | 1,130 | 851 | 443 | 214 | |
+| ours, chance per branch: policy net, exact | | | | 203 | 132 |
+
+The full-length run with the new sampling (`runs/fhp4_paper_branch`) and the paper's 16,000-step sweep line are in
+progress; docs/paper-fidelity.md has the details, including what still differs (the paper's Fig. 2 touches twice our
+nodes per iteration). **Everything below in this section was measured with one deal per traversal**, on the four-bet
+game with the paper's network and hyperparameters (`--game fhp --preset paper` as it was then; policy net by exact best
+response over all flops, SD-CFR average on 2,000 sampled flops, which overstates by ~8 %):
 
 | | t = 50 | 100 | 200 | 300 | 450 |
 |---|---|---|---|---|---|

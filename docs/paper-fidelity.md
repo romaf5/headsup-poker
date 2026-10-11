@@ -48,13 +48,46 @@ Open, about the paper's own figures:
   the big blind (decision, terminal and flop chance nodes; 5.0 / 3.4 of them are the traverser's infosets), i.e. 4.1e5 per
   iteration at K = 10k per player, and 4.6-5.5e5 during training: the paper's "10,000 traversals" touch 2.2-2.5 times
   more nodes than ours. The tree is the same (its infoset counts are reproduced), so either the count or K means
-  something else there.
+  something else there. Read off point by point against our logged counts (decision nodes per traversal, times the 1.9
+  histories per decision node), the factor is 2.0 throughout: 1.2e6 / 5.2e6 / 1.05e7 / 2.1e7 / 1.0e8 nodes after
+  t = 1 / 5 / 10 / 20 / 100 in Fig. 2 against 5.7e5 / 2.7e6 / 5.4e6 / 1.05e7 / 4.8e7 here. The authors' later public
+  code (DREAM repository, `FHP_ES.py`, "10,000 for SD-CFR as proposed by" this paper) touches 4.1e5 per iteration, as we do.
 - Its SGD-step sweep (Fig. 3-middle) ends at about 65 mbb/g for 4,000 steps (110 / 80 / 65 / 43 / 37 / 35 for 1k ... 32k),
   the traversal sweep (Fig. 3-left, nominally 4,000 steps) at 34-46 for every K: the headline 37-40 is the level of the
   sweep's 8,000-32,000-step runs.
-- **The FHP reproduction itself is open.** Runs of 2026-10-08 on the four-bet game with `--preset paper` (total
-  exploitability in mbb/g; policy net by exact best response over all flops, SD-CFR average on 2,000 sampled flops,
-  which overstates by ~8 %):
+- **One cause found on 2026-10-10: chance sampling.** The hold'em trainer dealt all cards once per traversal, so every
+  branch of the traverser's tree saw the same flop; Algorithm 2 samples chance at each chance node, and the authors'
+  code reshuffles the remaining deck for every branch (the row "Chance in external sampling" above). With
+  `--chance-sampling branch`, now part of `--preset paper` (total exploitability in mbb/g; SD-CFR average on 2,000
+  flops, policy net by exact best response; the paper's lines read off Fig. 3 by pixel):
+
+  | 10,000 traversals, 4,000 SGD steps | t = 5 | 10 | 20 | 50 | 100 |
+  |---|---|---|---|---|---|
+  | paper (Fig. 3-left) | 922 | 766 | 457 | 155 | 71 |
+  | ours, one deal per traversal (`runs/fhp4_paper`): SD-CFR average | 1,135 | 921 | 826 | 367 | 199 |
+  | ours, chance per branch (`runs/fhp4_chance_k10k`): SD-CFR average | 1,130 | 851 | 443 | 214 | |
+  | ours, chance per branch (`runs/fhp4_paper_branch`): policy net, exact | | | | 203 | 132 |
+
+  By nodes touched - the axis of the paper's Fig. 2 - the new run is below the paper's curve up to 5e7 nodes: 443 at
+  1.05e7, 203 at 2.4e7 and 132 at 4.8e7 against about 766 / 375 / 165. By iteration it is above from t = 50 on, and the
+  paper's run has twice the nodes per iteration (first bullet of this list).
+
+  With many traversals the new sampling changes less (300,000 traversals; SD-CFR average on 2,000 flops):
+
+  | 300,000 traversals | t = 5 | 10 | 15 | 20 | 25 | 30 | 40 | 50 |
+  |---|---|---|---|---|---|---|---|---|
+  | paper, Fig. 3-left, 300,000 traversals | 722 | 325 | 166 | | | 84 | 71 | 56 |
+  | paper, Fig. 3-middle, 4,000 SGD steps | | 296 | 183 | | 117 | 94 | 77 | 74 |
+  | paper, Fig. 3-middle, 16,000 SGD steps | 453 | 275 | 155 | 110 | 98 | 85 | 66 | 63 |
+  | exact tabular Linear CFR (`fhp_cfr`) | 976 | 355 | 187 | 115 | | 65 | 44 | 32 |
+  | ours, one deal, 16,000 steps (`runs/fhp4_sweep_k300k_s16k`, stopped at t = 88; policy net at 50, exact: 85.2) | 805 | 328 | 214 | 158 | 142 | 130 | 103 | 89 |
+  | ours, chance per branch, 4,000 steps (`runs/fhp4_branch_k300k_s4k`) | | 255 | 189 | 162 | 141 | | | |
+
+  Running: `runs/fhp4_paper_branch` (the printed configuration, to t = 450) and `runs/fhp4_branch_k300k_s16k` (the
+  16,000-step line with the new sampling, to t = 300).
+- **The runs before 2026-10-10 (one deal per traversal).** Runs of 2026-10-08 on the four-bet game with `--preset paper`
+  as it was then (total exploitability in mbb/g; policy net by exact best response over all flops, SD-CFR average on
+  2,000 sampled flops, which overstates by ~8 %):
 
   | | t = 50 | 100 | 200 | 300 | 450 |
   |---|---|---|---|---|---|
@@ -180,11 +213,12 @@ Open, about the paper's own figures:
     The paper's Fig. 3-middle line for 4,000 steps moves between 65 and 85 from t = 50 to 450 and ends near 65; its lines
     for 8,000 / 16,000 / 32,000 steps end at 43 / 37 / 36. So with the settings of its text we reproduce its 4,000-step
     line and not its headline, which lies on its 16,000-step line.
-  - *Open.* Only configurations the paper describes are run until its number is reproduced (the run with 8,000 steps and
-    weight averaging, `runs/fhp4_k25_8k_ema`, was stopped at t = 116 with 97 at t = 100). `runs/fhp4_sweep_k300k_s16k` is the
-    paper's 16,000-step line: 16,000 SGD steps, 300,000 traversals per iteration (the paper does not state the traversal
-    count of Fig. 3-middle; its lines start like the 300,000 / 1,000,000 lines of Fig. 3-left), 40 M memories, 300
-    iterations; the paper's line reads about 60 / 55 / 43 / 43 / 40 at t = 50 / 100 / 150 / 200 / 300.
+  - *The 16,000-step line with one deal.* Only configurations the paper describes are run until its number is reproduced
+    (the run with 8,000 steps and weight averaging, `runs/fhp4_k25_8k_ema`, was stopped at t = 116 with 97 at t = 100).
+    `runs/fhp4_sweep_k300k_s16k` was the paper's 16,000-step line: 16,000 SGD steps, 300,000 traversals per iteration (the
+    paper does not state the traversal count of Fig. 3-middle; its lines start like the 300,000 / 1,000,000 lines of
+    Fig. 3-left), 40 M memories. It reached 85.2 at t = 50 where the paper's line reads 63 (the table of 2026-10-10
+    above has its first 50 iterations) and was stopped at t = 88 when the sampling difference was found.
 
 ## DREAM and ESCHER
 
