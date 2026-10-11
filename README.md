@@ -244,9 +244,13 @@ branch. With `--chance-sampling branch` (now part of `--preset paper`) the paper
 | ours, chance per branch: SD-CFR average | 1,130 | 851 | 443 | 214 | |
 | ours, chance per branch: policy net, exact | | | | 203 | 132 |
 
-The full-length run with the new sampling (`runs/fhp4_paper_branch`) and the paper's 16,000-step sweep line are in
-progress; docs/paper-fidelity.md has the details, including what still differs (the paper's Fig. 2 touches twice our
-nodes per iteration). **Everything below in this section was measured with one deal per traversal**, on the four-bet
+That run ends at 97 / 79 / 77 after 200 / 300 / 450 iterations (paper 52 / 40 / 40): the early gap closed, the floor did
+not move. A second deviation was found the same day: the paper's parameter count (98,948) has room for rank and suit
+embeddings only, and the 52-card tables we had kept from its appendix code let the fit memorise samples (seed-to-seed
+noise on flop predictions 38.5 -> 27.9 chips on a 2.5 M-row memory without them). `--preset paper` now trains without
+them (`--no-card-table`); `runs/fhp4_paper_v3` is the full-length run with both fixes. docs/paper-fidelity.md has the
+details, including a reference run of the authors' public code scored with our exact best response.
+**Everything below in this section was measured with one deal per traversal and with the card tables**, on the four-bet
 game with the paper's network and hyperparameters (`--game fhp --preset paper` as it was then; policy net by exact best
 response over all flops, SD-CFR average on 2,000 sampled flops, which overstates by ~8 %):
 

@@ -18,6 +18,9 @@ outputs one value per action.  Variants (``BaseModel(**config)``):
   and "no card" embedded as zero.  Its inputs are fixed (``features`` is always ``history``).
 * ``cards``: ``embed`` = rank + suit + card embeddings summed per card group (DeepCFR);
   ``onehot`` = concatenated one-hot cards straight into the first card layer (SD-CFR paper).
+* ``card_table`` (``embed`` only): False = rank and suit embeddings alone - the 52-card tables stay in the state dict
+  as zeros and are not trained.  The DeepCFR paper's parameter count (23 d^2 + 74 d + 4) has no room for them, and with
+  them the fit memorises samples of small memories far more (docs/paper-fidelity.md).
 * ``dim``: width of every hidden layer and embedding (64 = ~68k / 66k parameters).
 * ``rm_fallback``: what regret matching plays when no advantage is positive - ``uniform`` (over
   the allowed actions) or ``argmax`` (the highest advantage, DeepCFR paper).  Stored with the
@@ -51,7 +54,7 @@ ARCHS = ("current", "paper", "deepcfr")
 CARDS = ("embed", "onehot")
 RM_FALLBACKS = ("uniform", "argmax")
 DEFAULT_CONFIG = dict(features="aggregated", arch="current", cards="embed", dim=EMBEDDING_DIM, rm_fallback="uniform",
-                      game=DEFAULT_GAME.tree_dict(), opp_cards=False)
+                      game=DEFAULT_GAME.tree_dict(), opp_cards=False, card_table=True)
 
 
 def normalize_config(config=None, **overrides):
@@ -72,6 +75,7 @@ def normalize_config(config=None, **overrides):
         cfg["features"] = "history"  # this architecture defines its inputs
     cfg["dim"] = int(cfg["dim"])
     cfg["opp_cards"] = bool(cfg["opp_cards"])
+    cfg["card_table"] = bool(cfg["card_table"])
     return cfg
 
 
@@ -122,14 +126,18 @@ def bet_feature_indices(features, arch, num_rounds=4):
 
 class CardEmbedding(nn.Module):
     """rank + suit + card embeddings of every card slot; index 0 = no card - a learned row, or with ``pad``
-    an all-zero row that is not trained (Appendix C: "zero out 'no card' embeddings")."""
+    an all-zero row that is not trained (Appendix C: "zero out 'no card' embeddings").  ``card_table=False``: the
+    card embedding is all zeros and not trained (rank + suit only)."""
 
-    def __init__(self, dim, pad=False):
+    def __init__(self, dim, pad=False, card_table=True):
         super().__init__()
         padding = 0 if pad else None
         self.rank_embedding = nn.Embedding(RANKS + 1, dim, padding_idx=padding)
         self.suit_embedding = nn.Embedding(SUITS + 1, dim, padding_idx=padding)
         self.card_embedding = nn.Embedding(RANKS * SUITS + 1, dim, padding_idx=padding)
+        if not card_table:
+            nn.init.zeros_(self.card_embedding.weight)
+            self.card_embedding.weight.requires_grad_(False)
 
     def forward(self, cards):  # cards: (B, n, 3) long
         return self.rank_embedding(cards[..., 0]) + self.suit_embedding(cards[..., 1]) + self.card_embedding(cards[..., 2])
@@ -152,7 +160,8 @@ class CardModel(nn.Module):
     ``groups``: card slots per embedding group (:func:`card_groups`); ``hidden``: width of the first two layers
     (the DeepCFR paper's network: 3 x dim); ``pad``: "no card" embeds as zero."""
 
-    def __init__(self, dim=EMBEDDING_DIM, cards="embed", per_group=False, opp_cards=False, groups=None, hidden=None, pad=False):
+    def __init__(self, dim=EMBEDDING_DIM, cards="embed", per_group=False, opp_cards=False, groups=None, hidden=None, pad=False,
+                 card_table=True):
         super().__init__()
         self.cards = cards
         self.per_group = per_group
@@ -162,9 +171,9 @@ class CardModel(nn.Module):
         n_slots = 9 if opp_cards else 7
         if cards == "embed":
             if per_group:  # DeepCFR paper: one embedding per card group
-                self.group_embeddings = nn.ModuleList([CardEmbedding(dim, pad) for _ in self.groups])
+                self.group_embeddings = nn.ModuleList([CardEmbedding(dim, pad, card_table) for _ in self.groups])
             else:
-                self.cards_embeddings = CardEmbedding(dim, pad)
+                self.cards_embeddings = CardEmbedding(dim, pad, card_table)
             self.fc1 = nn.Linear(len(self.groups) * dim, hidden)
         else:  # SD-CFR paper: one-hot cards, so the first layer is the (only) embedding
             self.onehot = nn.Linear(n_slots * CARD_CLASSES, hidden)
@@ -226,10 +235,10 @@ class BaseModel(nn.Module):
     """Maps a batch of observations (B, >= obs_dim) to per-action logits / advantages (B, num_actions)."""
 
     def __init__(self, features=None, arch=None, cards=None, dim=None, rm_fallback=None, game=None, config=None, opp_cards=None,
-                 zero_head=True):
+                 zero_head=True, card_table=None):
         super().__init__()
         cfg = normalize_config(config, features=features, arch=arch, cards=cards, dim=dim, rm_fallback=rm_fallback, game=game,
-                               opp_cards=opp_cards)
+                               opp_cards=opp_cards, card_table=card_table)
         self.config = cfg
         self.features, self.arch, self.cards_mode = cfg["features"], cfg["arch"], cfg["cards"]
         self.dim, self.rm_fallback = cfg["dim"], cfg["rm_fallback"]
@@ -247,7 +256,8 @@ class BaseModel(nn.Module):
 
         wide = self.arch == "deepcfr"
         self.card_model = CardModel(d, self.cards_mode, per_group=self.arch != "current", opp_cards=self.opp_cards,
-                                    groups=card_groups(self.arch, self.game.num_rounds, self.opp_cards), hidden=3 * d if wide else d, pad=wide)
+                                    groups=card_groups(self.arch, self.game.num_rounds, self.opp_cards), hidden=3 * d if wide else d, pad=wide,
+                                    card_table=cfg["card_table"])
         if self.arch == "current":
             self.stage_and_order_model = StageAndOrderModel(d)
         self.bets_model = BetsModel(len(idx), d)
@@ -318,4 +328,5 @@ def load_model(path, device=None, strict=True) -> BaseModel:
 
 
 def count_parameters(model):
-    return sum(p.numel() for p in model.parameters())
+    """Trained parameters (a card table switched off with ``card_table=False`` is not one)."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)

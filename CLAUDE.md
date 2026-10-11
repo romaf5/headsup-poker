@@ -60,7 +60,10 @@ python -m pytest tests -q                                    # ~440 tests, ~13 m
 - DeepCFR fits weight a sample of iteration t by 2t/T (`--loss-weights paper`, the paper's 5.3; the loss is O(1)).
   With `--loss-weights raw` (all runs before 2026-10-08; inherited when such a checkpoint is resumed) the loss grows
   ~linearly with t and the clip at 1 rescales every step: watch `eval_*` and `advantage/*/mse_unweighted` there.
-  `--preset paper` = paper hyperparameters + `--net deepcfr` + argmax fallback + `--chance-sampling branch`.
+  `--preset paper` = paper hyperparameters + `--net deepcfr` + argmax fallback + `--chance-sampling branch` + `--no-card-table`.
+- `card_table=False` in a model config = rank + suit embeddings only (the Deep CFR paper's parameter count; the 52-card
+  tables stay in the state dict as untrained zeros, so the numpy / C++ forwards are unchanged). With the tables the fit
+  memorises samples of small memories; models saved before 2026-10-10 have them (missing key = True).
 - External sampling draws chance per branch of the traverser with `--chance-sampling branch` (Deep CFR's Algorithm 2, the
   authors' code; `Engine.redeal`, one splitmix64 stream per traversal, identical in Python and C++). `deal` (default outside
   the paper preset, and every run before 2026-10-10) shares one deal among all branches: unbiased too, but on FHP it costs a
@@ -70,8 +73,9 @@ python -m pytest tests -q                                    # ~440 tests, ~13 m
   `--net paper` is Appendix C as printed (d-wide card branch, extra inputs) and is kept for the models trained with it.
 - First iteration: untrained nets output zeros and the argmax fallback shares exact ties, i.e. plays uniformly.
 - FHP: one cause of the gap was the single deal per traversal (found 2026-10-10; with `--chance-sampling branch` the paper preset
-  is at 443 / 203 / 132 mbb/g total at t = 20 / 50 / 100 against 826 / 367 / 202 before and the paper's 457 / 155 / 71). The rest of
-  this note describes the runs before that date (one deal); compare new runs only with new-sampler runs.
+  is at 443 / 203 / 132 mbb/g total at t = 20 / 50 / 100 against 826 / 367 / 202 before and the paper's 457 / 155 / 71), but that run
+  ends at 77 like the old ones (paper 40). `runs/fhp4_paper_v3` adds the network without card tables. The rest of this note
+  describes the runs before that date (one deal, card tables); compare new runs only with runs of the same sampler and network.
 - FHP is not reproduced (2026-10-08, four-bet game, paper preset: 202 / 113 / 95 / 78 mbb/g total at t = 100 / 200 /
   300 / 450 against the paper's 70 / 51 / 40 / 40; the three-bet runs ended at 80-86 too). Two measured causes: (1) the paper's "10,000 traversals" touch ~2.4x the nodes of
   ours - `--traversals 25000` gives 178 / 121 at t = 50 / 100 against 367 / 199; (2) at t = 125 the 4,000-step fit is

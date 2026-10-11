@@ -89,6 +89,7 @@ VARIANTS = [
     dict(features="both", arch="paper", cards="onehot", dim=32),
     dict(features="history", arch="paper", rm_fallback="argmax"),
     dict(cards="onehot", rm_fallback="argmax"),
+    dict(features="history", card_table=False),
 ]
 
 
@@ -522,6 +523,25 @@ def test_paper_preset_selects_the_papers_network():
     assert (a.net, a.rm_fallback, a.loss_weights) == ("deepcfr", "argmax", "paper")
     assert train.cli_args([]).net == "current"
     assert train.cli_args(["--preset", "paper", "--net", "paper"]).net == "paper"  # an explicit flag wins
+    # the paper's parameter count has no 52-card tables
+    assert a.card_table is False and train.cli_args([]).card_table is True
+    assert train.cli_args(["--preset", "paper", "--card-table"]).card_table is True
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_card_table_choice_reaches_the_networks_and_survives_a_resume(tmp_path):
+    import headsup.deepcfr.train as train
+
+    out = tmp_path / "run"
+    train.main(["--algo", "sdcfr", "--game", "fhp", "--preset", "paper", "--iterations", "1", "--checkpoint-every", "1", "--out", str(out)] + _TINY)
+    state = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=True)
+    assert state["model_config"]["card_table"] is False
+    assert all(float(sd[k].abs().max()) == 0 for sd in state["nets"] for k in sd if "card_embedding" in k)
+    assert any(float(sd[k].abs().max()) > 0 for sd in state["nets"] for k in sd if "rank_embedding" in k)
+    assert train.cli_args(["--resume", str(out / "checkpoint.pt")]).card_table is False
+    del state["model_config"]["card_table"]  # a checkpoint from before the option: its networks have the tables
+    torch.save(state, out / "checkpoint.pt")
+    assert train.cli_args(["--resume", str(out / "checkpoint.pt"), "--preset", "paper"]).card_table is True
 
 
 def test_loss_weights_are_rescaled_by_two_over_T():

@@ -283,7 +283,8 @@ class DeepCFRTrainer:
             mask = args.mask_redundant == "on" or (args.mask_redundant == "auto" and bet_sizes != ("min",))
             self.game = GameConfig(raise_cap=args.raise_cap, bet_sizes=bet_sizes, mask_redundant=mask)
         self.model_config = normalize_config(
-            dict(features=args.features, arch=args.net, cards=args.cards, dim=args.dim, rm_fallback=args.rm_fallback, game=self.game)
+            dict(features=args.features, arch=args.net, cards=args.cards, dim=args.dim, rm_fallback=args.rm_fallback, game=self.game,
+                 card_table=getattr(args, "card_table", True))
         )
         self.nets = [BaseModel(config=self.model_config).to(self.device).eval() for _ in range(2)]
         obs_dim, num_actions = self.nets[0].obs_dim, self.nets[0].num_actions
@@ -327,7 +328,7 @@ class DeepCFRTrainer:
             + f" on {mem_dev}"
         )
         print(
-            f"network: features={cfg['features']} arch={cfg['arch']} cards={cfg['cards']} dim={cfg['dim']} "
+            f"network: features={cfg['features']} arch={cfg['arch']} cards={cfg['cards']}{'' if cfg['card_table'] else ' (rank + suit only)'} dim={cfg['dim']} "
             f"rm_fallback={cfg['rm_fallback']}  ({count_parameters(self.nets[0]):,} parameters, obs[{obs_dim}])"
         )
         print(f"game: {args.game} bet sizes {self.game.bet_sizes} ({num_actions} actions), raise cap(s) "
@@ -840,6 +841,9 @@ def build_parser():
                    help="architecture: current (3 branches; default) | paper (Brown et al. Fig. 1 as Appendix C prints it) | deepcfr (the "
                         "network the paper trained: Appendix C with a 3x wider card branch, 98,948-parameter family; --preset paper)")
     p.add_argument("--cards", default="embed", choices=CARDS, help="card input: embed (rank+suit+card embeddings) | onehot (SD-CFR)")
+    p.add_argument("--card-table", action=argparse.BooleanOptionalAction, default=None,
+                   help="--cards embed: train a 52-card embedding next to the rank and suit embeddings (default; off with --preset "
+                        "paper - the paper's parameter count has rank and suit embeddings only)")
     p.add_argument("--dim", type=int, default=64, help="hidden / embedding width")
     p.add_argument("--rm-fallback", default=None, choices=RM_FALLBACKS,
                    help="regret matching when no advantage is positive: uniform | argmax (DeepCFR / DREAM papers; the default with "
@@ -899,6 +903,8 @@ def resolve_args(args):
         args.loss_weights = "paper"
     if getattr(args, "chance_sampling", None) is None:
         args.chance_sampling = "branch" if args.preset == "paper" else "deal"
+    if getattr(args, "card_table", None) is None:
+        args.card_table = args.preset != "paper"
     return args
 
 
@@ -937,8 +943,8 @@ def cli_args(argv=None):
     args = resolve_args(args)
     if checkpoint:  # the network variant and the game are fixed by the checkpoint
         cfg = DeepCFRTrainer.checkpoint_model_config(checkpoint)
-        args.features, args.net, args.cards, args.dim, args.rm_fallback = (
-            cfg["features"], cfg["arch"], cfg["cards"], cfg["dim"], cfg["rm_fallback"])
+        args.features, args.net, args.cards, args.dim, args.rm_fallback, args.card_table = (
+            cfg["features"], cfg["arch"], cfg["cards"], cfg["dim"], cfg["rm_fallback"], cfg["card_table"])
         game = GameConfig.from_dict(cfg["game"])
         args.bet_sizes, args.raise_cap = ",".join(str(s) for s in game.bet_sizes), game.raise_cap
         args.mask_redundant = "on" if game.mask_redundant else "off"

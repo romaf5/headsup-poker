@@ -165,3 +165,34 @@ def test_deepcfr_paper_network():
     other[:, 15:21] = 0
     with torch.no_grad():
         torch.testing.assert_close(m(obs), m(other))
+
+
+def test_network_without_the_card_table_is_the_papers_count():
+    """``card_table=False``: rank and suit embeddings only.  The paper's "98,948 parameters" and all model sizes of its
+    Fig. 3 are 23 d^2 + 74 d + 4, which has room for exactly these (34 d for two card groups) and not for the 52-card
+    tables its Appendix C prints.  The tables stay in the state dict as zeros that are not trained, so the numpy and
+    C++ forwards need no change."""
+    for d in (8, 64):
+        m = BaseModel(arch="deepcfr", game=FHP, dim=d, card_table=False)
+        # the paper's family - its fourth output + our untrained "no card" rows of the rank and suit tables
+        assert count_parameters(m) == (23 * d * d + 74 * d + 4) - (d + 1) + 4 * d
+    m = BaseModel(arch="deepcfr", game=FHP, card_table=False)
+    assert m.config["card_table"] is False and BaseModel(arch="deepcfr", game=FHP).config["card_table"] is True
+    tables = [e.card_embedding.weight for e in m.card_model.group_embeddings]
+    assert all(not t.requires_grad and float(t.abs().max()) == 0 for t in tables)
+    full = BaseModel(arch="deepcfr", game=FHP)
+    full.load_state_dict(m.state_dict())  # the same function as a full network whose card tables are zero
+    obs = torch.from_numpy(random_observations(128))
+    with torch.no_grad():
+        torch.nn.init.normal_(m.action_head.weight, std=0.5)
+        full.action_head.weight.copy_(m.action_head.weight)
+        assert torch.allclose(m(obs), full(obs))
+    opt = torch.optim.Adam(m.parameters(), lr=0.1)
+    m(obs).pow(2).mean().backward()
+    opt.step()
+    assert all(float(t.abs().max()) == 0 for t in tables)  # training leaves them alone
+    again = BaseModel.from_state({"config": dict(m.config), "state_dict": m.state_dict()})
+    assert again.config["card_table"] is False and not again.card_model.group_embeddings[0].card_embedding.weight.requires_grad
+    old = {k: v for k, v in BaseModel(arch="deepcfr", game=FHP).config.items() if k != "card_table"}
+    assert BaseModel(config=old).config["card_table"] is True  # models saved before the option have their tables
+    np.testing.assert_allclose(NumpyModel(m.numpy_weights())(obs.numpy()), m(obs).detach().numpy(), atol=1e-4)

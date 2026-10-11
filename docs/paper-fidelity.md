@@ -25,7 +25,7 @@ checked against independent implementations or enumeration.
 
 | item | status |
 |---|---|
-| Network. The paper's "98,948 parameters" is the family 23 d² + 74 d + 4 (it also matches the model sizes of Fig. 3): Appendix C with the card branch 3 d wide, as in both of the authors' code bases. `--net paper` had a d-wide card branch (67,459 parameters), 51 bet inputs instead of the bet history alone, and a learned "no card" row. | **fixed** - `--net deepcfr` (`--preset paper` selects it); `test_deepcfr_paper_network`. It keeps Appendix C's 52-card tables, which the count leaves out (rank + suit alone cannot tell A♠K♥ from A♥K♠), and FHP's 3 outputs instead of 4 |
+| Network. The paper's "98,948 parameters" is the family 23 d² + 74 d + 4 (it also matches the model sizes of Fig. 3): Appendix C with the card branch 3 d wide, as in both of the authors' code bases. `--net paper` had a d-wide card branch (67,459 parameters), 51 bet inputs instead of the bet history alone, and a learned "no card" row. | **fixed** - `--net deepcfr` (`--preset paper` selects it); `test_deepcfr_paper_network`. It kept Appendix C's 52-card tables, which the count leaves out (filed as a choice: rank + suit alone cannot tell A♠K♥ from A♥K♠ - which costs almost nothing in FHP, where a flush needs all five cards). Measured on 2026-10-10 (`docs/analysis/fhp_fit_capacity.py`, paired on the same rows): without the tables the fit memorises less - held-out loss -1.15 % and seed-to-seed noise on flop rows 38.5 -> 27.9 chips on 2.5 M rows, -0.10 % and 15.1 -> 13.5 on 14 M. **Fixed**: `--preset paper` trains rank and suit embeddings only (`--no-card-table`; 99,139 trained parameters = the paper's family with FHP's 3 outputs instead of 4 and our two untrained "no card" rows per group); `test_network_without_the_card_table_is_the_papers_count`. Every FHP run before `runs/fhp4_paper_v3` had the tables |
 | Loss weights: "we rescale all the batch weights by 2/T" (5.3). We used the raw t, so the gradient clip at 1 rescaled every step (norms 25-460 at T = 450). | **fixed** - `--loss-weights paper` (default); `raw` for the old behaviour, which resumed older checkpoints keep |
 | Refits start "from a random initialization" (5.2); only the first network must output zeros. Every refit started with a zero head. | **fixed** - `test_refits_start_from_a_random_head` |
 | First strategy: with the untrained network and the argmax fallback we played the first legal action (fold facing a bet); the authors play uniformly before the first network exists. | **fixed** - exact ties share the probability, in C++, numpy, torch and the small-game solver; `test_untrained_networks_play_uniformly_in_the_first_iteration` |
@@ -67,8 +67,13 @@ Open, about the paper's own figures:
   | ours, one deal per traversal (`runs/fhp4_paper`): SD-CFR average | 1,135 | 921 | 826 | 367 | 199 |
   | ours, chance per branch (`runs/fhp4_chance_k10k`): SD-CFR average | 1,130 | 851 | 443 | 214 | |
   | ours, chance per branch (`runs/fhp4_paper_branch`): policy net, exact | | | | 203 | 132 |
+  | ours, chance per branch, 20,000 traversals (`runs/fhp4_chance_k20k`): SD-CFR average | | 512 | 264 | 152 | |
+  | the authors' public code, 10,000 traversals (`runs/ref_fhp_es`, see below): SD-CFR average | 1,016 | 779 | 414 | | |
 
-  At t = 200 the new run is at 96.9 (paper 52; one deal: 113.3): the gain is large early and shrinks later. Of the 132 at
+  The new run ends at 96.9 / 78.9 / 77.0 at t = 200 / 300 / 450 (paper 52 / 40 / 40; one deal: 113.3 / 94.9 / 77.7): the
+  gain is large early and gone at the end - the floor did not move. With 20,000 traversals the first 20 iterations are far
+  ahead of the paper's 10,000 line (and on its 30,000 line, 655 / 275), so the paper's "10,000 traversals" are 10,000 of
+  ours even though its Fig. 2 counts twice our nodes. Of the 132 at
   t = 100, deviations on the pre-flop street alone are worth 42 and on the flop alone 93 (one deal: 49 and 145 of 202).
   By nodes touched - the axis of the paper's Fig. 2 - the new run is below the paper's curve up to 5e7 nodes (443 at
   1.05e7, 203 at 2.4e7 and 132 at 4.8e7 against about 766 / 375 / 165) and above it at 1e8 (97 against 71). By iteration
@@ -88,8 +93,8 @@ Open, about the paper's own figures:
   With 4,000 steps and a full 40 M memory (from t = 27: one pass per fit) our line stops falling near 140 where the
   paper's 4,000-step line is at 94 / 77 / 74.
 
-  Running: `runs/fhp4_paper_branch` (the printed configuration, to t = 450), `runs/fhp4_branch_k300k_s16k` (the
-  16,000-step line with the new sampling) and `runs/ref_fhp_es`: the authors' public external-sampling SD-CFR (DREAM
+  Running: `runs/fhp4_paper_v3` (the printed configuration with chance per branch and the network without card tables,
+  to t = 450) and `runs/ref_fhp_es`: the authors' public external-sampling SD-CFR (DREAM
   repository, `FHP_ES.py`: 10,000 traversals, 4,000 batches of 10,000) run here as a reference and scored with our exact
   best response. Its FHP class doubles the bet on the flop (`ROUND_WHERE_BIG_BET_STARTS = FLOP`), unlike both papers'
   rules; the reference run sets the flop bet to 100, and the evaluation checks at start-up that the two engines agree on
@@ -127,7 +132,29 @@ Open, about the paper's own figures:
 
   Below about 5 M rows the fit memorises samples. A run with 10,000 traversals per player stores 50,000 rows per seat
   and iteration: 1.25 M at t = 25, 2.5 M at t = 50, 5 M at t = 100. With the paper's nodes per iteration it would have
-  twice as many - the reason for `runs/fhp4_fig2_k20k` (20,000 traversals per player).
+  twice as many (the 20,000-traversal probe in the table above: better early, as expected, but the paper's early
+  curve is the one of 10,000 traversals).
+
+  Capacity and the card tables, same memory and fit (`docs/analysis/fhp_fit_capacity.py`; held-out loss relative to the
+  first row with its paired standard error, seed noise on held-out flop rows in chips):
+
+  | variant | 14 M rows: held-out loss | flop noise | 2.5 M rows: held-out loss | flop noise |
+  |---|---|---|---|---|
+  | `--net deepcfr` as it was (52-card tables), dim 64 | 1 | 15.1 | 1 | 38.5 |
+  | rank + suit embeddings only (the paper's parameter count) | 0.9990 ± 0.0002 | 13.5 | 0.9885 ± 0.0005 | 27.9 |
+  | skip connection around the middle card layer (authors' code) | 0.9998 ± 0.0002 | 15.5 | | |
+  | dim 128 | 0.9978 ± 0.0003 | 15.1 | | |
+  | dim 256 | 0.9978 ± 0.0003 | 14.5 | | |
+
+  The per-card tables were a second deviation filed as a choice: they let the network key on exact cards, which is what
+  memorising a sample needs. In a trained network of `runs/fhp4_paper_branch` many ReLU units never fire, more as the
+  run goes on: 0 / 2 / 5 / 23 / 34 / 38 of the 64 outputs of the card branch at t = 5 / 15 / 50 / 100 / 200 / 300 (seat 0;
+  units active on < 1 % of 100,000 memory rows), 13-22 of 64 in the trunk layers. The authors' networks at t = 15 look like
+  ours at t = 15.
+
+  The lost run: `runs/fhp4_branch_k300k_s16k` (the 16,000-step line with the new sampling) kept its 40 M-row memories in
+  host RAM and doubled them while writing its first checkpoint; the host ran out of memory at 21:09 and the run was
+  stopped without a usable snapshot. Checkpoints now take host-resident memories without a copy (commit 5a83bb4).
 - **The runs before 2026-10-10 (one deal per traversal).** Runs of 2026-10-08 on the four-bet game with `--preset paper`
   as it was then (total exploitability in mbb/g; policy net by exact best response over all flops, SD-CFR average on
   2,000 sampled flops, which overstates by ~8 %):
