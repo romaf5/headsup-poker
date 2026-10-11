@@ -68,9 +68,11 @@ Open, about the paper's own figures:
   | ours, chance per branch (`runs/fhp4_chance_k10k`): SD-CFR average | 1,130 | 851 | 443 | 214 | |
   | ours, chance per branch (`runs/fhp4_paper_branch`): policy net, exact | | | | 203 | 132 |
 
-  By nodes touched - the axis of the paper's Fig. 2 - the new run is below the paper's curve up to 5e7 nodes: 443 at
-  1.05e7, 203 at 2.4e7 and 132 at 4.8e7 against about 766 / 375 / 165. By iteration it is above from t = 50 on, and the
-  paper's run has twice the nodes per iteration (first bullet of this list).
+  At t = 200 the new run is at 96.9 (paper 52; one deal: 113.3): the gain is large early and shrinks later. Of the 132 at
+  t = 100, deviations on the pre-flop street alone are worth 42 and on the flop alone 93 (one deal: 49 and 145 of 202).
+  By nodes touched - the axis of the paper's Fig. 2 - the new run is below the paper's curve up to 5e7 nodes (443 at
+  1.05e7, 203 at 2.4e7 and 132 at 4.8e7 against about 766 / 375 / 165) and above it at 1e8 (97 against 71). By iteration
+  it is above from t = 50 on, and the paper's run has twice the nodes per iteration (first bullet of this list).
 
   With many traversals the new sampling changes less (300,000 traversals; SD-CFR average on 2,000 flops):
 
@@ -81,10 +83,17 @@ Open, about the paper's own figures:
   | paper, Fig. 3-middle, 16,000 SGD steps | 453 | 275 | 155 | 110 | 98 | 85 | 66 | 63 |
   | exact tabular Linear CFR (`fhp_cfr`) | 976 | 355 | 187 | 115 | | 65 | 44 | 32 |
   | ours, one deal, 16,000 steps (`runs/fhp4_sweep_k300k_s16k`, stopped at t = 88; policy net at 50, exact: 85.2) | 805 | 328 | 214 | 158 | 142 | 130 | 103 | 89 |
-  | ours, chance per branch, 4,000 steps (`runs/fhp4_branch_k300k_s4k`) | | 255 | 189 | 162 | 141 | | | |
+  | ours, chance per branch, 4,000 steps (`runs/fhp4_branch_k300k_s4k`) | | 255 | 189 | 162 | 141 | 138 | 164 | 122 |
 
-  Running: `runs/fhp4_paper_branch` (the printed configuration, to t = 450) and `runs/fhp4_branch_k300k_s16k` (the
-  16,000-step line with the new sampling, to t = 300).
+  With 4,000 steps and a full 40 M memory (from t = 27: one pass per fit) our line stops falling near 140 where the
+  paper's 4,000-step line is at 94 / 77 / 74.
+
+  Running: `runs/fhp4_paper_branch` (the printed configuration, to t = 450), `runs/fhp4_branch_k300k_s16k` (the
+  16,000-step line with the new sampling) and `runs/ref_fhp_es`: the authors' public external-sampling SD-CFR (DREAM
+  repository, `FHP_ES.py`: 10,000 traversals, 4,000 batches of 10,000) run here as a reference and scored with our exact
+  best response. Its FHP class doubles the bet on the flop (`ROUND_WHERE_BIG_BET_STARTS = FLOP`), unlike both papers'
+  rules; the reference run sets the flop bet to 100, and the evaluation checks at start-up that the two engines agree on
+  the player to act, the legal actions and the pot at all 78 decision nodes.
 - **The runs before 2026-10-10 (one deal per traversal).** Runs of 2026-10-08 on the four-bet game with `--preset paper`
   as it was then (total exploitability in mbb/g; policy net by exact best response over all flops, SD-CFR average on
   2,000 sampled flops, which overstates by ~8 %):
