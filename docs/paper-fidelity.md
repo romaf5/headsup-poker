@@ -114,6 +114,20 @@ Open, about the paper's own figures:
   t = 300; a run with the paper's nodes per iteration makes half as many. (The earlier finding that 16,000 steps lower
   the held-out loss by 5 % was made on one-deal data, where held-out rows share their deal - hand, flop and opponent
   hand - with training rows, so memorising deals lowered it.)
+
+  The same memory, the paper's fit on random subsets of it, one fixed held-out set (`docs/analysis/fhp_fit_datasize.py`):
+
+  | training rows | passes of 4,000 x 10,000 | held-out loss | training loss | noise between seeds on held-out flop rows | pre-flop rows |
+  |---|---|---|---|---|---|
+  | 14 M | 2.9 | 1 | 1.000 | 15.1 | 5.6 |
+  | 10 M | 4 | 1.001 | 1.000 | 15.5 | 5.8 |
+  | 5 M | 8 | 1.003 | 0.998 | 22.2 | 8.8 |
+  | 2.5 M | 16 | 1.020 | 0.983 | 39.8 | 9.7 |
+  | 1.25 M | 32 | 1.060 | 0.935 | 62.9 | 14.4 |
+
+  Below about 5 M rows the fit memorises samples. A run with 10,000 traversals per player stores 50,000 rows per seat
+  and iteration: 1.25 M at t = 25, 2.5 M at t = 50, 5 M at t = 100. With the paper's nodes per iteration it would have
+  twice as many - the reason for `runs/fhp4_fig2_k20k` (20,000 traversals per player).
 - **The runs before 2026-10-10 (one deal per traversal).** Runs of 2026-10-08 on the four-bet game with `--preset paper`
   as it was then (total exploitability in mbb/g; policy net by exact best response over all flops, SD-CFR average on
   2,000 sampled flops, which overstates by ~8 %):
