@@ -975,3 +975,46 @@ def test_paper_preset_samples_chance_per_branch_and_a_resumed_run_keeps_its_own(
     torch.save(state, ck)
     assert train.cli_args(["--resume", str(ck), "--preset", "paper"]).chance_sampling == "deal"
     assert train.DeepCFRTrainer(train.cli_args(["--game", "fhp", "--out", str(tmp_path / "other")] + _TINY)).runner.branch_chance is False
+
+
+def test_host_memories_are_handed_to_a_checkpoint_without_a_copy(tmp_path):
+    """``state_dict(copy=False)``: the stored rows of a memory kept in host RAM as they lie there - for writing a
+    checkpoint right away.  The snapshot copies doubled a full 40 M-row memory (32 GB) while its checkpoint was written
+    and exhausted the host.  The file still holds the stored rows only, not the capacity."""
+    import os
+
+    buf = ReservoirBuffer(1000, "cpu", seed=0, legal_dim=4)
+    rng = np.random.default_rng(0)
+    obs = np.zeros((300, 80), np.float32)
+    obs[:, :21] = rng.integers(0, 5, (300, 21))
+    obs[:, 23:] = rng.random((300, 57))
+    buf.add(obs, np.arange(300) % 7 + 1, rng.standard_normal((300, 4)).astype(np.float32), rng.integers(0, 2, (300, 4)))
+    state = buf.state_dict(copy=False)
+    for key, live in (("obs_int", buf.obs_int), ("obs_float", buf.obs_float), ("t", buf.t), ("target", buf.target), ("legal", buf.legal)):
+        assert state[key].data_ptr() == live.data_ptr() and len(state[key]) == 300, key
+        assert state[key].untyped_storage().nbytes() == live[:300].numel() * live.element_size(), key  # what torch.save writes
+    torch.save(state, tmp_path / "memory.pt")
+    assert os.path.getsize(tmp_path / "memory.pt") < 0.5 * sum(x.numel() * x.element_size() for x in (buf.obs_int, buf.obs_float, buf.target))
+    other = ReservoirBuffer(1000, "cpu", seed=0, legal_dim=4)
+    other.load_state_dict(torch.load(tmp_path / "memory.pt", weights_only=True))
+    assert other.size == 300 and torch.equal(other.obs, buf.obs) and torch.equal(other.target[:300], buf.target[:300])
+    snapshot = buf.state_dict()  # the default stays a snapshot: later samples do not change it
+    assert snapshot["target"].data_ptr() != buf.target.data_ptr()
+    kept = snapshot["target"].clone()
+    buf.target[:300] += 1
+    assert torch.equal(snapshot["target"], kept)
+
+
+@pytest.mark.skipif(not native.available(), reason="C++ extension not built")
+def test_checkpoints_take_the_memories_without_snapshot_copies(tmp_path, monkeypatch):
+    import headsup.deepcfr.train as train
+
+    seen = []
+    state_dict = ReservoirBuffer.state_dict
+    monkeypatch.setattr(ReservoirBuffer, "state_dict", lambda self, copy=True: (seen.append(copy), state_dict(self, copy=copy))[1])
+    out = tmp_path / "run"
+    train.main(["--algo", "both", "--game", "fhp", "--iterations", "1", "--checkpoint-every", "1", "--memory-device", "cpu", "--out", str(out)] + _TINY)
+    assert seen and not any(seen)
+    trainer = train.DeepCFRTrainer(train.cli_args(["--resume", str(out / "checkpoint.pt"), "--iterations", "2"] + _TINY))
+    trainer.load_checkpoint(str(out / "checkpoint.pt"))  # and the file restores the run
+    assert trainer.iteration == 1 and len(trainer.adv_memory[0]) > 0 and len(trainer.strat_memory) > 0

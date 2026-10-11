@@ -38,9 +38,13 @@ def _load_rows(dst, src, size):
         dst[i:j] = src[i:j].to(dst.device)
 
 
-def _rows(x, n):
+def _rows(x, n, copy=True):
     """The first n rows on the CPU as their own tensor: a slice of host storage is a view, and saving a view
-    writes the whole underlying storage (the full capacity instead of the stored rows)."""
+    writes the whole underlying storage (the full capacity instead of the stored rows).  ``copy=False``: host storage
+    is not duplicated - the tensor lies over the same memory and its storage ends after the n rows (it follows later
+    writes to the buffer, so it is for saving right away)."""
+    if not copy and x.device.type == "cpu":
+        return torch.from_numpy(x.numpy()[:n])
     return x[:n].to("cpu", copy=True)
 
 
@@ -187,14 +191,16 @@ class ReservoirBuffer:
         """float32 view of the stored observations (materialised; for tests / inspection)."""
         return torch.cat([self.obs_int[: self.size].to(torch.float32), self.obs_float[: self.size]], dim=1)
 
-    def state_dict(self):
+    def state_dict(self, copy=True):
+        """The stored rows and counters.  ``copy=False``: without a second copy of rows kept in host RAM (see
+        :func:`_rows`) - a checkpoint of full 40 M-row memories otherwise needs their 32 GB twice."""
         n = self.size
         return {
-            "obs_int": _rows(self.obs_int, n),
-            "obs_float": _rows(self.obs_float, n),
-            "t": _rows(self.t, n),
-            "target": _rows(self.target, n),
-            **({"legal": _rows(self.legal, n)} if self.legal is not None else {}),
+            "obs_int": _rows(self.obs_int, n, copy),
+            "obs_float": _rows(self.obs_float, n, copy),
+            "t": _rows(self.t, n, copy),
+            "target": _rows(self.target, n, copy),
+            **({"legal": _rows(self.legal, n, copy)} if self.legal is not None else {}),
             "capacity": self.capacity,
             "obs_dim": self.obs_dim,
             "size": self.size,

@@ -345,8 +345,8 @@ class DeepCFRTrainer:
         state = {
             "iteration": self.iteration,
             "nets": [n.state_dict() for n in self.nets],
-            "adv_memory": [m.state_dict() for m in self.adv_memory],
-            "strat_memory": self.strat_memory.state_dict() if self.strat_memory is not None else None,
+            "adv_memory": [m.state_dict(copy=False) for m in self.adv_memory],  # written right away: no snapshot copies
+            "strat_memory": self.strat_memory.state_dict(copy=False) if self.strat_memory is not None else None,
             "iterates": self._stacked_iterates() if self.iterates is not None else None,
             "iterate_first": self.iterate_first,
             "args": vars(self.args),
